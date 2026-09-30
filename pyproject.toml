@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "doc-rag"
+version = "0.1.0"
+description = "Local-first document analysis and retrieval experiments."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pdfplumber>=0.11.10,<0.12",
+    "pydantic>=2.7,<3",
+]
+
+[project.scripts]
+doc-rag = "doc_rag.cli:main"
+
+[dependency-groups]
+dev = [
+    "pip-audit>=2.7,<3",
+    "pytest>=9.0.3,<10",
+    "ruff>=0.9,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/doc_rag"]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "README.md",
+    "pyproject.toml",
+    "src/doc_rag",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

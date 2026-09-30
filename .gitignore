@@ -1,0 +1,50 @@
+# User-provided files require review before publication.
+
+
+
+# Repository-specific artifacts are outside the supported application source.
+
+
+# User-provided files are handled outside the application package.
+
+
+# Derived document text, embeddings, databases, and evaluation outputs.
+/database/
+/data/
+/artifacts/
+/outputs/
+/indexes/
+/storage/
+output*.json
+incorrect_answers*.json
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.faiss
+*.db
+*.sqlite
+*.sqlite3
+*.pdf
+
+# Notebook contents and embedded outputs require review before publication.
+# Publish new notebooks only after an explicit content review and rule change.
+*.ipynb
+.ipynb_checkpoints/
+
+# Local environments, credentials, caches, and downloaded models.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.cache/
+.pytest_cache/
+.ruff_cache/
+/models/
+*.safetensors
+*.gguf
+*.pt
+*.pth
