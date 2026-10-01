@@ -1,0 +1,163 @@
+{
+  "configuration": {
+    "alignment_policy": "whitespace-only-unique-complete-annotation-union-v1",
+    "benchmark_version": "qasper-document-bm25-v1",
+    "code_sha256": {
+      "evaluation.py": "fba8a793db4ba98e5dcb56d3e32ed1794cdd3bb371381b1bf0aa14a44e9b06a9",
+      "models.py": "3ec5c78d4c67464684ac5f1a1a3df9c27b6f21ab977da801ec8d2fea4d9cd56c",
+      "qasper.py": "afbaf125d98b5b458608955cf9c805867c2d2d6539979673704cd9735281a9a2",
+      "retrieval.py": "84556960fb7675c0eec39147241d8e385615a9bcb9ea99f9d3786e33ec6f8d06",
+      "store.py": "9f3cc29a0dbdf26a8124b41216c9fb845e76709f58c21c6250307bce39df0c9f",
+      "tokenize.py": "3a99697754b20b0887b7211d70a474637625dcd513319f8bcfad9058d0022793"
+    },
+    "dataset": "allenai/qasper",
+    "dev_questions": 50,
+    "license": "CC-BY-4.0",
+    "metrics_policy": "question-macro-recall/union-of-complete-text-annotations/errors-zero/v1",
+    "python": "3.11.16",
+    "retriever": {
+      "b": 0.75,
+      "backend": "numpy",
+      "k1": 1.5,
+      "method": "lucene",
+      "top_k": 10
+    },
+    "revision": "16ac8fdf81e7e3ad213ead4b60fdcc9dc8ca40e9",
+    "scope": "English structured full_text paragraphs, known-paper retrieval; no PDF parsing or answer generation.",
+    "seed": 42,
+    "selection_policy": "seeded-sorted-document-order/then-sorted-question-id/v1",
+    "source_files": {
+      "train": {
+        "filename": "qasper-train.parquet",
+        "sha256": "9af08092ee26c4f700202c1f90d1592b662926f23f3a308a10ff0a53345e37fe",
+        "size": 14374550
+      },
+      "validation": {
+        "filename": "qasper-validation.parquet",
+        "sha256": "089781b91c337d348dd9e8b57cc8adc100ed2d9cab84a6127402bcccf1559222",
+        "size": 4749127
+      }
+    },
+    "tokenizer": "nfkc-casefold-mathminus-jieba-search-no-hmm-v1/jieba-0.42.1/unicode-14.0.0",
+    "validation_questions": 200,
+    "versions": {
+      "bm25s": "0.2.14",
+      "jieba": "0.42.1",
+      "numpy": "2.4.6",
+      "pyarrow": "24.0.0",
+      "scipy": "1.17.1"
+    }
+  },
+  "coverage": {
+    "train": {
+      "annotation_issue_counts": {
+        "ambiguous_evidence": 6,
+        "no_evidence": 86,
+        "non_text_evidence": 327,
+        "unanswerable": 281,
+        "unmatched_evidence": 76
+      },
+      "eligible_not_selected": 1805,
+      "eligible_questions": 1855,
+      "excluded_questions": {
+        "ambiguous_evidence": 6,
+        "no_evidence": 79,
+        "no_passages": 3,
+        "non_text_evidence": 310,
+        "unanswerable": 271,
+        "unmatched_evidence": 69
+      },
+      "selected_papers": 23,
+      "selected_questions": 50,
+      "total_papers": 888,
+      "total_questions": 2593
+    },
+    "validation": {
+      "annotation_issue_counts": {
+        "ambiguous_evidence": 8,
+        "no_evidence": 49,
+        "non_text_evidence": 212,
+        "unanswerable": 163,
+        "unmatched_evidence": 52
+      },
+      "eligible_not_selected": 598,
+      "eligible_questions": 798,
+      "excluded_questions": {
+        "ambiguous_evidence": 2,
+        "no_evidence": 18,
+        "non_text_evidence": 99,
+        "unanswerable": 60,
+        "unmatched_evidence": 28
+      },
+      "selected_papers": 68,
+      "selected_questions": 200,
+      "total_papers": 281,
+      "total_questions": 1005
+    }
+  },
+  "platform": "Linux-5.15.0-139-generic-x86_64-with-glibc2.31",
+  "results": {
+    "train": {
+      "errors": 0,
+      "metrics_at_k": {
+        "5": {
+          "gold_evidence": 95,
+          "macro_evidence_recall": 0.35700000000000004,
+          "matched_evidence": 28,
+          "micro_evidence_recall": 0.29473684210526313,
+          "questions_with_all_evidence": 14,
+          "questions_with_any_evidence": 24
+        },
+        "10": {
+          "gold_evidence": 95,
+          "macro_evidence_recall": 0.5778333333333333,
+          "matched_evidence": 44,
+          "micro_evidence_recall": 0.4631578947368421,
+          "questions_with_all_evidence": 22,
+          "questions_with_any_evidence": 37
+        }
+      },
+      "papers": 23,
+      "query_p50_ms": 0.22489699767902493,
+      "query_p95_ms": 0.27416117954999203,
+      "questions": 50,
+      "zero_results": 0
+    },
+    "validation": {
+      "errors": 0,
+      "metrics_at_k": {
+        "5": {
+          "gold_evidence": 375,
+          "macro_evidence_recall": 0.4858333333333335,
+          "matched_evidence": 143,
+          "micro_evidence_recall": 0.38133333333333336,
+          "questions_with_all_evidence": 78,
+          "questions_with_any_evidence": 126
+        },
+        "10": {
+          "gold_evidence": 375,
+          "macro_evidence_recall": 0.6412619047619049,
+          "matched_evidence": 202,
+          "micro_evidence_recall": 0.5386666666666666,
+          "questions_with_all_evidence": 105,
+          "questions_with_any_evidence": 157
+        }
+      },
+      "papers": 68,
+      "query_p50_ms": 0.16597501235082746,
+      "query_p95_ms": 0.25606361450627446,
+      "questions": 200,
+      "zero_results": 0
+    }
+  },
+  "run_id": "db321bbce1d3ff2f43901abe2428542a2eef9cbeee7e77250f6b51f57480d420",
+  "selection_sha256": "da54def8692ff302abed07851311bba123de5597c38c38dd1687da9696c9df0f",
+  "this_invocation": {
+    "index_build_ms_total": 2371.3532969122753,
+    "index_builds": 91,
+    "index_load_ms_total": 347.12464932817966,
+    "index_loads": 91,
+    "questions_executed": 250,
+    "resumed_results": 0
+  }
+}

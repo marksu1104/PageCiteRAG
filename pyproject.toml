@@ -25,6 +25,9 @@ dev = [
     "pytest>=9.0.3,<10",
     "ruff>=0.9,<1",
 ]
+eval = [
+    "pyarrow>=21,<25",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/doc_rag"]

@@ -149,6 +149,36 @@ def _run_retrieval(args: argparse.Namespace) -> int:
         return 1
 
 
+def _run_eval(args: argparse.Namespace) -> int:
+    from doc_rag.qasper import QasperError, download_qasper
+
+    try:
+        if args.eval_action == "download-qasper":
+            report = download_qasper(args.data_dir)
+        else:
+            from doc_rag.evaluation import EvaluationError, run_qasper
+
+            try:
+                report = run_qasper(
+                    args.data_dir,
+                    args.output_dir,
+                    dev_questions=args.dev_questions,
+                    validation_questions=args.validation_questions,
+                    seed=args.seed,
+                    resume=args.resume,
+                    retry_errors=args.retry_errors,
+                )
+            except EvaluationError as exc:
+                print(f"doc-rag: evaluation failed: {exc}", file=sys.stderr)
+                return 1
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        errors = sum(row["errors"] for row in report.get("results", {}).values())
+        return 1 if errors else 0
+    except (QasperError, StoreError, OSError, sqlite3.Error, ValidationError) as exc:
+        print(f"doc-rag: evaluation failed: {exc}", file=sys.stderr)
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="doc-rag",
@@ -228,6 +258,30 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("query", help="Lexical query; quote queries containing spaces.")
     search_parser.add_argument("--top-k", type=_positive_integer, default=5)
 
+    eval_parser = subparsers.add_parser(
+        "eval", help="Prepare public data or run offline retrieval evaluation."
+    )
+    eval_commands = eval_parser.add_subparsers(dest="eval_action", required=True)
+    download_parser = eval_commands.add_parser(
+        "download-qasper",
+        help="Explicitly download the pinned QASPER train/validation Parquet files.",
+    )
+    qasper_parser = eval_commands.add_parser(
+        "qasper", help="Run the frozen, document-scoped BM25 QASPER baseline offline."
+    )
+    for command in (download_parser, qasper_parser):
+        command.add_argument("--data-dir", type=Path, default=Path("data/qasper"))
+    qasper_parser.add_argument("--output-dir", type=Path, default=Path("outputs/qasper-bm25"))
+    qasper_parser.add_argument("--dev-questions", type=_positive_integer, default=50)
+    qasper_parser.add_argument("--validation-questions", type=_positive_integer, default=200)
+    qasper_parser.add_argument("--seed", type=int, default=42)
+    qasper_parser.add_argument(
+        "--resume", action="store_true", help="Reuse verified completed question records."
+    )
+    qasper_parser.add_argument(
+        "--retry-errors", action="store_true", help="With --resume, retry recorded failures."
+    )
+
     return parser
 
 
@@ -243,6 +297,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_show(args)
     if args.command in ("index", "search"):
         return _run_retrieval(args)
+    if args.command == "eval":
+        return _run_eval(args)
     if args.command is None:
         parser.print_help()
         return 0

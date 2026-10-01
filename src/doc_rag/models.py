@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-MediaType = Literal["text/plain", "text/markdown", "application/pdf"]
+MediaType = Literal["text/plain", "text/markdown", "application/pdf", "application/vnd.qasper+json"]
 DocumentStatus = Literal["ready", "partial", "no_text", "failed"]
 UnitStatus = Literal["ok", "no_text", "error"]
 
@@ -21,7 +21,7 @@ class DocumentMetadata(BaseModel):
     source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_name: str = Field(min_length=1, max_length=512)
     media_type: MediaType
-    parser_name: Literal["plain_text", "markdown", "pdfplumber"]
+    parser_name: Literal["plain_text", "markdown", "pdfplumber", "qasper"]
     parser_version: str = Field(min_length=1, max_length=160)
     language: str | None = Field(default=None, max_length=32)
     usage_scope: str = Field(default="not-recorded", min_length=1, max_length=256)
@@ -37,6 +37,7 @@ class DocumentMetadata(BaseModel):
             "application/pdf": "pdfplumber",
             "text/plain": "plain_text",
             "text/markdown": "markdown",
+            "application/vnd.qasper+json": "qasper",
         }[self.media_type]
         if self.parser_name != expected_parser:
             raise ValueError("parser name does not match the source media type")

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import sqlite3
+from bisect import bisect_right
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 from doc_rag.models import (
     Block,
@@ -162,6 +163,8 @@ class SQLiteDocumentStore:
         self,
         document: DocumentMetadata,
         units: Iterable[ParsedUnit],
+        *,
+        block_factory: Callable[[DocumentMetadata, ParsedUnit, int], Iterable[Block]] = iter_blocks,
     ) -> IngestResult:
         """Store one parsed source atomically; repeated identical imports are no-ops."""
         connection = self._connect()
@@ -250,7 +253,22 @@ class SQLiteDocumentStore:
                 elif unit.status == "error":
                     failed_units += 1
 
-                for block in iter_blocks(document, unit, next_ordinal):
+                line_starts = [0]
+                for line in unit.text.splitlines(keepends=True):
+                    line_starts.append(line_starts[-1] + len(line))
+                for block in block_factory(document, unit, next_ordinal):
+                    if (
+                        block.document_id != document.document_id
+                        or block.unit_index != unit.unit_index
+                        or block.page_number != unit.page_number
+                        or block.ordinal != next_ordinal
+                        or unit.text[block.char_start : block.char_end] != block.text
+                        or block.char_end > len(unit.text)
+                        or block.line_start != bisect_right(line_starts, block.char_start)
+                        or block.line_end != bisect_right(line_starts, block.char_end - 1)
+                        or unit.status != "ok"
+                    ):
+                        raise StoreError("parser returned a block outside its source unit")
                     self._insert_block(connection, block)
                     block_count += 1
                     next_ordinal = block.ordinal + 1

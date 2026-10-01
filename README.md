@@ -32,7 +32,7 @@ uv run --locked doc-rag show DOCUMENT_ID --unit 1
 
 PDF extraction uses pdfplumber's text layer only. Scanned pages are recorded as
 having no extractable text; OCR, table reconstruction, complex reading-order
-repair, search, and answer generation are out of scope for this slice. Extracted
+repair, and answer generation are out of scope for this parser. Extracted
 page text is parser output, not a claim of faithful visual or semantic PDF
 reconstruction. Do not ingest documents unless you are authorized to process
 them, and keep document text and databases local. The current slice has no
@@ -85,5 +85,65 @@ The reproducible smoke benchmark generates its own English text in a temporary
 directory and reports index-build time, snapshot-load time, and warm-search
 p50/p95 separately. Exact marker matches verify the path works; they do not
 measure evidence recall on the recorded benchmark slice without LLM generation.
+
+## QASPER retrieval evaluation
+
+Install the optional Parquet reader, explicitly prepare the public snapshot,
+then evaluate locally from the repository checkout:
+
+```bash
+uv sync --locked --group dev --group eval
+uv run --locked --group eval doc-rag eval download-qasper
+uv run --locked --group eval doc-rag eval qasper
+uv run --locked --group eval doc-rag eval qasper --resume
+```
+
+The download command fetches only the pinned train/validation Parquet files and
+verifies their published SHA-256 and sizes. Evaluation reads these files offline;
+it does not run remote dataset scripts or download during retrieval. PyArrow is
+in the `eval` dependency group and is unnecessary for normal document search.
+
+The baseline uses 50 train questions for development and 200 validation questions,
+seed 42, selected by shuffled document order followed by question ID before
+scoring. The split document IDs must be disjoint. Only nonblank `full_text`
+paragraphs are indexed, with their original boundaries and coordinates preserved.
+Titles, abstract fields, questions, answers, and evidence labels are not indexed.
+Dataset-derived line numbers refer to reconstructed text, not PDF pages.
+
+Evidence alignment changes whitespace only. Each evidence paragraph must match
+exactly one source paragraph. An annotation containing figure/table evidence
+(`FLOAT SELECTED`), unmatched text, or ambiguous matches is excluded in full.
+Questions with at least one complete text annotation are eligible; the gold set
+is the union of distinct paragraphs across those valid annotations. Exclusion
+and annotation-issue counts cover the full source splits, including alternatives
+to otherwise eligible questions. The selected subset therefore does not represent
+figure/table or unanswerable-question performance.
+
+Reports contain question-level macro evidence recall@5/@10, micro recall, complete
+and partial coverage counts, per-query rankings/scores/timing, and exclusions.
+This is our paragraph-retrieval protocol, not the official QASPER Answer F1 or
+Evidence F1 leaderboard metric. It searches within a known paper and measures
+structured-text retrieval, not PDF parsing, cross-language quality, or generated
+answer correctness. Query timing excludes corpus preparation, index building,
+snapshot loading, and CLI output; first-query tokenizer setup is included.
+
+Results are under `outputs/qasper-bm25/<run-id>/`, with configuration, frozen
+selection, per-question records, aggregate JSONL, and summary JSON. Input hashes,
+code hashes, versions, and metric policy identify each run. Completed results are
+validated and reused with `--resume`; `--resume --retry-errors` retries failures.
+Recorded query failures remain in recall denominators with zero credit. Documents
+are prepared/indexed once and their loaded retrievers serve all pending questions.
+Existing runs are not overwritten without explicit resume.
+
+The benchmark workflow retrieves pinned sources and builds its corpus and indexes. Public
+benchmark files contain identifiers, metrics, and provenance only. See
+[the frozen BM25 baseline](benchmarks/qasper-bm25/README.md) for measured results.
+
+QASPER attribution: Dasigi et al. (2021), *A Dataset of Information-Seeking
+Questions and Answers Anchored in Research Papers*. The
+[AllenAI dataset card](https://huggingface.co/datasets/allenai/qasper) identifies
+the dataset license as [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+This evaluation uses the dataset's structured text and does not redistribute
+source PDFs or grant rights to other documents.
 
 ## Scope
