@@ -18,12 +18,13 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, ValidationError
 
 from doc_rag import qasper
+from doc_rag.embedding import EmbeddingEncoder
 from doc_rag.qasper import Alignment, Paper, Question
 from doc_rag.retrieval import BM25Retriever, RetrievalError, build_bm25_index
 from doc_rag.store import SQLiteDocumentStore, StoreError
 from doc_rag.tokenize import tokenizer_version
 
-_BENCHMARK_VERSION = "qasper-document-bm25-v1"
+_BENCHMARK_VERSION = "qasper-document-retrieval-v2"
 _KS = (5, 10)
 
 
@@ -118,7 +119,12 @@ def recall_at(retrieved: tuple[str, ...], gold: tuple[str, ...], k: int) -> floa
 
 
 def _validate_record(
-    record: QueryRecord, split: str, paper: Paper, question: Question, aligned: Alignment
+    record: QueryRecord,
+    split: str,
+    paper: Paper,
+    question: Question,
+    aligned: Alignment,
+    method: str = "bm25",
 ) -> None:
     if (
         record.split != split
@@ -128,13 +134,23 @@ def _validate_record(
         or len(record.retrieved_passage_ids) != len(record.scores)
         or len(record.retrieved_passage_ids) > max(_KS)
         or len(set(record.retrieved_passage_ids)) != len(record.retrieved_passage_ids)
-        or any(score <= 0 for score in record.scores)
+        or (method != "dense" and any(score <= 0 for score in record.scores))
         or any(a < b for a, b in zip(record.scores, record.scores[1:]))
         or not set(record.retrieved_passage_ids).issubset(p.passage_id for p in paper.passages)
         or (record.status == "error" and (record.retrieved_passage_ids or not record.error_type))
         or (record.status == "ok" and record.error_type is not None)
     ):
         raise EvaluationError("cached query result does not match the frozen selection")
+
+
+def _coverage_metrics(records: list[QueryRecord], k: int) -> dict:
+    values = [recall_at(r.retrieved_passage_ids, r.gold_passage_ids, k) for r in records]
+    return {
+        "macro_evidence_recall": sum(values) / len(values) if values else None,
+        "complete": sum(v == 1 for v in values),
+        "partial": sum(0 < v < 1 for v in values),
+        "none": sum(v == 0 for v in values),
+    }
 
 
 def _summarize(records: list[QueryRecord]) -> dict:
@@ -171,11 +187,31 @@ def _summarize(records: list[QueryRecord]) -> dict:
             "metrics_at_k": metrics,
             "query_p50_ms": float(np.percentile(timings, 50)) if timings else None,
             "query_p95_ms": float(np.percentile(timings, 95)) if timings else None,
+            "evidence_groups": {
+                group: {
+                    "questions": len(group_records),
+                    "metrics_at_k": {str(k): _coverage_metrics(group_records, k) for k in _KS},
+                }
+                for group, group_records in (
+                    ("single", [r for r in subset if len(r.gold_passage_ids) == 1]),
+                    ("multiple", [r for r in subset if len(r.gold_passage_ids) > 1]),
+                    ("three_or_more", [r for r in subset if len(r.gold_passage_ids) >= 3]),
+                )
+            },
         }
     return summary
 
 
-def _configuration(*, dev_questions: int, validation_questions: int, seed: int) -> dict:
+def _configuration(
+    *,
+    dev_questions: int,
+    validation_questions: int,
+    seed: int,
+    method: str = "bm25",
+    encoder: EmbeddingEncoder | None = None,
+    candidates: int = 20,
+    rrf_constant: int = 60,
+) -> dict:
     module_files = (
         Path(__file__),
         Path(qasper.__file__),
@@ -183,6 +219,9 @@ def _configuration(*, dev_questions: int, validation_questions: int, seed: int) 
         Path(__file__).with_name("tokenize.py"),
         Path(__file__).with_name("store.py"),
         Path(__file__).with_name("models.py"),
+        Path(__file__).with_name("embedding.py"),
+        Path(__file__).with_name("dense.py"),
+        Path(__file__).with_name("hybrid.py"),
     )
     return {
         "benchmark_version": _BENCHMARK_VERSION,
@@ -197,7 +236,14 @@ def _configuration(*, dev_questions: int, validation_questions: int, seed: int) 
         "selection_policy": "seeded-sorted-document-order/then-sorted-question-id/v1",
         "alignment_policy": qasper.ALIGNMENT_VERSION,
         "metrics_policy": "question-macro-recall/union-of-complete-text-annotations/errors-zero/v1",
-        "retriever": {"method": "lucene", "k1": 1.5, "b": 0.75, "backend": "numpy", "top_k": 10},
+        "retriever": {
+            "method": method,
+            "lexical": {"method": "lucene", "k1": 1.5, "b": 0.75, "backend": "numpy"},
+            "encoder": encoder.identity if encoder is not None else None,
+            "top_k": 10,
+            "candidates": candidates if method == "hybrid" else None,
+            "rrf_constant": rrf_constant if method == "hybrid" else None,
+        },
         "tokenizer": tokenizer_version(),
         "versions": {
             name: version(name) for name in ("bm25s", "jieba", "numpy", "scipy", "pyarrow")
@@ -221,10 +267,22 @@ def run_qasper(
     seed: int = 42,
     resume: bool = False,
     retry_errors: bool = False,
+    method: Literal["bm25", "dense", "hybrid"] = "bm25",
+    encoder: EmbeddingEncoder | None = None,
+    candidates: int = 20,
+    rrf_constant: int = 60,
+    model_load_ms: float = 0,
+    index_database: Path | None = None,
 ) -> dict:
     """Prepare each selected document once and persist each question result atomically."""
     if retry_errors and not resume:
         raise EvaluationError("retry_errors requires resume")
+    if method not in ("bm25", "dense", "hybrid") or (method != "bm25" and encoder is None):
+        raise EvaluationError("dense/hybrid evaluation requires an explicitly loaded encoder")
+    if type(candidates) is not int or candidates < max(_KS):
+        raise EvaluationError("candidate budget must cover the evaluated top-k")
+    if type(rrf_constant) is not int or rrf_constant < 1:
+        raise EvaluationError("RRF constant must be a positive integer")
     papers = {
         split: list(qasper.read_snapshot(data_dir, split)) for split in ("train", "validation")
     }
@@ -242,7 +300,13 @@ def run_qasper(
     for split, count in (("train", dev_questions), ("validation", validation_questions)):
         selected[split], coverage[split] = select_questions(papers[split], limit=count, seed=seed)
     config = _configuration(
-        dev_questions=dev_questions, validation_questions=validation_questions, seed=seed
+        dev_questions=dev_questions,
+        validation_questions=validation_questions,
+        seed=seed,
+        method=method,
+        encoder=encoder if method != "bm25" else None,
+        candidates=candidates,
+        rrf_constant=rrf_constant,
     )
     selection = [
         {
@@ -291,7 +355,7 @@ def run_qasper(
             if path.exists():
                 try:
                     record = QueryRecord.model_validate_json(path.read_text(encoding="utf-8"))
-                    _validate_record(record, split, paper, question, aligned)
+                    _validate_record(record, split, paper, question, aligned, method)
                 except (OSError, ValidationError) as exc:
                     raise EvaluationError("saved query record is damaged") from exc
                 if record.status == "ok" or not retry_errors:
@@ -302,21 +366,47 @@ def run_qasper(
 
     builds = loads = executed = 0
     build_ms = load_ms = 0.0
-    store = SQLiteDocumentStore(run_dir / "documents.sqlite3") if pending else None
+    store = (
+        SQLiteDocumentStore(index_database or run_dir / "documents.sqlite3") if pending else None
+    )
     handled_errors = (RetrievalError, StoreError, OSError, sqlite3.Error, ValidationError)
     for (split, _), items in pending.items():
         preparation_error = None
         try:
             document_id, mapping = qasper.ingest_paper(store, items[0][0])
-            if store.get_retrieval_manifest(document_id, "bm25") is None:
+            branches = {}
+            kinds = ("bm25", "dense") if method == "hybrid" else (method,)
+            for kind in kinds:
+                if store.get_retrieval_manifest(document_id, kind) is None:
+                    start = time.perf_counter()
+                    if kind == "bm25":
+                        build_bm25_index(store, document_id)
+                    else:
+                        from doc_rag.dense import build_dense_index
+
+                        build_dense_index(store, document_id, encoder)
+                    build_ms += (time.perf_counter() - start) * 1000
+                    builds += 1
                 start = time.perf_counter()
-                build_bm25_index(store, document_id)
-                build_ms += (time.perf_counter() - start) * 1000
-                builds += 1
-            start = time.perf_counter()
-            retriever = BM25Retriever(store, document_id)
-            load_ms += (time.perf_counter() - start) * 1000
-            loads += 1
+                if kind == "bm25":
+                    branches[kind] = BM25Retriever(store, document_id)
+                else:
+                    from doc_rag.dense import DenseRetriever
+
+                    branches[kind] = DenseRetriever(store, document_id, encoder)
+                load_ms += (time.perf_counter() - start) * 1000
+                loads += 1
+            if method == "hybrid":
+                from doc_rag.hybrid import HybridRetriever
+
+                retriever = HybridRetriever(
+                    branches["bm25"],
+                    branches["dense"],
+                    candidates=candidates,
+                    constant=rrf_constant,
+                )
+            else:
+                retriever = branches[method]
         except handled_errors as exc:
             preparation_error = type(exc).__name__
         for paper, question, aligned, path in items:
@@ -342,7 +432,7 @@ def run_qasper(
                 status="error" if error else "ok",
                 error_type=error,
             )
-            _validate_record(record, split, paper, question, aligned)
+            _validate_record(record, split, paper, question, aligned, method)
             _write_json(path, record.model_dump(mode="json"))
             records.append(record)
             executed += 1
@@ -361,6 +451,7 @@ def run_qasper(
             "resumed_results": resumed,
             "index_build_ms_total": build_ms,
             "index_load_ms_total": load_ms,
+            "model_load_ms": model_load_ms,
         },
     }
     with tempfile.TemporaryDirectory(prefix=".aggregate-", dir=run_dir) as temporary:

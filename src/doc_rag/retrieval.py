@@ -55,7 +55,7 @@ class SearchHit(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     rank: int = Field(ge=1)
-    score: float = Field(gt=0, allow_inf_nan=False)
+    score: float = Field(allow_inf_nan=False)
     block: Block
 
 
@@ -64,7 +64,7 @@ class SearchResult(BaseModel):
 
     document_id: str
     index_id: str
-    method: Literal["bm25"] = "bm25"
+    method: Literal["bm25", "dense", "hybrid"] = "bm25"
     query: str
     hits: tuple[SearchHit, ...]
     elapsed_ms: float = Field(ge=0)

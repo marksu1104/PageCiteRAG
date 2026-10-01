@@ -66,6 +66,64 @@ def test_metric_is_fraction_of_distinct_evidence_and_duplicates_do_not_inflate()
         recall_at((), (), 5)
 
 
+def test_dense_hybrid_compare_same_selection_and_reuse_indexes(
+    tmp_path, monkeypatch, synthetic_snapshot
+):
+    import numpy as np
+
+    class Encoder:
+        identity = {"model": "synthetic", "version": 1}
+        dimension = 2
+        documents_encoded = 0
+
+        def split_document(self, text):
+            return [(0, len(text))]
+
+        def encode_documents(self, texts):
+            self.documents_encoded += len(texts)
+            return np.array([[1, 0] if "Alpha" in t else [0, 1] for t in texts])
+
+        def encode_queries(self, texts):
+            return np.array([[1, 0] for _ in texts])
+
+    encoder = Encoder()
+    config = dict(
+        dev_questions=4, validation_questions=4, index_database=tmp_path / "shared.sqlite3"
+    )
+    bm25 = run_qasper(tmp_path, tmp_path / "out", **config)
+    dense = run_qasper(tmp_path, tmp_path / "out", **config, method="dense", encoder=encoder)
+    hybrid = run_qasper(tmp_path, tmp_path / "out", **config, method="hybrid", encoder=encoder)
+    assert bm25["selection_sha256"] == dense["selection_sha256"] == hybrid["selection_sha256"]
+    assert len({r["run_id"] for r in (bm25, dense, hybrid)}) == 3
+    assert dense["this_invocation"]["index_builds"] == 4
+    assert hybrid["this_invocation"]["index_builds"] == 0
+    assert encoder.documents_encoded == 8
+    for report in (bm25, dense, hybrid):
+        assert report["results"]["validation"]["metrics_at_k"]["10"]["macro_evidence_recall"] == 1
+        assert report["results"]["validation"]["evidence_groups"]["single"]["questions"] == 4
+    resumed = run_qasper(
+        tmp_path, tmp_path / "out", **config, method="dense", encoder=encoder, resume=True
+    )
+    assert resumed["this_invocation"]["questions_executed"] == 0
+    assert resumed["this_invocation"]["index_loads"] == 0
+    assert encoder.documents_encoded == 8
+    encoder.identity = {"model": "synthetic", "version": 2}
+    with pytest.raises(RetrievalError, match="configuration changed"):
+        from doc_rag.dense import DenseRetriever
+        from doc_rag.store import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(config["index_database"])
+        document_id, _ = qasper.ingest_paper(store, synthetic_snapshot["train"][0])
+        DenseRetriever(store, document_id, encoder)
+
+
+def test_dense_configuration_must_be_explicit(tmp_path):
+    with pytest.raises(EvaluationError, match="encoder"):
+        run_qasper(tmp_path, tmp_path / "out", method="dense")
+    with pytest.raises(EvaluationError, match="candidate"):
+        run_qasper(tmp_path, tmp_path / "out", candidates=5)
+
+
 def test_offline_runner_outputs_ids_only_and_reuses_completed_records(
     tmp_path, monkeypatch, synthetic_snapshot
 ):

@@ -5,8 +5,9 @@ testable Python package. The first document-ingestion slice accepts UTF-8 text,
 Markdown, and text-based PDFs, stores extracted source units and paragraph blocks
 in a local SQLite database, and can read the stored text back. A persisted BM25
 index searches one document's paragraphs and returns their exact stored text and
-source locations. Dense/hybrid retrieval, generation, and agent workflows are
-not implemented yet.
+source locations. Optional local Qwen embeddings add exact cosine retrieval and
+reciprocal-rank fusion (RRF) over the same source blocks. Generation and agent
+workflows are not implemented yet.
 
 ## Development
 
@@ -84,7 +85,48 @@ uv run --locked python scripts/benchmark_bm25.py --paragraphs 1000 --queries 50
 The reproducible smoke benchmark generates its own English text in a temporary
 directory and reports index-build time, snapshot-load time, and warm-search
 p50/p95 separately. Exact marker matches verify the path works; they do not
-measure evidence recall on the recorded benchmark slice without LLM generation.
+measure real-world evidence recall. It uses generated text only and no LLM.
+
+## Semantic and hybrid retrieval
+
+The optional `ml-cpu` extra is isolated from the core and CPU CI. The current
+real-model integration uses CPU float32; GPU installation/compatibility is not
+validated. It does not change system drivers or install a CUDA toolkit.
+
+```bash
+uv sync --locked --group dev --group eval --extra ml-cpu
+uv run --locked doc-rag model prepare-embedding
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 uv run --locked --extra ml-cpu python scripts/embedding_smoke.py
+uv run --locked --extra ml-cpu doc-rag index DOCUMENT_ID --method hybrid
+uv run --locked --extra ml-cpu doc-rag search DOCUMENT_ID 'your question' --method hybrid --top-k 5
+```
+
+Model preparation is an explicit network step (~1.2 GB of weights). The
+[Qwen model](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) is pinned to revision
+`97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`, with an allowlisted, hash-checked
+safetensors/config/tokenizer snapshot. Model weights are validated against the pinned snapshot.
+Inference loads local files only, disables remote model code, and requires the
+original snapshot to validate. No documents or questions are sent to a hosted API.
+
+Queries use the model's `query` instruction; passages use no instruction. The
+initial token budget is 512, overlap 64, dimensions 1024, batch size 4 and CPU
+threads 6. Long passages use original-character-offset windows; cosine scores
+are aggregated by maximum score per original paragraph **before** top-k. This
+preserves provenance and prevents duplicate subchunks from occupying the result
+list. Oversized queries are rejected, not silently truncated. These are fixed
+starting settings, not optimized hyperparameters.
+
+Dense indexes store normalized float32 vectors in `.npy`, loaded with
+`allow_pickle=False` and mmap. SQLite manifests validate model/config identity,
+source hashes, vector shape/checksum and segment-to-block mappings. Queries do
+not rebuild indexes. An `EmbeddingEncoder` protocol allows replacing the model
+without changing source storage; a different encoder requires an explicit rebuild.
+
+Hybrid retrieves up to 20 unique paragraphs from each branch, then sums
+`1 / (60 + rank)`. It never adds raw BM25 and cosine scores. Empty lexical
+branches contribute nothing; ties use source order. Dense search still ranks
+passages for unrelated nonempty questions: there is no calibrated relevance or
+answerability threshold yet. Retrieval is not an answer-grounding guarantee.
 
 ## QASPER retrieval evaluation
 
@@ -135,9 +177,34 @@ Recorded query failures remain in recall denominators with zero credit. Document
 are prepared/indexed once and their loaded retrievers serve all pending questions.
 Existing runs are not overwritten without explicit resume.
 
-The benchmark workflow retrieves pinned sources and builds its corpus and indexes. Public
-benchmark files contain identifiers, metrics, and provenance only. See
-[the frozen BM25 baseline](benchmarks/qasper-bm25/README.md) for measured results.
+See [the frozen BM25 baseline](benchmarks/qasper-bm25/README.md) for measured results.
+
+Run the same selected questions through BM25, dense and hybrid with one loaded
+model and shared persisted document indexes:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 uv run --locked --extra ml-cpu --group eval python scripts/qasper_comparison.py
+# Repeat the same run without executing completed questions:
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 uv run --locked --extra ml-cpu --group eval python scripts/qasper_comparison.py --resume
+```
+
+The comparison keeps seed 42, 50 development questions, 200 validation questions,
+the evidence-alignment policy and selection checksum fixed. Each method has a
+separate run ID and records its configuration. It reports single/multiple/three-or-more
+evidence coverage as well as overall recall. Compare results at the same k; these
+overlapping groups are diagnostics, not independent samples. Dense/hybrid query
+latency includes query embedding; build time includes document embedding. Shared
+indexes are built once; hybrid's reused indexing cost is not evidence that
+embedding preparation is free. No query translation or reranking is included.
+See [the frozen comparison](benchmarks/qasper-retrieval/README.md) for measured
+gains, multi-evidence regressions and CPU preparation costs.
+The CLI loads a model once per invocation; do not start a separate CLI process
+for every question in a batch. Use the comparison script or reuse one encoder
+and retriever through the Python API.
+
+For individual runs, `doc-rag eval qasper --method dense` or `--method hybrid`
+accepts the same model/token settings as index/search. Use `--output-dir` for
+separate experiments and optionally `--index-db` for a shared local corpus.
 
 QASPER attribution: Dasigi et al. (2021), *A Dataset of Information-Seeking
 Questions and Answers Anchored in Research Papers*. The
@@ -145,5 +212,3 @@ Questions and Answers Anchored in Research Papers*. The
 the dataset license as [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 This evaluation uses the dataset's structured text and does not redistribute
 source PDFs or grant rights to other documents.
-
-## Scope

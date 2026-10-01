@@ -1,13 +1,3 @@
-# User-provided files require review before publication.
-
-
-
-# Repository-specific artifacts are outside the supported application source.
-
-
-# User-provided files are handled outside the application package.
-
-
 # Derived document text, embeddings, databases, and evaluation outputs.
 /database/
 /data/
@@ -29,7 +19,6 @@ incorrect_answers*.json
 *.pdf
 
 # Notebook contents and embedded outputs require review before publication.
-# Publish new notebooks only after an explicit content review and rule change.
 *.ipynb
 .ipynb_checkpoints/
 

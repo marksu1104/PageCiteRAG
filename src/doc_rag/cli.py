@@ -7,6 +7,7 @@ import json
 import platform
 import sqlite3
 import sys
+import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Sequence
@@ -137,14 +138,42 @@ def _run_retrieval(args: argparse.Namespace) -> int:
         if not args.db.expanduser().is_file():
             raise RetrievalError("database was not found; ingest a document first")
         store = SQLiteDocumentStore(args.db)
+        encoder = _load_encoder(args) if args.method != "bm25" else None
         if args.command == "index":
-            result = build_bm25_index(store, args.document_id)
+            if args.method == "bm25":
+                result = build_bm25_index(store, args.document_id)
+            else:
+                from doc_rag.dense import build_dense_index
+
+                dense = build_dense_index(store, args.document_id, encoder)
+                if args.method == "hybrid":
+                    lexical = build_bm25_index(store, args.document_id)
+                    result = {
+                        "dense": dense.model_dump(mode="json"),
+                        "bm25": lexical.model_dump(mode="json"),
+                    }
+                else:
+                    result = dense
         else:
-            retriever = BM25Retriever(store, args.document_id)
+            if args.method == "bm25":
+                retriever = BM25Retriever(store, args.document_id)
+            else:
+                from doc_rag.dense import DenseRetriever
+
+                retriever = DenseRetriever(store, args.document_id, encoder)
+                if args.method == "hybrid":
+                    from doc_rag.hybrid import HybridRetriever
+
+                    retriever = HybridRetriever(
+                        BM25Retriever(store, args.document_id),
+                        retriever,
+                        candidates=max(20, args.top_k),
+                    )
             result = retriever.search(args.query, top_k=args.top_k)
-        print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, sort_keys=True))
+        report = result if isinstance(result, dict) else result.model_dump(mode="json")
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0
-    except (RetrievalError, StoreError, OSError, sqlite3.Error, ValidationError) as exc:
+    except (RetrievalError, StoreError, OSError, sqlite3.Error, ValidationError, ValueError) as exc:
         print(f"doc-rag: {args.command} failed: {exc}", file=sys.stderr)
         return 1
 
@@ -157,8 +186,12 @@ def _run_eval(args: argparse.Namespace) -> int:
             report = download_qasper(args.data_dir)
         else:
             from doc_rag.evaluation import EvaluationError, run_qasper
+            from doc_rag.retrieval import RetrievalError
 
             try:
+                start = time.perf_counter()
+                encoder = _load_encoder(args) if args.method != "bm25" else None
+                model_load_ms = (time.perf_counter() - start) * 1000 if encoder else 0
                 report = run_qasper(
                     args.data_dir,
                     args.output_dir,
@@ -167,8 +200,14 @@ def _run_eval(args: argparse.Namespace) -> int:
                     seed=args.seed,
                     resume=args.resume,
                     retry_errors=args.retry_errors,
+                    method=args.method,
+                    encoder=encoder,
+                    candidates=args.candidates,
+                    rrf_constant=args.rrf_constant,
+                    model_load_ms=model_load_ms,
+                    index_database=args.index_db,
                 )
-            except EvaluationError as exc:
+            except (EvaluationError, RetrievalError, ValueError) as exc:
                 print(f"doc-rag: evaluation failed: {exc}", file=sys.stderr)
                 return 1
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
@@ -176,6 +215,40 @@ def _run_eval(args: argparse.Namespace) -> int:
         return 1 if errors else 0
     except (QasperError, StoreError, OSError, sqlite3.Error, ValidationError) as exc:
         print(f"doc-rag: evaluation failed: {exc}", file=sys.stderr)
+        return 1
+
+
+def _embedding_options(parser: argparse.ArgumentParser) -> None:
+    # No embedding/model imports for --help, doctor or BM25 commands.
+    parser.add_argument("--model-dir", type=Path, default=None)
+    parser.add_argument("--max-tokens", type=_positive_integer, default=512)
+    parser.add_argument("--overlap", type=int, default=64)
+    parser.add_argument("--batch-size", type=_positive_integer, default=4)
+    parser.add_argument("--threads", type=_positive_integer, default=6)
+
+
+def _load_encoder(args: argparse.Namespace):
+    from doc_rag.embedding import DEFAULT_MODEL_DIR, QwenEmbeddingEncoder
+
+    return QwenEmbeddingEncoder(
+        args.model_dir or DEFAULT_MODEL_DIR,
+        max_tokens=args.max_tokens,
+        overlap=args.overlap,
+        batch_size=args.batch_size,
+        threads=args.threads,
+    )
+
+
+def _run_model(args: argparse.Namespace) -> int:
+    from doc_rag.embedding import DEFAULT_MODEL_DIR, prepare_embedding_model
+    from doc_rag.retrieval import RetrievalError
+
+    try:
+        report = prepare_embedding_model(args.model_dir or DEFAULT_MODEL_DIR)
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (RetrievalError, OSError, ValueError) as exc:
+        print(f"doc-rag: model preparation failed: {exc}", file=sys.stderr)
         return 1
 
 
@@ -248,6 +321,10 @@ def build_parser() -> argparse.ArgumentParser:
         "search", help="Search one document's existing BM25 index and return source blocks."
     )
     for retrieval_parser in (index_parser, search_parser):
+        retrieval_parser.add_argument(
+            "--method", choices=("bm25", "dense", "hybrid"), default="bm25"
+        )
+        _embedding_options(retrieval_parser)
         retrieval_parser.add_argument("document_id", help="Document ID returned by ingest.")
         retrieval_parser.add_argument(
             "--db",
@@ -275,12 +352,28 @@ def build_parser() -> argparse.ArgumentParser:
     qasper_parser.add_argument("--dev-questions", type=_positive_integer, default=50)
     qasper_parser.add_argument("--validation-questions", type=_positive_integer, default=200)
     qasper_parser.add_argument("--seed", type=int, default=42)
+    qasper_parser.add_argument("--method", choices=("bm25", "dense", "hybrid"), default="bm25")
+    qasper_parser.add_argument("--candidates", type=_positive_integer, default=20)
+    qasper_parser.add_argument("--rrf-constant", type=_positive_integer, default=60)
+    qasper_parser.add_argument(
+        "--index-db",
+        type=Path,
+        help="Optional shared corpus/index database across retrieval experiments.",
+    )
+    _embedding_options(qasper_parser)
     qasper_parser.add_argument(
         "--resume", action="store_true", help="Reuse verified completed question records."
     )
     qasper_parser.add_argument(
         "--retry-errors", action="store_true", help="With --resume, retry recorded failures."
     )
+
+    model_parser = subparsers.add_parser("model", help="Explicitly prepare local model files.")
+    model_commands = model_parser.add_subparsers(dest="model_action", required=True)
+    prepare_parser = model_commands.add_parser(
+        "prepare-embedding", help="Download and verify the pinned Qwen safetensors snapshot."
+    )
+    prepare_parser.add_argument("--model-dir", type=Path, default=None)
 
     return parser
 
@@ -299,6 +392,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_retrieval(args)
     if args.command == "eval":
         return _run_eval(args)
+    if args.command == "model":
+        return _run_model(args)
     if args.command is None:
         parser.print_help()
         return 0
