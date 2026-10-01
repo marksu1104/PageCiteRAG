@@ -19,7 +19,7 @@ from doc_rag.models import (
 )
 from doc_rag.text import iter_blocks
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class StoreError(RuntimeError):
@@ -66,16 +66,26 @@ class SQLiteDocumentStore:
                     "database already contains tables but is not a doc-rag store; "
                     "choose a new database file"
                 )
-            if version not in (0, _SCHEMA_VERSION):
+            if version not in (0, 1, _SCHEMA_VERSION):
                 raise StoreError(f"database schema version {version} is not supported")
 
             if version == 0:
                 self._create_schema(connection)
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             else:
                 required = {"documents", "document_units", "blocks"}
+                if version == _SCHEMA_VERSION:
+                    required.add("retrieval_indexes")
                 if not required.issubset(tables):
                     raise StoreError("doc-rag database schema is incomplete")
+
+            if version in (0, 1):
+                connection.execute(
+                    "CREATE TABLE retrieval_indexes ("
+                    "document_id TEXT NOT NULL, kind TEXT NOT NULL, manifest TEXT NOT NULL, "
+                    "PRIMARY KEY (document_id, kind), "
+                    "FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE)"
+                )
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
             connection.commit()
         except BaseException:
@@ -369,3 +379,24 @@ class SQLiteDocumentStore:
     def count_documents(self) -> int:
         with self._read_connection() as connection:
             return connection.execute("SELECT count(*) FROM documents").fetchone()[0]
+
+    def get_retrieval_manifest(self, document_id: str, kind: str) -> str | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT manifest FROM retrieval_indexes WHERE document_id = ? AND kind = ?",
+                (document_id, kind),
+            ).fetchone()
+        return row["manifest"] if row is not None else None
+
+    def save_retrieval_manifest(self, document_id: str, kind: str, manifest: str) -> None:
+        """Activate an already-written index; failure preserves the previous manifest."""
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    "INSERT INTO retrieval_indexes (document_id, kind, manifest) VALUES (?, ?, ?) "
+                    "ON CONFLICT(document_id, kind) DO UPDATE SET manifest = excluded.manifest",
+                    (document_id, kind, manifest),
+                )
+        finally:
+            connection.close()

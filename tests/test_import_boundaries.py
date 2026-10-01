@@ -11,7 +11,7 @@ import sys
 
 blocked = {
     "Utils", "llm", "torch", "transformers", "llama_index", "paddleocr",
-    "ckip_transformers", "chromadb",
+    "ckip_transformers", "chromadb", "bm25s", "jieba", "numpy", "scipy",
 }
 
 class ImportBlocker(importlib.abc.MetaPathFinder):

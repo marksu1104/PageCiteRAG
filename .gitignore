@@ -25,6 +25,7 @@ incorrect_answers*.json
 *.db
 *.sqlite
 *.sqlite3
+*.indexes/
 *.pdf
 
 # Notebook contents and embedded outputs require review before publication.

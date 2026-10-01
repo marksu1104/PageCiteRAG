@@ -129,6 +129,26 @@ def _positive_integer(value: str) -> int:
     return parsed
 
 
+def _run_retrieval(args: argparse.Namespace) -> int:
+    # Keep lexical libraries out of imports, --help and doctor startup.
+    from doc_rag.retrieval import BM25Retriever, RetrievalError, build_bm25_index
+
+    try:
+        if not args.db.expanduser().is_file():
+            raise RetrievalError("database was not found; ingest a document first")
+        store = SQLiteDocumentStore(args.db)
+        if args.command == "index":
+            result = build_bm25_index(store, args.document_id)
+        else:
+            retriever = BM25Retriever(store, args.document_id)
+            result = retriever.search(args.query, top_k=args.top_k)
+        print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, sort_keys=True))
+        return 0
+    except (RetrievalError, StoreError, OSError, sqlite3.Error, ValidationError) as exc:
+        print(f"doc-rag: {args.command} failed: {exc}", file=sys.stderr)
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="doc-rag",
@@ -191,6 +211,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"SQLite file (default: {_DEFAULT_DATABASE}).",
     )
 
+    index_parser = subparsers.add_parser(
+        "index", help="Build and activate a local BM25 index for one stored document."
+    )
+    search_parser = subparsers.add_parser(
+        "search", help="Search one document's existing BM25 index and return source blocks."
+    )
+    for retrieval_parser in (index_parser, search_parser):
+        retrieval_parser.add_argument("document_id", help="Document ID returned by ingest.")
+        retrieval_parser.add_argument(
+            "--db",
+            type=Path,
+            default=_DEFAULT_DATABASE,
+            help=f"SQLite file (default: {_DEFAULT_DATABASE}).",
+        )
+    search_parser.add_argument("query", help="Lexical query; quote queries containing spaces.")
+    search_parser.add_argument("--top-k", type=_positive_integer, default=5)
+
     return parser
 
 
@@ -204,6 +241,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_ingest(args)
     if args.command == "show":
         return _run_show(args)
+    if args.command in ("index", "search"):
+        return _run_retrieval(args)
     if args.command is None:
         parser.print_help()
         return 0
