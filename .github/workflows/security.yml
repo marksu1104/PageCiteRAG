@@ -1,0 +1,60 @@
+name: Dependency audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - pyproject.toml
+      - uv.lock
+      - .python-version
+      - .github/workflows/ci.yml
+      - .github/workflows/security.yml
+  pull_request:
+    paths:
+      - pyproject.toml
+      - uv.lock
+      - .python-version
+      - .github/workflows/ci.yml
+      - .github/workflows/security.yml
+  schedule:
+    - cron: "27 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [ci, parser, ml-cpu]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.20"
+          python-version: "3.11"
+          enable-cache: false
+      - name: Install locked audit tooling
+        run: uv sync --locked --no-default-groups --group dev --no-editable
+      - name: Export and audit locked dependencies
+        env:
+          AUDIT_PROFILE: ${{ matrix.profile }}
+        run: |
+          requirements_file="$RUNNER_TEMP/requirements-${AUDIT_PROFILE}.txt"
+          if [ "$AUDIT_PROFILE" = ci ]; then
+            uv -q export --locked --no-default-groups --group dev --group eval --extra api --extra gpu-embed --extra agent --no-emit-project --output-file "$requirements_file" >/dev/null
+            uv run --no-sync pip-audit --strict --disable-pip --require-hashes --requirement "$requirements_file"
+          else
+            uv -q export --locked --no-default-groups --extra "$AUDIT_PROFILE" --no-emit-project --output-file "$requirements_file" >/dev/null
+            uv run --no-sync pip-audit --strict --disable-pip --require-hashes --vulnerability-service osv --requirement "$requirements_file"
+          fi

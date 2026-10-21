@@ -96,6 +96,10 @@ uv run --no-sync ruff format --check src scripts tests
 uv run --no-sync python -m pytest -q
 ```
 
+`CPU checks` runs on pushes to `main` and pull requests. `Dependency audit` runs when dependency
+or workflow files change, every Monday at 02:27 UTC, or when started manually. Security findings
+fail the audit workflow independently of the CPU tests.
+
 GPU evaluation scripts require `PAGE_CITE_RAG_GPU_UUID` to identify the selected device.
 Scoring saved results does not require a GPU.
 
