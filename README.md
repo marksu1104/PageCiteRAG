@@ -1,214 +1,129 @@
-# doc-rag
+# PageCiteRAG
 
-Local-first document analysis and retrieval experiments, starting with a small,
-testable Python package. The first document-ingestion slice accepts UTF-8 text,
-Markdown, and text-based PDFs, stores extracted source units and paragraph blocks
-in a local SQLite database, and can read the stored text back. A persisted BM25
-index searches one document's paragraphs and returns their exact stored text and
-source locations. Optional local Qwen embeddings add exact cosine retrieval and
-reciprocal-rank fusion (RRF) over the same source blocks. Generation and agent
-workflows are not implemented yet.
+Local-first, bilingual document reading with answers linked to the original source text.
+Ingest a document, ask in English or Traditional Chinese, and read the passages behind each
+citation. The document workflow is implemented; answer-quality evaluation is in progress.
 
-## Development
+## What it does
 
-Use Python 3.11 and [uv](https://docs.astral.sh/uv/):
+- Ingest one text-based PDF, TXT, or Markdown document into a local SQLite store.
+- Search with BM25, dense retrieval, or hybrid retrieval when the matching embedding index is
+  prepared.
+- Ask in English or Traditional Chinese, or explain a selected passage; retrieve the cited
+  original text and its page/line/character location.
+- Run locally with a compatible local model backend; the application does not require a paid
+  hosted LLM API.
 
-```bash
-uv sync --locked --group dev
-uv run --locked doc-rag --help
-uv run --locked doc-rag doctor --json
-uv run --locked pytest -q
-```
+Citation validation confirms that quoted text exists in the stored source and belongs to the
+requested document. It does **not** prove that the quotation supports the answer or that the
+answer preserves every important detail. Inspect citations before relying on an answer.
 
-The `doctor` command reports only the Python, package, and SQLite versions/status.
-Ingestion is explicit; importing the package does not scan documents, download
-models, or initialize a database. The default database path is
-`database.sqlite3`; pass `--db` to choose another local path.
+## Quick start
+
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-uv run --locked doc-rag ingest ./paper.pdf --language en --usage-scope personal
-uv run --locked doc-rag show DOCUMENT_ID
-uv run --locked doc-rag show DOCUMENT_ID --unit 1
+git clone https://github.com/marksu1104/PageCiteRAG.git
+cd PageCiteRAG
+uv sync --locked --no-default-groups --group dev
+uv run --locked page-cite-rag --help
+uv run --locked page-cite-rag ingest ./paper.pdf
 ```
 
-PDF extraction uses pdfplumber's text layer only. Scanned pages are recorded as
-having no extractable text; OCR, table reconstruction, complex reading-order
-repair, and answer generation are out of scope for this parser. Extracted
-page text is parser output, not a claim of faithful visual or semantic PDF
-reconstruction. Do not ingest documents unless you are authorized to process
-them, and keep document text and databases local. The current slice has no
-document-level deletion or access-control feature; `--usage-scope` is only a
-local metadata label, not an authorization check. Avoid sensitive documents
-until those controls exist.
-
-## Lexical retrieval
-
-Build the index explicitly after ingestion, then search the returned document ID:
+Copy the `document_id` printed by `ingest`, then build a lexical index:
 
 ```bash
-uv run --locked doc-rag index DOCUMENT_ID
-uv run --locked doc-rag search DOCUMENT_ID "sample size" --top-k 5
-uv run --locked doc-rag search DOCUMENT_ID "樣本數" --top-k 5
+uv run --locked page-cite-rag index DOCUMENT_ID --method bm25
 ```
 
-The [BM25S](https://github.com/xhluca/bm25s) index uses Lucene scoring with
-`k1=1.5`, `b=0.75`, and the NumPy backend. English terms are case-folded; Han text
-uses jieba search-mode segmentation with HMM disabled. Search normalization does
-not change stored source text. Numbers and negations are kept, with no stopword
-removal. Results contain positive-score blocks only, ordered by score then source
-paragraph order. Empty or unmatched queries return an empty `hits` list.
+The default local database is `data/page-cite-rag.sqlite3`. Use `--db PATH` to select another
+location. `ask` does not download or pull a model: use the pinned local Ollama-compatible backend
+(`--backend ollama`) or prepare the pinned `llama.cpp` bundle with
+`python scripts/prepare_llama.py --help`. The latter requires an existing compatible local build
+toolchain; it does not install or update system drivers. Check disk, model, and GPU requirements
+before preparation.
 
-SQLite schema v1 stores are migrated transactionally to v2 when opened. Index
-snapshots live beside the database in `<database-filename>.indexes/`, which is
-a generated directory. SQLite records the active index, source fingerprint, tokenizer
-and engine versions, block-ID mapping, and file checksums. A failed rebuild keeps
-the previous active index. Old snapshots are retained; there is no automatic
-cleanup yet. Keep the database and its index directory together when moving them.
-Snapshots contain derived document vocabulary; keep them with the matching index metadata.
-
-Search loads a snapshot without rebuilding it. Python callers can reuse one
-`BM25Retriever` and stream `search_many()` results; separate CLI invocations each
-load their own snapshot. Missing, incompatible, or damaged indexes produce an
-error requiring an explicit `index` command. Use indexes generated by this application.
-Checksums detect accidental damage; they do not authenticate an index supplied
-by someone else.
-
-This baseline searches one document's existing paragraph blocks. It does not
-translate queries, split oversized paragraphs, or match Chinese queries to
-English text without shared terms. Bilingual tokenization tests do not establish
-cross-language retrieval quality.
+Once the matching local runtime and model are prepared, ask a question. For the prepared
+`llama.cpp` bundle:
 
 ```bash
-uv run --locked python scripts/benchmark_bm25.py --paragraphs 1000 --queries 50
+uv run --locked page-cite-rag ask DOCUMENT_ID \
+  "What are the main findings and limitations?" \
+  --backend llama --token-budget exact --language zh-Hant
 ```
 
-The reproducible smoke benchmark generates its own English text in a temporary
-directory and reports index-build time, snapshot-load time, and warm-search
-p50/p95 separately. Exact marker matches verify the path works; they do not
-measure real-world evidence recall. It uses generated text only and no LLM.
+## Optional retrieval and parsing components
 
-## Semantic and hybrid retrieval
-
-The optional `ml-cpu` extra is isolated from the core and CPU CI. The current
-real-model integration uses CPU float32; GPU installation/compatibility is not
-validated. It does not change system drivers or install a CUDA toolkit.
+Dense and hybrid indexes use the pinned Qwen embedding model. Installing the optional local
+embedding dependencies and preparing model files can require several gigabytes of disk space:
 
 ```bash
-uv sync --locked --group dev --group eval --extra ml-cpu
-uv run --locked doc-rag model prepare-embedding
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 uv run --locked --extra ml-cpu python scripts/embedding_smoke.py
-uv run --locked --extra ml-cpu doc-rag index DOCUMENT_ID --method hybrid
-uv run --locked --extra ml-cpu doc-rag search DOCUMENT_ID 'your question' --method hybrid --top-k 5
+uv sync --locked --no-default-groups --group dev --extra ml-cpu
+uv run --locked page-cite-rag model prepare-embedding
+uv run --locked page-cite-rag index DOCUMENT_ID --method hybrid
 ```
 
-Model preparation is an explicit network step (~1.2 GB of weights). The
-[Qwen model](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) is pinned to revision
-`97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`, with an allowlisted, hash-checked
-safetensors/config/tokenizer snapshot. Model weights are validated against the pinned snapshot.
-Inference loads local files only, disables remote model code, and requires the
-original snapshot to validate. No documents or questions are sent to a hosted API.
+Docling is an optional PDF parser for structured text and native source locations. OCR is
+disabled in this integration; scans and image-only evidence are outside the supported path. Its parser
+dependencies and model assets are optional and larger than the core install. Start with the
+default text parser and inspect extracted text before indexing.
 
-Queries use the model's `query` instruction; passages use no instruction. The
-initial token budget is 512, overlap 64, dimensions 1024, batch size 4 and CPU
-threads 6. Long passages use original-character-offset windows; cosine scores
-are aggregated by maximum score per original paragraph **before** top-k. This
-preserves provenance and prevents duplicate subchunks from occupying the result
-list. Oversized queries are rejected, not silently truncated. These are fixed
-starting settings, not optimized hyperparameters.
+## Local API
 
-Dense indexes store normalized float32 vectors in `.npy`, loaded with
-`allow_pickle=False` and mmap. SQLite manifests validate model/config identity,
-source hashes, vector shape/checksum and segment-to-block mappings. Queries do
-not rebuild indexes. An `EmbeddingEncoder` protocol allows replacing the model
-without changing source storage; a different encoder requires an explicit rebuild.
-
-Hybrid retrieves up to 20 unique paragraphs from each branch, then sums
-`1 / (60 + rank)`. It never adds raw BM25 and cosine scores. Empty lexical
-branches contribute nothing; ties use source order. Dense search still ranks
-passages for unrelated nonempty questions: there is no calibrated relevance or
-answerability threshold yet. Retrieval is not an answer-grounding guarantee.
-
-## QASPER retrieval evaluation
-
-Install the optional Parquet reader, explicitly prepare the public snapshot,
-then evaluate locally from the repository checkout:
+The API binds only to `127.0.0.1` and requires a bearer token on every endpoint. Set a private,
+nonempty secret in `PAGE_CITE_RAG_API_TOKEN` before starting `page-cite-rag serve`; the CLI does
+not generate, print, or log a token. For a temporary shell session, generate one without printing
+it and start the service:
 
 ```bash
-uv sync --locked --group dev --group eval
-uv run --locked --group eval doc-rag eval download-qasper
-uv run --locked --group eval doc-rag eval qasper
-uv run --locked --group eval doc-rag eval qasper --resume
+uv sync --locked --no-default-groups --group dev --extra api
+export PAGE_CITE_RAG_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+uv run --locked page-cite-rag serve DOCUMENT_ID
 ```
 
-The download command fetches only the pinned train/validation Parquet files and
-verifies their published SHA-256 and sizes. Evaluation reads these files offline;
-it does not run remote dataset scripts or download during retrieval. PyArrow is
-in the `eval` dependency group and is unnecessary for normal document search.
+Send the value in the `Authorization: Bearer …` header from the client. The API is intended for
+one local user, not as a network-facing or multi-user service.
 
-The baseline uses 50 train questions for development and 200 validation questions,
-seed 42, selected by shuffled document order followed by question ID before
-scoring. The split document IDs must be disjoint. Only nonblank `full_text`
-paragraphs are indexed, with their original boundaries and coordinates preserved.
-Titles, abstract fields, questions, answers, and evidence labels are not indexed.
-Dataset-derived line numbers refer to reconstructed text, not PDF pages.
+Before publishing changes, review the staged files. Ignore rules do not prevent an explicitly
+added file from being committed.
 
-Evidence alignment changes whitespace only. Each evidence paragraph must match
-exactly one source paragraph. An annotation containing figure/table evidence
-(`FLOAT SELECTED`), unmatched text, or ambiguous matches is excluded in full.
-Questions with at least one complete text annotation are eligible; the gold set
-is the union of distinct paragraphs across those valid annotations. Exclusion
-and annotation-issue counts cover the full source splits, including alternatives
-to otherwise eligible questions. The selected subset therefore does not represent
-figure/table or unanswerable-question performance.
-
-Reports contain question-level macro evidence recall@5/@10, micro recall, complete
-and partial coverage counts, per-query rankings/scores/timing, and exclusions.
-This is our paragraph-retrieval protocol, not the official QASPER Answer F1 or
-Evidence F1 leaderboard metric. It searches within a known paper and measures
-structured-text retrieval, not PDF parsing, cross-language quality, or generated
-answer correctness. Query timing excludes corpus preparation, index building,
-snapshot loading, and CLI output; first-query tokenizer setup is included.
-
-Results are under `outputs/qasper-bm25/<run-id>/`, with configuration, frozen
-selection, per-question records, aggregate JSONL, and summary JSON. Input hashes,
-code hashes, versions, and metric policy identify each run. Completed results are
-validated and reused with `--resume`; `--resume --retry-errors` retries failures.
-Recorded query failures remain in recall denominators with zero credit. Documents
-are prepared/indexed once and their loaded retrievers serve all pending questions.
-Existing runs are not overwritten without explicit resume.
-
-See [the frozen BM25 baseline](benchmarks/qasper-bm25/README.md) for measured results.
-
-Run the same selected questions through BM25, dense and hybrid with one loaded
-model and shared persisted document indexes:
+## Development checks
 
 ```bash
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 uv run --locked --extra ml-cpu --group eval python scripts/qasper_comparison.py
-# Repeat the same run without executing completed questions:
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 uv run --locked --extra ml-cpu --group eval python scripts/qasper_comparison.py --resume
+uv sync --locked --no-default-groups --group dev --group eval --extra api --extra gpu-embed --extra agent
+uv run --no-sync ruff check src scripts tests
+uv run --no-sync ruff format --check src scripts tests
+uv run --no-sync python -m pytest -q
 ```
 
-The comparison keeps seed 42, 50 development questions, 200 validation questions,
-the evidence-alignment policy and selection checksum fixed. Each method has a
-separate run ID and records its configuration. It reports single/multiple/three-or-more
-evidence coverage as well as overall recall. Compare results at the same k; these
-overlapping groups are diagnostics, not independent samples. Dense/hybrid query
-latency includes query embedding; build time includes document embedding. Shared
-indexes are built once; hybrid's reused indexing cost is not evidence that
-embedding preparation is free. No query translation or reranking is included.
-See [the frozen comparison](benchmarks/qasper-retrieval/README.md) for measured
-gains, multi-evidence regressions and CPU preparation costs.
-The CLI loads a model once per invocation; do not start a separate CLI process
-for every question in a batch. Use the comparison script or reuse one encoder
-and retriever through the Python API.
+GPU evaluation scripts require `PAGE_CITE_RAG_GPU_UUID` to identify the selected device.
+Scoring saved results does not require a GPU.
 
-For individual runs, `doc-rag eval qasper --method dense` or `--method hybrid`
-accepts the same model/token settings as index/search. Use `--output-dir` for
-separate experiments and optionally `--index-db` for a shared local corpus.
+QASPER retrieval evaluation and its scope are documented in
+[`benchmarks/qasper-retrieval/README.md`](benchmarks/qasper-retrieval/README.md). Its English
+paper QA metrics do not establish Chinese answer quality, PDF parsing accuracy, or full-document
+comprehension. Historical experiments are not directly comparable unless their data, models,
+prompts, code, and budgets match.
 
-QASPER attribution: Dasigi et al. (2021), *A Dataset of Information-Seeking
-Questions and Answers Anchored in Research Papers*. The
-[AllenAI dataset card](https://huggingface.co/datasets/allenai/qasper) identifies
-the dataset license as [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
-This evaluation uses the dataset's structured text and does not redistribute
-source PDFs or grant rights to other documents.
+## Current limits
+
+- This is a development snapshot, not a security-cleared release. The locked Pillow 12.3.0
+  dependency has known vulnerabilities fixed in Pillow 13; the optional Docling stack currently
+  requires Pillow <13, constraining the shared lock. Security audits remain blocking checks.
+  Do not expose this application publicly or process untrusted files. See the
+  [Pillow security fixes](https://pillow.readthedocs.io/en/stable/releasenotes/13.0.0.html).
+- The supported workflow is local, single-document reading. It is not an unlimited-context or
+  general multi-document research system.
+- OCR, image/chart understanding, robust complex-table interpretation, and production
+  multi-user authentication are not complete.
+- Retrieval and citation-location tests are not semantic answer-quality results. Full-document
+  conceptual understanding still needs a controlled quality evaluation.
+
+## Repository layout
+
+- `src/page_cite_rag/`: document storage, retrieval, answering, local inference, API, and evaluation support.
+- `tests/`: regression tests for the supported workflow and evaluation metrics.
+- `scripts/`: local model preparation, QASPER evaluation, scorer checks, and sanitized result export.
+- `benchmarks/`: published retrieval summaries and rankings.
+
+This repository contains the maintained application and public benchmark summaries.
