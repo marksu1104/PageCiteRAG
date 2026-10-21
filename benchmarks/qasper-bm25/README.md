@@ -54,8 +54,8 @@ uv run --locked --group eval page-cite-rag eval qasper
 uv run --locked --group eval page-cite-rag eval qasper --resume
 ```
 
-The run ID hashes configuration, code hashes,
-and selection. It can differ across dependency/Python versions; the reported
+The run ID hashes configuration, code hashes, and selection. It can differ
+across dependency/Python versions; the reported
 selection hash and policy allow checking whether the same questions were used.
 
 Data attribution: Dasigi et al. (2021), *A Dataset of Information-Seeking Questions

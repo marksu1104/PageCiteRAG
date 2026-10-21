@@ -364,11 +364,13 @@ def freeze(args: argparse.Namespace) -> dict:
         )
 
     manifest = {
-        "format": "pagecite-reading-eval/v3",
+        "format": "pagecite-reading-eval/v4",
         "created_date_utc": "2026-10-20",
         "seed": SEED,
         "state": "frozen_inputs_not_run",
-        "privacy": "Redistribute benchmark inputs, gold, and outputs only as permitted by source terms.",
+        "handling": (
+            "Redistribute benchmark inputs, gold, and outputs only as permitted by source terms."
+        ),
         "selection_policy": {
             "qasper": (
                 "hash-rank questions; exclude every paper with a previously exposed validation "

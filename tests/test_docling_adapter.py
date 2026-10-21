@@ -1,4 +1,4 @@
-"""Synthetic source-contract tests; without parser runtime or external documents."""
+"""Synthetic source-contract tests without parser runtime or external documents."""
 
 from __future__ import annotations
 
