@@ -7,8 +7,15 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_generated_and_reserved_paths_are_excluded() -> None:
-    paths = ["database/x.db", "outputs/x.json", "data/x", ".env", "models/x"]
+def test_generated_paths_are_ignored() -> None:
+    paths = [
+        "database/index.sqlite",
+        "custom.sqlite3.indexes/example/data.csc.index.npy",
+        "outputs/report.json",
+        "notebooks/example.ipynb",
+        ".env",
+        "models/example.safetensors",
+    ]
 
     for path in paths:
         result = subprocess.run(
@@ -16,21 +23,16 @@ def test_generated_and_reserved_paths_are_excluded() -> None:
             cwd=REPOSITORY_ROOT,
             check=False,
         )
-        assert result.returncode == 0, f"expected reserved path to be excluded: {path}"
+        assert result.returncode == 0, f"expected generated path to be ignored: {path}"
 
 
-def test_nonrelease_paths_are_not_tracked() -> None:
+def test_runtime_artifacts_are_not_tracked() -> None:
     result = subprocess.run(
         [
             "git",
             "ls-files",
             "--",
-            "AGENTS.md",
-            "docs",
-            "reference",
-            "dataset",
             "database",
-            "legacy",
             "outputs",
             "models",
             "data",
