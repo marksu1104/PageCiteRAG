@@ -21,7 +21,24 @@ def test_generated_and_reserved_paths_are_excluded() -> None:
 
 def test_nonrelease_paths_are_not_tracked() -> None:
     result = subprocess.run(
-        ["git", "ls-files", "--", "notes", "sources", "corpus", "database", "archive"],
+        [
+            "git",
+            "ls-files",
+            "--",
+            "AGENTS.md",
+            "docs",
+            "reference",
+            "dataset",
+            "database",
+            "legacy",
+            "outputs",
+            "models",
+            "data",
+            "artifacts",
+            "indexes",
+            "storage",
+            ".env",
+        ],
         cwd=REPOSITORY_ROOT,
         check=True,
         capture_output=True,
@@ -36,9 +53,9 @@ def test_build_configuration_has_explicit_package_allowlist() -> None:
         config = tomllib.load(config_file)
 
     targets = config["tool"]["hatch"]["build"]["targets"]
-    assert targets["wheel"]["packages"] == ["src/doc_rag"]
+    assert targets["wheel"]["packages"] == ["src/page_cite_rag"]
     assert set(targets["sdist"]["only-include"]) == {
         "README.md",
         "pyproject.toml",
-        "src/doc_rag",
+        "src/page_cite_rag",
     }

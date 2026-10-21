@@ -7,9 +7,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from doc_rag import evaluation, qasper
-from doc_rag.evaluation import run_qasper
-from doc_rag.qasper import Annotation, Paper, Passage, Question
+from page_cite_rag import evaluation, qasper
+from page_cite_rag.evaluation import run_qasper
+from page_cite_rag.qasper import Annotation, Paper, Passage, Question
 
 
 def publisher():

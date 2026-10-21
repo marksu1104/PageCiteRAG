@@ -7,12 +7,12 @@ import sqlite3
 import bm25s
 import pytest
 
-from doc_rag.cli import main
-from doc_rag.ingest import prepare_source
-from doc_rag.models import DocumentMetadata, ParsedUnit
-from doc_rag.retrieval import BM25Retriever, RetrievalError, build_bm25_index, index_root
-from doc_rag.store import SQLiteDocumentStore
-from doc_rag.tokenize import LexicalTokenizer
+from page_cite_rag.cli import main
+from page_cite_rag.ingest import prepare_source
+from page_cite_rag.models import DocumentMetadata, ParsedUnit
+from page_cite_rag.retrieval import BM25Retriever, RetrievalError, build_bm25_index, index_root
+from page_cite_rag.store import SQLiteDocumentStore
+from page_cite_rag.tokenize import LexicalTokenizer
 
 
 def _ingest(tmp_path, text="Alpha marker.\n\nBeta marker.\n\nAlpha marker.", name="sample.txt"):

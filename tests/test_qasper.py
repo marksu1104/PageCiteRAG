@@ -5,10 +5,10 @@ import io
 
 import pytest
 
-from doc_rag import qasper
-from doc_rag.qasper import Annotation, Paper, Passage, Question, align_question, ingest_paper
-from doc_rag.retrieval import BM25Retriever, build_bm25_index
-from doc_rag.store import SQLiteDocumentStore, StoreError
+from page_cite_rag import qasper
+from page_cite_rag.qasper import Annotation, Paper, Passage, Question, align_question, ingest_paper
+from page_cite_rag.retrieval import BM25Retriever, build_bm25_index
+from page_cite_rag.store import SQLiteDocumentStore, StoreError
 
 
 def make_row(paper_id="paper", paragraphs=None, questions=None):
@@ -37,19 +37,28 @@ def test_whitespace_alignment_retains_original_paragraph_and_coordinates():
     assert aligned.gold_passage_ids == ("paper/s0000/p0001",)
     assert aligned.exclusion_reason is None
     assert paper.passages[0].text == "Alpha\n\nsamples."
+    assert paper.section_names == ("Results",)
 
 
-@pytest.mark.parametrize("change", ["paragraphs", "evidence", "question_lengths"])
+@pytest.mark.parametrize("change", ["paragraphs", "evidence", "question_lengths", "section_names"])
 def test_malformed_arrow_row_is_not_silently_accepted(change):
     row = make_row()
     if change == "paragraphs":
         row["full_text"]["paragraphs"] = ["not a paragraph list"]
     elif change == "evidence":
         row["qas"]["answers"][0]["answer"][0]["evidence"] = "not an evidence list"
+    elif change == "section_names":
+        row["full_text"]["section_name"] = [42]
     else:
         row["qas"]["question_id"].pop()
     with pytest.raises(qasper.QasperError, match="schema"):
         qasper.paper_from_row(row)
+
+
+def test_null_section_heading_is_preserved_as_missing_metadata():
+    row = make_row()
+    row["full_text"]["section_name"] = [None]
+    assert qasper.paper_from_row(row).section_names == (None,)
 
 
 @pytest.mark.parametrize(
@@ -130,8 +139,8 @@ def test_qasper_store_keeps_paragraph_boundaries_and_does_not_index_questions(tm
 
 
 def test_invalid_custom_block_factory_rolls_back(tmp_path):
-    from doc_rag.ingest import prepare_source
-    from doc_rag.models import Block
+    from page_cite_rag.ingest import prepare_source
+    from page_cite_rag.models import Block
 
     path = tmp_path / "source.txt"
     path.write_text("Actual source.")

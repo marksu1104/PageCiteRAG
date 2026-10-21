@@ -20,13 +20,46 @@ mean every question improves or that hybrid dominates dense:
 | Multiple paragraphs (81 questions) | 49.69% / 17 | 60.38% / 27 | 56.91% / 22 |
 | Three or more (42-question subset) | 42.27% / 6 | 50.96% / 6 | 46.67% / 6 |
 
-Dense is better on the multi-evidence subset; hybrid is better on single-evidence
-questions. All methods completely recover evidence for only 6/42 questions in
-the three-or-more group. At @10 micro recall, dense (63.20%) also exceeds hybrid
+Dense has higher **union-evidence** recall on the union-multiple subset; hybrid
+is better on union-single questions. All methods completely recover the union
+for only 6/42 questions in the union-three-or-more group. At @10 micro recall,
+dense (63.20%) also exceeds hybrid
 (61.87%); macro gives each question equal weight, whereas micro weights questions
 by gold evidence count. This leaves substantial detail-coverage work unresolved.
 No statistical significance or universal superiority is claimed; questions
 within a paper are correlated and the evidence groups overlap.
+
+## Reference-aware interpretation correction (2026-10-03)
+
+The numerical baseline files and original union scores are unchanged. A
+retrospective check against the pinned annotations shows that missing union
+paragraphs must not automatically be interpreted as missing necessary answer
+evidence. Different annotators can provide alternative valid evidence sets.
+
+| Validation group / complete at least one reference @10 | BM25 | Dense | Hybrid |
+| --- | ---: | ---: | ---: |
+| All 200 questions | 129/200 | 138/200 | 145/200 |
+| Original union-multiple group | 41/81 | 45/81 | 46/81 |
+| Every valid reference contains at least two paragraphs | 7/35 | 7/35 | 7/35 |
+
+Of the 81 union-multiple questions, 46 have a valid single-paragraph alternative.
+Thus the earlier union-based regression does not establish worse answer-support
+coverage by hybrid. The 35-question group is still challenging, but annotation
+coverage is not proof of answer correctness, and multiple paragraphs do not
+necessarily imply multi-hop reasoning. These retrospective diagnostic groups
+were not pre-registered; no significance or leaderboard claim is made.
+
+Reference-aware recalculation is reproducible without rerunning models:
+
+```bash
+uv run --locked --group eval python scripts/qasper_diagnostics.py calibrate --output-dir outputs/qasper-diagnostics/reference-calibration
+```
+
+The new metrics include maximum paragraph-set F1 over the retained references,
+following the max-reference evaluation idea in [QASPER §4.1](https://aclanthology.org/2021.naacl-main.365.pdf).
+Our selected text-only subset/exclusions are different from official QASPER.
+The same diagnostic script also supports train-only candidate analysis with explicitly
+prepared local indexes; validation ranks are recalibrated, not used for search-parameter tuning.
 
 ## Protocol and costs
 
@@ -73,8 +106,8 @@ From the repository root, explicitly prepare public data and model files once:
 
 ```bash
 uv sync --locked --group dev --group eval --extra ml-cpu
-uv run --locked doc-rag eval download-qasper
-uv run --locked doc-rag model prepare-embedding
+uv run --locked page-cite-rag eval download-qasper
+uv run --locked page-cite-rag model prepare-embedding
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 uv run --locked --extra ml-cpu --group eval python scripts/qasper_comparison.py
 # Reuse all 750 completed method/question records:
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 uv run --locked --extra ml-cpu --group eval python scripts/qasper_comparison.py --resume

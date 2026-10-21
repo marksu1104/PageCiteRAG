@@ -17,9 +17,9 @@ from pathlib import Path
 
 import numpy as np
 
-from doc_rag.ingest import prepare_source
-from doc_rag.retrieval import BM25Retriever, build_bm25_index, index_root
-from doc_rag.store import SQLiteDocumentStore
+from page_cite_rag.ingest import prepare_source
+from page_cite_rag.retrieval import BM25Retriever, build_bm25_index, index_root
+from page_cite_rag.store import SQLiteDocumentStore
 
 
 def run_benchmark(*, paragraphs: int = 1000, queries: int = 50) -> dict:
@@ -31,7 +31,7 @@ def run_benchmark(*, paragraphs: int = 1000, queries: int = 50) -> dict:
         for i in range(paragraphs)
     )
     query_indexes = [(i * 7919) % paragraphs for i in range(queries)]
-    with tempfile.TemporaryDirectory(prefix="doc-rag-benchmark-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="page-cite-rag-benchmark-") as temporary:
         root = Path(temporary)
         source = root / "synthetic.txt"
         source.write_text(source_text, encoding="utf-8")

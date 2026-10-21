@@ -8,14 +8,15 @@ import subprocess
 import pytest
 from pydantic import ValidationError
 
-from doc_rag.cli import main
-from doc_rag.ingest import DocumentIngestError, prepare_source
-from doc_rag.models import DocumentMetadata, ParsedUnit
-from doc_rag.store import SQLiteDocumentStore, StoreError
+from page_cite_rag.cli import main
+from page_cite_rag.ingest import DocumentIngestError, prepare_source
+from page_cite_rag.models import DocumentMetadata, ParsedUnit
+from page_cite_rag.store import SQLiteDocumentStore, StoreError
 
 
-def _write_two_page_pdf(path) -> None:
-    text_stream = b"BT /F1 12 Tf 72 720 Td (English PDF page one.) Tj ET\n"
+def _write_two_page_pdf(path, text_stream=None) -> None:
+    if text_stream is None:
+        text_stream = b"BT /F1 12 Tf 72 720 Td (English PDF page one.) Tj ET\n"
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>",
@@ -190,6 +191,56 @@ def test_pdf_ingest_tracks_each_page_and_cli_reads_page_back(tmp_path, capsys) -
     assert "no extractable text" in capsys.readouterr().err
 
 
+def test_opt_in_pdf_stream_order_preserves_columns_and_separates_source_identity(
+    tmp_path, capsys
+) -> None:
+    source = tmp_path / "two-columns.pdf"
+    _write_two_page_pdf(
+        source,
+        b"BT /F1 12 Tf 72 720 Td (LEFT first.) Tj 0 -18 Td (LEFT NOT 65.) Tj ET\n"
+        b"BT /F1 12 Tf 330 720 Td (RIGHT first.) Tj 0 -18 Td (RIGHT 90.) Tj ET\n",
+    )
+    default = prepare_source(source)
+    flowed = prepare_source(source, pdf_reading_order="text-flow")
+    assert default.document.source_sha256 == flowed.document.source_sha256
+    assert default.document.document_id != flowed.document.document_id
+    assert ";extract-v1;x-tolerance-3;" in default.document.parser_version
+    assert "use-text-flow-true;x-tolerance-ratio-0.15" in flowed.document.parser_version
+    assert list(default.iter_units())[0].text.splitlines()[0] == "LEFT first. RIGHT first."
+    assert list(flowed.iter_units())[0].text == (
+        "LEFT first.\nLEFT NOT 65.\nRIGHT first.\nRIGHT 90."
+    )
+    database = tmp_path / "columns.sqlite3"
+    assert (
+        main(["ingest", str(source), "--db", str(database), "--pdf-reading-order", "text-flow"])
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["document"]["document_id"] == flowed.document.document_id
+    store = SQLiteDocumentStore(database)
+    unit = store.get_unit(flowed.document.document_id, 1)
+    assert unit.text == list(flowed.iter_units())[0].text
+    assert store.get_unit(flowed.document.document_id, 2).status == "no_text"
+    assert all(
+        unit.text[b.char_start : b.char_end] == b.text
+        for b in store.get_blocks(flowed.document.document_id)
+    )
+
+
+def test_pdf_order_rejects_unknown_or_non_pdf_inputs_before_creating_store(tmp_path, capsys):
+    source = tmp_path / "plain.txt"
+    source.write_text("NOT a PDF.")
+    with pytest.raises(DocumentIngestError, match="unsupported PDF reading order"):
+        prepare_source(source, pdf_reading_order="automatic")
+    database = tmp_path / "should-not-exist.sqlite3"
+    assert (
+        main(["ingest", str(source), "--db", str(database), "--pdf-reading-order", "text-flow"])
+        == 1
+    )
+    assert "only to PDF" in capsys.readouterr().err
+    assert not database.exists()
+
+
 def test_installed_cli_ingests_and_reads_text_from_outside_repository(
     tmp_path,
 ) -> None:
@@ -197,7 +248,7 @@ def test_installed_cli_ingests_and_reads_text_from_outside_repository(
     source_text = "# Notes\n\nEnglish detail.\n\n中文細節。\n"
     source.write_text(source_text, encoding="utf-8", newline="")
     database = tmp_path / "local" / "documents.sqlite3"
-    executable = shutil.which("doc-rag")
+    executable = shutil.which("page-cite-rag")
     assert executable is not None
 
     ingest = subprocess.run(

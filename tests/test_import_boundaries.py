@@ -12,7 +12,7 @@ import sys
 blocked = {
     "Utils", "llm", "torch", "transformers", "llama_index", "paddleocr",
     "ckip_transformers", "chromadb", "bm25s", "jieba", "numpy", "scipy", "pyarrow",
-    "sentence_transformers", "huggingface_hub",
+    "sentence_transformers", "huggingface_hub", "httpx", "ollama",
 }
 
 class ImportBlocker(importlib.abc.MetaPathFinder):
@@ -22,8 +22,8 @@ class ImportBlocker(importlib.abc.MetaPathFinder):
         return None
 
 sys.meta_path.insert(0, ImportBlocker())
-import doc_rag
-from doc_rag.cli import main
+import page_cite_rag
+from page_cite_rag.cli import main
 
 assert main(["doctor", "--json"]) == 0
 """
@@ -44,13 +44,18 @@ import importlib.abc
 import sys
 class Blocker(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.', 1)[0] in {'torch', 'transformers', 'sentence_transformers'}:
+        blocked = {'torch', 'transformers', 'sentence_transformers', 'httpx', 'ollama'}
+        if fullname.split('.', 1)[0] in blocked:
             raise AssertionError('model dependency imported in core')
 sys.meta_path.insert(0, Blocker())
-import doc_rag.embedding
-import doc_rag.dense
-import doc_rag.hybrid
-import doc_rag.evaluation
+import page_cite_rag.embedding
+import page_cite_rag.dense
+import page_cite_rag.hybrid
+import page_cite_rag.evaluation
+import page_cite_rag.evidence_metrics
+import page_cite_rag.diagnostics
+import page_cite_rag.generation
+import page_cite_rag.llama
 """
     result = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

@@ -5,11 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from doc_rag import evaluation, qasper
-from doc_rag.cli import main
-from doc_rag.evaluation import EvaluationError, recall_at, run_qasper, select_questions
-from doc_rag.qasper import Annotation, Paper, Passage, Question
-from doc_rag.retrieval import BM25Retriever, RetrievalError
+from page_cite_rag import evaluation, qasper
+from page_cite_rag.cli import main
+from page_cite_rag.evaluation import EvaluationError, recall_at, run_qasper, select_questions
+from page_cite_rag.qasper import Annotation, Paper, Passage, Question
+from page_cite_rag.retrieval import BM25Retriever, RetrievalError
 
 
 def paper(paper_id, *, questions=3):
@@ -109,8 +109,8 @@ def test_dense_hybrid_compare_same_selection_and_reuse_indexes(
     assert encoder.documents_encoded == 8
     encoder.identity = {"model": "synthetic", "version": 2}
     with pytest.raises(RetrievalError, match="configuration changed"):
-        from doc_rag.dense import DenseRetriever
-        from doc_rag.store import SQLiteDocumentStore
+        from page_cite_rag.dense import DenseRetriever
+        from page_cite_rag.store import SQLiteDocumentStore
 
         store = SQLiteDocumentStore(config["index_database"])
         document_id, _ = qasper.ingest_paper(store, synthetic_snapshot["train"][0])
@@ -122,6 +122,48 @@ def test_dense_configuration_must_be_explicit(tmp_path):
         run_qasper(tmp_path, tmp_path / "out", method="dense")
     with pytest.raises(EvaluationError, match="candidate"):
         run_qasper(tmp_path, tmp_path / "out", candidates=5)
+
+
+def test_train_only_versioned_dense_reuses_scorer_without_overwriting_legacy(
+    tmp_path, synthetic_snapshot
+):
+    import numpy as np
+
+    from page_cite_rag.dense import dense_index_kind
+    from page_cite_rag.store import SQLiteDocumentStore
+
+    class Encoder:
+        identity = {"model": "synthetic", "device": "gpu"}
+        dimension = 2
+
+        def split_document(self, text):
+            return [(0, len(text))]
+
+        def encode_documents(self, texts):
+            return np.array([[1, 0] if "Alpha" in text else [0, 1] for text in texts])
+
+        def encode_queries(self, texts):
+            return np.array([[1, 0] for _ in texts])
+
+    encoder = Encoder()
+    config = dict(dev_questions=4, validation_questions=0, index_database=tmp_path / "db.sqlite3")
+    legacy = run_qasper(tmp_path, tmp_path / "out", **config, method="dense", encoder=encoder)
+    versioned = run_qasper(
+        tmp_path,
+        tmp_path / "out",
+        **config,
+        method="dense",
+        encoder=encoder,
+        versioned_dense=True,
+    )
+    assert legacy["selection_sha256"] == versioned["selection_sha256"]
+    assert legacy["run_id"] != versioned["run_id"]
+    assert set(versioned["results"]) == {"train"}
+    assert versioned["coverage"]["validation"]["status"] == "not_selected"
+    store = SQLiteDocumentStore(config["index_database"])
+    document_id, _ = qasper.ingest_paper(store, synthetic_snapshot["train"][0])
+    assert store.get_retrieval_manifest(document_id, "dense") is not None
+    assert store.get_retrieval_manifest(document_id, dense_index_kind(encoder)) is not None
 
 
 def test_offline_runner_outputs_ids_only_and_reuses_completed_records(

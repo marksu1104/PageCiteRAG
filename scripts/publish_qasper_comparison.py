@@ -7,7 +7,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from doc_rag.evaluation import QueryRecord, _json_hash, _summarize
+from page_cite_rag.evaluation import QueryRecord, _json_hash, _summarize
 
 
 def publish(source: Path, destination: Path) -> None:

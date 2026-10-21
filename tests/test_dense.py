@@ -6,12 +6,12 @@ import json
 import numpy as np
 import pytest
 
-from doc_rag import dense, embedding
-from doc_rag.dense import DenseRetriever, build_dense_index
-from doc_rag.embedding import normalized_vectors
-from doc_rag.ingest import prepare_source
-from doc_rag.retrieval import RetrievalError, index_root
-from doc_rag.store import SQLiteDocumentStore
+from page_cite_rag import dense, embedding
+from page_cite_rag.dense import DenseRetriever, build_dense_index, dense_index_kind
+from page_cite_rag.embedding import normalized_vectors
+from page_cite_rag.ingest import prepare_source
+from page_cite_rag.retrieval import RetrievalError, index_root
+from page_cite_rag.store import SQLiteDocumentStore
 
 
 class FakeEncoder:
@@ -130,6 +130,47 @@ def test_failed_dense_build_keeps_active_snapshot(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         build_dense_index(store, document_id, encoder)
     assert DenseRetriever(store, document_id, encoder).manifest.index_id == original.index_id
+
+
+def test_versioned_dense_index_coexists_with_legacy_and_requires_explicit_selection(tmp_path):
+    store, document_id = ingest(tmp_path)
+    cpu = FakeEncoder()
+    legacy = build_dense_index(store, document_id, cpu)
+    gpu = FakeEncoder()
+    gpu.identity = {**cpu.identity, "backend": "native-gpu", "model_sha256": "a" * 64}
+    kind = dense_index_kind(gpu)
+    assert kind.startswith("dense:") and len(kind) == len("dense:") + 64
+    versioned = build_dense_index(store, document_id, gpu, versioned=True)
+
+    assert store.get_retrieval_manifest(document_id, "dense") is not None
+    assert store.get_retrieval_manifest(document_id, kind) is not None
+    assert DenseRetriever(store, document_id, cpu).manifest.index_id == legacy.index_id
+    assert DenseRetriever(store, document_id, gpu, versioned=True).manifest.index_id == (
+        versioned.index_id
+    )
+    with pytest.raises(RetrievalError, match="configuration changed"):
+        DenseRetriever(store, document_id, gpu)
+    with pytest.raises(RetrievalError, match="no dense index"):
+        DenseRetriever(store, document_id, cpu, versioned=True)
+
+
+def test_failed_versioned_build_does_not_switch_either_active_index(tmp_path):
+    store, document_id = ingest(tmp_path)
+    cpu = FakeEncoder()
+    legacy = build_dense_index(store, document_id, cpu)
+    gpu = FakeEncoder()
+    gpu.identity = {**cpu.identity, "backend": "native-gpu"}
+    versioned = build_dense_index(store, document_id, gpu, versioned=True)
+    gpu.encode_documents = lambda texts: np.zeros((len(texts), 2))
+    with pytest.raises(RetrievalError, match="zero"):
+        build_dense_index(store, document_id, gpu, versioned=True)
+    assert DenseRetriever(store, document_id, cpu).manifest.index_id == legacy.index_id
+    assert DenseRetriever(store, document_id, gpu, versioned=True).manifest.index_id == (
+        versioned.index_id
+    )
+    gpu.identity["unserializable"] = object()
+    with pytest.raises(RetrievalError, match="JSON serializable"):
+        dense_index_kind(gpu)
 
 
 def test_invalid_encoder_segments_and_outputs_are_not_activated(tmp_path):

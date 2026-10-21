@@ -48,10 +48,10 @@ Reproduce from a source checkout:
 
 ```bash
 uv sync --locked --group dev --group eval
-uv run --locked --group eval doc-rag eval download-qasper
-uv run --locked --group eval doc-rag eval qasper
+uv run --locked --group eval page-cite-rag eval download-qasper
+uv run --locked --group eval page-cite-rag eval qasper
 # If that run already exists:
-uv run --locked --group eval doc-rag eval qasper --resume
+uv run --locked --group eval page-cite-rag eval qasper --resume
 ```
 
 The run ID hashes configuration, code hashes,

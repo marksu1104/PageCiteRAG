@@ -7,8 +7,8 @@ import json
 import time
 from pathlib import Path
 
-from doc_rag.embedding import DEFAULT_MODEL_DIR, QwenEmbeddingEncoder
-from doc_rag.evaluation import run_qasper
+from page_cite_rag.embedding import DEFAULT_MODEL_DIR, QwenEmbeddingEncoder
+from page_cite_rag.evaluation import run_qasper
 
 
 def main() -> None:

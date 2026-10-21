@@ -4,9 +4,9 @@ import hashlib
 
 import pytest
 
-from doc_rag.hybrid import HybridRetriever, reciprocal_rank_fusion
-from doc_rag.models import Block
-from doc_rag.retrieval import RetrievalError, SearchHit, SearchResult
+from page_cite_rag.hybrid import HybridRetriever, reciprocal_rank_fusion
+from page_cite_rag.models import Block
+from page_cite_rag.retrieval import RetrievalError, SearchHit, SearchResult
 
 
 def result(ordinals, scores=None, document_id="1" * 64, query="q"):
@@ -70,7 +70,10 @@ def test_hybrid_limits_candidates_and_reuses_branches():
 
     lexical, dense = Branch([]), Branch([1, 2])
     retriever = HybridRetriever(lexical, dense, candidates=20)
-    assert retriever.search("q", top_k=1).method == "hybrid"
+    combined = retriever.search("q", top_k=1)
+    assert combined.method == "hybrid"
+    assert [branch.name for branch in combined.branches] == ["lexical", "dense"]
+    assert [len(branch.block_ids) for branch in combined.branches] == [0, 2]
     assert lexical.calls == dense.calls == [("q", 20)]
     with pytest.raises(ValueError):
         retriever.search("q", top_k=21)
