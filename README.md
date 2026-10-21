@@ -100,10 +100,6 @@ uv run --no-sync python -m pytest -q
 or workflow files change, every Monday at 02:27 UTC, or when started manually. Security findings
 fail the audit workflow independently of the CPU tests.
 
-Dependabot checks Python dependencies weekly and GitHub Actions monthly. Related Docling and
-Pillow updates are grouped for review. Update pull requests run the same checks before merging;
-updates are not merged automatically.
-
 GPU evaluation scripts require `PAGE_CITE_RAG_GPU_UUID` to identify the selected device.
 Scoring saved results does not require a GPU.
 
