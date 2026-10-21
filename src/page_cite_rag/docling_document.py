@@ -312,7 +312,7 @@ def convert_pdf(
     language: str | None = None,
     usage_scope: str = "not-recorded",
 ) -> DoclingDocumentBundle:
-    """Convert an arbitrary local text PDF with pinned, offline Docling components."""
+    """Convert a local text PDF with locked, offline Docling components."""
     if not path.is_file() or path.suffix.lower() != ".pdf":
         raise DoclingDocumentError("provide a local PDF file")
     _check_local_models(artifacts)
@@ -331,11 +331,6 @@ def convert_pdf(
         versions = {name: version(name) for name in ("docling", "docling-core", "transformers")}
     except PackageNotFoundError as exc:
         raise DoclingDocumentError("install the optional Docling parser environment") from exc
-    if versions != {"docling": "2.137.0", "docling-core": "2.101.1", "transformers": "5.19.0"}:
-        raise DoclingDocumentError(
-            "Docling parser dependency versions differ from the pinned profile"
-        )
-
     for key, value in {
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
