@@ -20,6 +20,45 @@ def reference_runner(monkeypatch):
     return module
 
 
+@pytest.fixture
+def configuration_manifest(tmp_path):
+    """Minimal configuration inputs, not copies of historical evaluation data."""
+
+    def create(phase):
+        manifest = {
+            "phase": phase,
+            "case_count": 1,
+            "qasper": {"revision": "test", "split": "validation", "sha256": "test-qasper"},
+            "xrag": {"revision": "test", "sha256": "test-xrag"},
+            "drcd": {"revision": "test", "sha256": "test-drcd"},
+            "pdfs": {},
+            "parent_q3_sha256": "test-q3",
+            "parent_p0_sha256": "test-p0",
+            "parent_q5_sha256": "test-q5",
+            "parent_q6_sha256": "test-q6",
+            "shared": {
+                "answer_contract": "test-contract",
+                "exact_input_token_cap": 10_000,
+                "output_tokens_per_call": 1_536,
+                "template_reserve": 1_024,
+                "common_context_preflight": True,
+            },
+            "selection_policy": {"max_sources": 12},
+            "selection": {"seed": 42},
+            "fallback_policy": "stop on technical selector failure",
+            "resource_limits": {"memory_mib": 12_000},
+            "generation_limits": {
+                "invocation_wall_seconds": 60,
+                "invocation_generation_seconds": 30,
+            },
+        }
+        path = tmp_path / f"{phase}.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return manifest, path
+
+    return create
+
+
 def test_missing_gpu_selection_stops_before_execution(reference_runner, monkeypatch, capsys):
     monkeypatch.setattr(reference_runner, "GPU_UUID", "")
     monkeypatch.setattr(sys, "argv", ["compare_reference.py", "--preflight-only"])
@@ -313,23 +352,30 @@ def test_identifies_closed_client_without_a_new_generation_call(
     assert reference_runner.client_closed_before_generation(error_type, error) is expected
 
 
-def test_q4_manifest_is_pinned_to_first_eight_answerable_q3_cases(reference_runner):
-    manifest = reference_runner.read_manifest(reference_runner.Q4_MANIFEST_PATH)
+@pytest.mark.parametrize("state", ["missing", "unknown", "changed"])
+def test_manifest_rejects_missing_unrecognized_or_changed_files(
+    reference_runner, tmp_path, monkeypatch, state
+):
+    path = tmp_path / "manifest.json"
+    if state != "missing":
+        path.write_text("{}", encoding="utf-8")
+    if state == "changed":
+        monkeypatch.setattr(reference_runner, "Q4_MANIFEST_PATH", path)
+        monkeypatch.setattr(reference_runner, "Q4_MANIFEST_SHA256", "not-the-file-hash")
 
-    assert manifest["phase"] == "Q4"
-    assert manifest["arms"] == ["fixed", "agent"]
-    q3 = json.loads(reference_runner.Q3_MANIFEST_PATH.read_text(encoding="utf-8"))
-    q3_answerable = [case for case in q3["cases"] if case["kind"] == "qasper"][:8]
-    assert [case["id"] for case in manifest["cases"]] == [case["id"] for case in q3_answerable]
+    with pytest.raises(ValueError, match="missing|checksum changed"):
+        reference_runner.read_manifest(path)
 
 
-def test_q4_static_configuration_records_comparison_and_agent_limits(reference_runner):
-    manifest = reference_runner.read_manifest(reference_runner.Q4_MANIFEST_PATH)
+def test_q4_static_configuration_records_comparison_and_agent_limits(
+    reference_runner, configuration_manifest
+):
+    manifest, path = configuration_manifest("Q4")
 
     static = reference_runner.static_configuration(
         manifest,
         final_k=10,
-        manifest_path=reference_runner.Q4_MANIFEST_PATH,
+        manifest_path=path,
     )
 
     assert set(static["arms"]) == {"fixed", "agent"}
@@ -338,57 +384,57 @@ def test_q4_static_configuration_records_comparison_and_agent_limits(reference_r
     assert static["agent"]["final_answer_calls"] == 1
     assert static["shared"]["exact_input_token_cap"] == 10_000
     assert "reranker" not in static["models"]
+    assert static["manifest_sha256"] == reference_runner.sha256(path)
 
 
-def test_q5_manifest_is_pinned_to_q3_plus_the_four_exposed_pdf_cases(reference_runner):
-    manifest = reference_runner.read_manifest(reference_runner.Q5_MANIFEST_PATH)
-
-    assert manifest["phase"] == "Q5"
-    assert manifest["arms"] == ["A", "B"]
-    assert len(manifest["cases"]) == 44
-    assert sum(case["kind"] == "pdf" for case in manifest["cases"]) == 4
+def test_q5_static_configuration_records_shared_answer_and_failure_contracts(
+    reference_runner, configuration_manifest
+):
+    manifest, path = configuration_manifest("Q5")
     static = reference_runner.static_configuration(
         manifest,
         final_k=10,
-        manifest_path=reference_runner.Q5_MANIFEST_PATH,
+        manifest_path=path,
     )
     assert static["shared"]["same_final_answer_schema_and_prompt"] is True
     assert static["shared"]["continue_after_recorded_non_guard_case_failure"] is True
     assert static["shared"]["stop_after_generation_client_closes"] is True
     assert static["evidence_first"]["max_completion_calls_per_case"] == 2
+    assert static["parent_q3_sha256"] == manifest["parent_q3_sha256"]
+    assert static["manifest_sha256"] == reference_runner.sha256(path)
 
 
-def test_q6_manifest_is_pinned_to_q5_and_declares_smoke_subset(reference_runner):
-    manifest = reference_runner.read_manifest(reference_runner.Q6_MANIFEST_PATH)
-
-    assert manifest["phase"] == "Q6"
-    assert manifest["arms"] == ["A1", "B1"]
-    assert len(manifest["cases"]) == 44
-    assert len(manifest["smoke_case_ids"]) == 6
+def test_q6_static_configuration_records_candidate_and_selection_policy(
+    reference_runner, configuration_manifest
+):
+    manifest, path = configuration_manifest("Q6")
     static = reference_runner.static_configuration(
         manifest,
         final_k=10,
-        manifest_path=reference_runner.Q6_MANIFEST_PATH,
+        manifest_path=path,
     )
     assert static["shared"]["candidate_pool_k"] == 20
     assert static["arms"]["A1"].startswith("common top-20")
-    assert "technical selector failure" in static["fallback_policy"]
+    assert static["fallback_policy"] == manifest["fallback_policy"]
+    assert static["selection"] == manifest["selection_policy"]
+    assert static["manifest_sha256"] == reference_runner.sha256(path)
 
 
-def test_q6_confirmation_manifest_is_an_a1_only_sample_from_new_papers(reference_runner):
-    manifest = reference_runner.read_manifest(reference_runner.Q6_CONFIRMATION_MANIFEST_PATH)
+def test_confirmation_static_configuration_records_single_arm_and_lineage(
+    reference_runner, configuration_manifest
+):
+    manifest, path = configuration_manifest("Q6-confirmation")
     static = reference_runner.static_configuration(
         manifest,
         final_k=10,
-        manifest_path=reference_runner.Q6_CONFIRMATION_MANIFEST_PATH,
+        manifest_path=path,
     )
 
-    assert manifest["phase"] == "Q6-confirmation"
-    assert manifest["arms"] == ["A1"]
-    assert len(manifest["cases"]) == 8
-    assert len({case["paper_id"] for case in manifest["cases"]}) == 8
     assert static["run_version"] == "quality-convergence-q6-a1-confirmation-v1"
     assert set(static["arms"]) == {"A1"}
+    assert static["parent_q6_sha256"] == manifest["parent_q6_sha256"]
+    assert static["confirmation_selection"] == manifest["selection"]
+    assert static["manifest_sha256"] == reference_runner.sha256(path)
 
 
 @pytest.mark.parametrize(

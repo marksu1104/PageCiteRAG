@@ -115,6 +115,13 @@ def clients(monkeypatch):
     return opened
 
 
+@pytest.fixture
+def tokenizer_directory(tmp_path):
+    directory = tmp_path / "test-tokenizer"
+    directory.mkdir()
+    return directory
+
+
 def ask_arguments(document, *options):
     store, document_id, _ = document
     return ["ask", document_id, "significant", "--db", str(store.database_path), *options]
@@ -528,13 +535,14 @@ def test_agent_cli_uses_bounded_context_then_shared_answer_path(
 
 
 def test_native_gpu_ask_searches_before_opening_the_generation_model(
-    document, clients, monkeypatch, capsys
+    document, clients, tokenizer_directory, monkeypatch, capsys
 ):
     from page_cite_rag.retrieval import BM25Retriever
 
     store, document_id, _ = document
     build_bm25_index(store, document_id)
     events = []
+    expected_tokenizer_directory = tokenizer_directory
 
     class FakeStagedGpuSearch:
         def __init__(
@@ -554,6 +562,7 @@ def test_native_gpu_ask_searches_before_opening_the_generation_model(
             assert model_path.name == "Qwen3-Embedding-0.6B-f16.gguf"
             assert gpu_uuid == "GPU-12345678-1234-1234-1234-123456789abc"
             assert gpu_temperature_limit_c == 80
+            assert tokenizer_directory == expected_tokenizer_directory
             assert tokenizer_directory.is_dir()
             assert clients == []
             events.append("embedding setup")
@@ -590,6 +599,8 @@ def test_native_gpu_ask_searches_before_opening_the_generation_model(
         "cuda",
         "--gpu-uuid",
         "GPU-12345678-1234-1234-1234-123456789abc",
+        "--model-dir",
+        str(tokenizer_directory),
         "--format",
         "json",
     )
@@ -606,7 +617,7 @@ def test_native_gpu_ask_searches_before_opening_the_generation_model(
 
 
 def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
-    document, clients, monkeypatch, capsys
+    document, clients, tokenizer_directory, monkeypatch, capsys
 ):
     from contextlib import contextmanager
 
@@ -621,6 +632,7 @@ def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
         lambda _args: pytest.fail("native GPU must not silently fall back to CPU"),
     )
     events = []
+    expected_tokenizer_directory = tokenizer_directory
 
     class FakeStagedGpuSearch:
         def __init__(
@@ -637,6 +649,7 @@ def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
             assert passed_store.database_path == store.database_path
             assert passed_document_id == document_id
             assert method == "hybrid"
+            assert tokenizer_directory == expected_tokenizer_directory
             assert tokenizer_directory.is_dir()
             assert gpu_temperature_limit_c == 88
             assert clients == []
@@ -692,6 +705,8 @@ def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
         "cuda",
         "--gpu-uuid",
         "GPU-12345678-1234-1234-1234-123456789abc",
+        "--model-dir",
+        str(tokenizer_directory),
         "--gpu-temperature-limit",
         "88",
         "--agent",
