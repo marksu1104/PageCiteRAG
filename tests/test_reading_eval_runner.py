@@ -21,6 +21,11 @@ sys.modules[_RUNNER_SPEC.name] = run_reading_eval
 _RUNNER_SPEC.loader.exec_module(run_reading_eval)
 
 
+@pytest.fixture(autouse=True)
+def _local_embedding_tokenizer(monkeypatch, embedding_tokenizer_dir):
+    monkeypatch.setattr(run_reading_eval, "DEFAULT_MODEL_DIR", embedding_tokenizer_dir)
+
+
 def _write_frozen_fixture(root, case_ids, row_ids=None):
     rows = [{"case_id": case_id} for case_id in (case_ids if row_ids is None else row_ids)]
     payload = "".join(json.dumps(row) + "\n" for row in rows).encode()

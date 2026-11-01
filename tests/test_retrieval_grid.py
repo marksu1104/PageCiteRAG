@@ -21,6 +21,11 @@ reading_eval = module_from_spec(_SPEC)
 _SPEC.loader.exec_module(reading_eval)
 
 
+@pytest.fixture(autouse=True)
+def _local_embedding_tokenizer(monkeypatch, embedding_tokenizer_dir):
+    monkeypatch.setattr(reading_eval, "DEFAULT_MODEL_DIR", embedding_tokenizer_dir)
+
+
 def test_grid_continuation_skips_recorded_failures_and_rejects_unknown_attempts():
     inputs = [{"case_id": key} for key in ("done", "failed", "pending")]
     attempts = {"done": {}, "failed": {}}
