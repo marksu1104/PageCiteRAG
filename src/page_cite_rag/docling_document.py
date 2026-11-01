@@ -1,7 +1,7 @@
 """Persist Docling's native PDF sources through the existing SQLite document store.
 
-The SQLite units are virtual native items or cells. Their character offsets refer to
-the saved native text, while PDF page and bbox provenance is stored separately.
+The SQLite units are native text items or structured tables. Their character offsets
+refer to saved native content, while PDF page and bbox provenance is stored separately.
 """
 
 from __future__ import annotations
@@ -13,15 +13,19 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from page_cite_rag.docling_adapter import ADAPTER_VERSION, DoclingSourceStore
-from page_cite_rag.docling_source import read_native_item
+from page_cite_rag.docling_adapter import (
+    ADAPTER_VERSION,
+    LEGACY_ADAPTER_VERSION,
+    DoclingSourceStore,
+)
+from page_cite_rag.docling_source import body_source_refs, is_layout_furniture, read_native_item
 from page_cite_rag.embedding import DEFAULT_MODEL_DIR
 from page_cite_rag.models import Block, DocumentMetadata, ParsedUnit
 from page_cite_rag.source_outline import OUTLINE_KIND, SourceOutline, SourceSection
 from page_cite_rag.store import SQLiteDocumentStore, StoreError
 
 SOURCE_KIND = "docling-native-document-v1"
-_SOURCE_VERSION = "docling-native-document/v1"
+_SOURCE_VERSION = "docling-native-document/v2"
 DEFAULT_ARTIFACTS = Path("models/docling-pinned")
 _MODEL_HASHES = {
     "00333a43451945aaf89db8ca9c0a17e75d1537c17db60fdb91aa95f4c7929e0c",
@@ -144,19 +148,74 @@ def bundle_from_native(
     for entry in chunks:
         if not isinstance(entry, dict) or entry.get("profile", parser_version) != parser_version:
             raise DoclingDocumentError("Docling chunk parser profile changed")
+    if "docling-native-item-or-cell/v1" in parser_version:
+        raise DoclingDocumentError("old cell-mapped Docling sources must be re-ingested")
+    source_order = body_source_refs(document)
+    source_rank = {ref: rank for rank, ref in enumerate(source_order)}
     chunks = [{**entry, "profile": parser_version} for entry in chunks]
+    for entry in chunks:
+        chunk = entry.get("chunk")
+        meta = chunk.get("meta") if isinstance(chunk, dict) else None
+        refs = meta.get("doc_items") if isinstance(meta, dict) else None
+        if (
+            not isinstance(refs, list)
+            or not refs
+            or any(
+                not isinstance(item, dict) or not isinstance(item.get("self_ref"), str)
+                for item in refs
+            )
+        ):
+            raise DoclingDocumentError("Docling chunk source refs are missing or invalid")
+    useful_chunks = []
+    for entry in chunks:
+        refs = [item["self_ref"] for item in entry["chunk"]["meta"]["doc_items"]]
+        furniture_refs = [ref for ref in refs if is_layout_furniture(document, ref)]
+        if furniture_refs and len(furniture_refs) != len(refs):
+            raise DoclingDocumentError("Docling merged page furniture with readable source items")
+        if not furniture_refs:
+            useful_chunks.append(entry)
+    chunks = useful_chunks
+    if not chunks:
+        raise DoclingDocumentError("Docling found no searchable non-furniture chunks")
+    indexed_chunks = list(enumerate(chunks))
+    indexed_chunks.sort(
+        key=lambda pair: (
+            min(
+                (
+                    source_rank.get(item["self_ref"], len(source_rank))
+                    for item in pair[1]["chunk"]["meta"]["doc_items"]
+                ),
+                default=len(source_rank),
+            ),
+            pair[0],
+        )
+    )
+    chunks = [entry for _, entry in indexed_chunks]
+    included_order = tuple(ref for ref in source_order if not is_layout_furniture(document, ref))
     source = DoclingSourceStore(
         document,
         chunks,
         source_sha256=source_sha256,
         source_name=source_name,
         page_count=page_count,
+        source_order=included_order,
+        adapter_version=(
+            LEGACY_ADAPTER_VERSION if LEGACY_ADAPTER_VERSION in parser_version else ADAPTER_VERSION
+        ),
     )
     if any(not isinstance(entry.get("search_text"), str) for entry in chunks):
         raise DoclingDocumentError("Docling chunk search text is missing")
-    covered = {ref for refs in source.chunk_native_refs for ref in refs}
+    chunk_refs = {ref for refs in source.chunk_native_refs for ref in refs}
+    linked_caption_refs = {
+        caption_ref
+        for ref in chunk_refs
+        for caption_ref in read_native_item(document, ref, page_count=page_count)["caption_refs"]
+    }
+    covered = chunk_refs | linked_caption_refs
+    body_refs = set(source_order)
     missing: list[str] = []
     unsupported: list[str] = []
+    excluded: list[dict[str, str]] = []
     for collection in ("texts", "tables", "pictures", "key_value_items", "form_items"):
         for item in document.get(collection, []):
             ref = item.get("self_ref") if isinstance(item, dict) else None
@@ -165,8 +224,12 @@ def bundle_from_native(
             native = read_native_item(document, ref, page_count=page_count)
             if native["saved_item_text"] is None and native["table"] is None:
                 unsupported.append(ref)
-            elif ref not in covered:
+            elif is_layout_furniture(document, ref):
+                excluded.append({"ref": ref, "reason": "docling_page_furniture"})
+            elif ref in body_refs and ref not in covered:
                 missing.append(ref)
+            elif ref not in body_refs and ref not in covered:
+                excluded.append({"ref": ref, "reason": "not_in_docling_body_tree"})
     if missing:
         labels: dict[str, int] = {}
         for ref in missing:
@@ -191,9 +254,18 @@ def bundle_from_native(
     coverage = {
         "readable_source_units": len(source.get_blocks(metadata.document_id)),
         "unsupported_native_refs": unsupported,
+        "excluded_native_refs": excluded,
+        "linked_caption_refs": sorted(linked_caption_refs),
+        "source_order": (
+            "docling-body-children/v1"
+            if isinstance(document.get("body"), dict)
+            and isinstance(document["body"].get("children"), list)
+            else "legacy-collection-order-fallback"
+        ),
         "chunk_count": len(chunks),
         "recovered_search_windows": sum(
-            entry.get("origin") == "native-item-recovery-v1" for entry in chunks
+            entry.get("origin") in {"native-item-recovery-v2", "native-table-recovery-v2"}
+            for entry in chunks
         ),
     }
     return DoclingDocumentBundle(
@@ -260,47 +332,163 @@ def prepare_models(directory: Path = DEFAULT_ARTIFACTS) -> dict:
     return {"artifacts_path": str(directory), "weight_sha256": hashes}
 
 
+def _text_search_windows(text: str, headings: tuple[str, ...], tokenizer) -> list[tuple[str, str]]:
+    """Split one saved text item without exceeding the full search-input budget."""
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+    if not tokens:
+        raise DoclingDocumentError("a readable text item produced no search tokens")
+    prefix = "\n".join(headings)
+    prefix_tokens = len(tokenizer.encode(prefix, add_special_tokens=False)) if prefix else 0
+    available = min(400, 512 - prefix_tokens)
+    if available < 1:
+        raise DoclingDocumentError("recovered heading path exceeds the search chunk budget")
+
+    windows = []
+    start = 0
+    while start < len(tokens):
+        size = min(available, len(tokens) - start)
+        while size:
+            body = tokenizer.decode(tokens[start : start + size]).strip()
+            search_text = "\n".join((prefix, body)) if prefix else body
+            if body and len(tokenizer.encode(search_text, add_special_tokens=False)) <= 512:
+                windows.append((body, "native-item-recovery-v2"))
+                start += size
+                break
+            size -= 1
+        if not size:
+            raise DoclingDocumentError("a recovered text window exceeds the search chunk budget")
+    return windows
+
+
 def _recover_omitted_items(
     document: dict, chunks: list[dict], *, page_count: int, tokenizer
 ) -> int:
     """Keep native readable items searchable when HybridChunker skips them.
 
-    These windows navigate to the complete saved native item/cell; their decoded
+    These windows navigate to the complete saved native item/table; their text
     search text is never used as a quotation or claimed to be PDF character offsets.
     """
     covered = {item["self_ref"] for entry in chunks for item in entry["chunk"]["meta"]["doc_items"]}
+    source_order = body_source_refs(document)
+    items_by_ref = {
+        item["self_ref"]: item
+        for collection in ("texts", "tables", "key_value_items", "form_items")
+        for item in document.get(collection, [])
+        if isinstance(item, dict) and isinstance(item.get("self_ref"), str)
+    }
+    heading_paths: dict[str, tuple[str, ...]] = {}
+    headings: list[str] = []
+    for ref in source_order:
+        item = items_by_ref.get(ref)
+        if item is None:
+            continue
+        if item.get("label") == "section_header":
+            title = item.get("text")
+            if isinstance(title, str) and title.strip():
+                level = item.get("level", 1)
+                level = level if type(level) is int and level > 0 else 1
+                headings[:] = headings[: level - 1]
+                headings.append(title.strip())
+        heading_paths[ref] = tuple(headings)
+
     recovered = 0
-    for collection in ("texts", "tables", "key_value_items", "form_items"):
-        for item in document.get(collection, []):
-            ref = item["self_ref"]
-            if ref in covered:
-                continue
-            native = read_native_item(document, ref, page_count=page_count)
-            source_text = native["saved_item_text"]
-            if source_text is None and native["table"] is not None:
-                source_text = "\n".join(
-                    cell["text"] for cell in native["table"]["cells"] if cell["text"].strip()
-                )
-            if not source_text or not source_text.strip():
-                continue
-            tokens = tokenizer.encode(source_text, add_special_tokens=False)
-            for start in range(0, len(tokens), 400):
-                window = tokenizer.decode(tokens[start : start + 400]).strip()
-                if not window:
+    for ref in source_order:
+        if ref in covered:
+            continue
+        if is_layout_furniture(document, ref):
+            continue
+        item = items_by_ref.get(ref)
+        if item is None:
+            continue
+        native = read_native_item(
+            document, ref, page_count=page_count, include_enumerated_marker=True
+        )
+        path = heading_paths.get(ref, ())
+        source_text = native["saved_item_text"]
+        if native["table"] is None and source_text is not None and source_text.strip():
+            windows = _text_search_windows(source_text, path, tokenizer)
+        elif native["table"] is not None:
+            table = native["table"]
+            header_cells = [cell for cell in table["cells"] if cell["column_header"]]
+            header_end = max((cell["row_end"] for cell in header_cells), default=0)
+            prefix = [*path, f"Table ({table['rows']} rows, {table['columns']} columns)"]
+            prefix.extend(
+                f"Column header [rows {cell['row_start']}–{cell['row_end']}; "
+                f"columns {cell['column_start']}–{cell['column_end']}]: {cell['text']}"
+                for cell in header_cells
+                if cell["text"].strip()
+            )
+            if len(tokenizer.encode("\n".join(prefix), add_special_tokens=False)) > 400:
+                raise DoclingDocumentError("recovered table headers exceed the search chunk budget")
+            row_lines = []
+            for row in range(header_end, table["rows"]):
+                cells = [
+                    cell
+                    for cell in table["cells"]
+                    if cell["row_start"] <= row < cell["row_end"] and not cell["column_header"]
+                ]
+                if not cells:
                     continue
-                chunks.append(
-                    {
-                        "chunk": {
-                            "text": window,
-                            "meta": {"doc_items": [{"self_ref": ref}], "headings": []},
-                        },
-                        "search_text": window,
-                        "search_tokens": len(tokens[start : start + 400]),
-                        "origin": "native-item-recovery-v1",
-                    }
+                row_lines.append(
+                    "Row "
+                    + str(row)
+                    + ": "
+                    + " | ".join(
+                        f"columns {cell['column_start']}–{cell['column_end']}: {cell['text']}"
+                        for cell in sorted(cells, key=lambda cell: cell["column_start"])
+                    )
                 )
-                recovered += 1
-            covered.add(ref)
+            if not row_lines:
+                row_lines = [
+                    f"Cell rows {cell['row_start']}–{cell['row_end']}, "
+                    f"columns {cell['column_start']}–{cell['column_end']}: {cell['text']}"
+                    for cell in table["cells"]
+                    if cell["text"].strip()
+                ]
+
+            windows = []
+            current: list[str] = []
+            for row_line in row_lines:
+                candidate = "\n".join([*prefix, *current, row_line])
+                if len(tokenizer.encode(candidate, add_special_tokens=False)) <= 400:
+                    current.append(row_line)
+                    continue
+                if not current:
+                    raise DoclingDocumentError(
+                        "a recovered table row exceeds the search chunk budget"
+                    )
+                windows.append(("\n".join([*prefix, *current]), "native-table-recovery-v2"))
+                current = [row_line]
+                row_window = "\n".join([*prefix, *current])
+                if len(tokenizer.encode(row_window, add_special_tokens=False)) > 400:
+                    raise DoclingDocumentError(
+                        "a recovered table row exceeds the search chunk budget"
+                    )
+            if current:
+                windows.append(("\n".join([*prefix, *current]), "native-table-recovery-v2"))
+        else:
+            continue
+
+        for window, origin in windows:
+            search_text = (
+                window if origin == "native-table-recovery-v2" else "\n".join((*path, window))
+            )
+            token_count = len(tokenizer.encode(search_text, add_special_tokens=False))
+            if token_count > 512:
+                raise DoclingDocumentError("recovered search chunk exceeds 512 tokens")
+            chunks.append(
+                {
+                    "chunk": {
+                        "text": window,
+                        "meta": {"doc_items": [{"self_ref": ref}], "headings": list(path)},
+                    },
+                    "search_text": search_text,
+                    "search_tokens": token_count,
+                    "origin": origin,
+                }
+            )
+            recovered += 1
+        covered.add(ref)
     return recovered
 
 
@@ -416,7 +604,7 @@ def load_bundle(store: SQLiteDocumentStore, document_id: str) -> DoclingDocument
         raise StoreError("saved Docling native source is missing")
     payload = json.loads(raw)
     if payload.get("version") != _SOURCE_VERSION:
-        raise StoreError("saved Docling source version is unsupported")
+        raise StoreError("saved Docling source needs re-ingestion with the current source mapper")
     bundle = bundle_from_native(
         payload["document"],
         payload["chunks"],

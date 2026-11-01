@@ -9,7 +9,6 @@ import re
 import secrets
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -21,12 +20,18 @@ import numpy as np
 
 from page_cite_rag.embedding_native import GGUF_REVISION, GGUF_SHA256
 from page_cite_rag.gpu_processes import (
+    GPU_DISPATCH_HEADROOM_C,
+    MAX_GPU_MEMORY_MIB,
+    GpuDispatchCancelled,
+    GpuDispatchTimeout,
     gpu_process_lifecycle,
     register_owned_gpu_process,
     snapshot_gpu_processes,
     unregister_owned_gpu_process,
+    wait_for_gpu_dispatch,
 )
 from page_cite_rag.llama import DEFAULT_BUNDLE, LLAMA_COMMIT, verify_bundle
+from page_cite_rag.owned_process import launch_owned_llama_process
 from page_cite_rag.retrieval import RetrievalError
 
 _MODEL_BYTES = 1_197_629_632
@@ -45,6 +50,7 @@ def _sample_record(sample: dict, phase: str) -> dict:
     record = dict(sample)
     record["pids"] = sorted(record.get("pids", ()))
     record["phase"] = phase
+    record["sampled_monotonic"] = time.monotonic()
     return record
 
 
@@ -164,7 +170,7 @@ def _gpu_sample(
             raise RetrievalError("GPU thermal telemetry unavailable for embedding")
         if hardware == "Active" or software == "Active":
             raise _GpuGuardTriggered("gpu_thermal_slowdown", result)
-        if result["memory_mib"] > 12000:
+        if result["memory_mib"] > MAX_GPU_MEMORY_MIB:
             raise _GpuGuardTriggered("gpu_memory_limit", result)
         if result["temperature_c"] > max_gpu_temperature_c:
             raise _GpuGuardTriggered("gpu_temperature_limit", result)
@@ -184,9 +190,19 @@ class NativeEmbeddingServer:
         bundle_dir: Path = DEFAULT_BUNDLE,
         cancel_event: threading.Event | None = None,
         max_gpu_temperature_c: int = 80,
+        context_tokens: int = 1024,
+        request_timeout_seconds: int | None = None,
     ):
         if type(max_gpu_temperature_c) is not int or not 40 <= max_gpu_temperature_c <= 88:
             raise ValueError("GPU temperature guard must be an integer from 40 to 88 C")
+        if type(context_tokens) is not int or not 32 <= context_tokens <= 8192:
+            raise ValueError("embedding context must be an integer from 32 to 8192 tokens")
+        if request_timeout_seconds is None:
+            request_timeout_seconds = 120 if context_tokens > 1024 else 15
+        if type(request_timeout_seconds) is not int or not 1 <= request_timeout_seconds <= 600:
+            raise ValueError("embedding request timeout must be an integer from 1 to 600 seconds")
+        self.context_tokens = context_tokens
+        self.request_timeout_seconds = request_timeout_seconds
         self.model_path = model_path.expanduser().absolute()
         self.gpu_uuid = gpu_uuid
         self.bundle_dir = bundle_dir.expanduser().absolute()
@@ -197,12 +213,20 @@ class NativeEmbeddingServer:
         self._process: subprocess.Popen | None = None
         self._temporary: tempfile.TemporaryDirectory | None = None
         self._log = None
+        self._auth_token: str | None = None
+        self._exit_code: int | None = None
+        self._termination_requested = False
+        self._server_log_tail: str | None = None
         self._stop = threading.Event()
         self._watcher: threading.Thread | None = None
         self._guard_error: str | None = None
         self._last_gpu_check: dict | None = None
         self._last_gpu_sample: dict | None = None
         self.samples: list[dict] = []
+        self._samples_lock = threading.Lock()
+        self._last_dispatch_wait: dict | None = None
+        self._dispatch_wait_seconds_total = 0.0
+        self._dispatch_count = 0
         self.startup_ms = 0.0
         try:
             self._start()
@@ -230,10 +254,10 @@ class NativeEmbeddingServer:
         except _GpuGuardTriggered as exc:
             self._guard_error = exc.category
             self._last_gpu_sample = _sample_record(exc.sample, "startup")
-            self.samples.append(self._last_gpu_sample)
+            self._append_sample(self._last_gpu_sample)
             raise
         self._last_gpu_sample = _sample_record(initial, "startup")
-        self.samples.append(self._last_gpu_sample)
+        self._append_sample(self._last_gpu_sample)
         self._last_gpu_check = process_state
         if process_state["unexpected_pids"]:
             self._guard_error = "unexpected_gpu_process"
@@ -242,6 +266,7 @@ class NativeEmbeddingServer:
         self._temporary = tempfile.TemporaryDirectory(prefix="page-cite-rag-embedding-session-")
         session = Path(self._temporary.name)
         token = secrets.token_hex(32)
+        self._auth_token = token
         key_file = session / "api-key"
         key_file.touch(mode=0o600)
         key_file.write_text(token + "\n", encoding="utf-8")
@@ -303,20 +328,11 @@ class NativeEmbeddingServer:
         ]
         self._log = (session / "server.log").open("w+b")
         with gpu_process_lifecycle():
-            self._process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-I",
-                    "-m",
-                    "page_cite_rag.llama_process",
-                    str(os.getpid()),
-                    *argv,
-                ],
+            self._process = launch_owned_llama_process(
+                argv,
                 cwd=session,
                 env=env,
                 stdout=self._log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
             )
             register_owned_gpu_process(self._process)
         self._http = httpx.Client(
@@ -344,20 +360,31 @@ class NativeEmbeddingServer:
         self._verify_offload((session / "server.log").read_text(errors="replace"))
         self.startup_ms = (time.perf_counter() - started) * 1000
 
+    def _append_sample(self, sample: dict) -> None:
+        with self._samples_lock:
+            self.samples.append(sample)
+            self.samples = self.samples[-120:]
+
+    def _sample_snapshot(self) -> list[dict]:
+        with self._samples_lock:
+            return [dict(sample) for sample in self.samples]
+
     def _verify_model(self) -> None:
         verify_native_model(self.model_path)
 
     def _context_size(self) -> int:
-        return 1024
+        return self.context_tokens
 
     def _batch_size(self) -> int:
-        return 128
+        # Large explicitly admitted native chunks must fit one embedding
+        # microbatch, including runtimes requiring non-causal whole-sequence input.
+        return self.context_tokens if self.context_tokens > 1024 else 128
 
     def _mode_options(self) -> list[str]:
         return ["--embedding", "--pooling", "last", "--embd-normalize", "2"]
 
     def _request_timeout(self) -> int:
-        return 15
+        return self.request_timeout_seconds
 
     def _verify_offload(self, log: str) -> None:
         if "offloaded 29/29 layers to GPU" not in log:
@@ -365,24 +392,86 @@ class NativeEmbeddingServer:
 
     def diagnostics(self) -> dict:
         """Return resource observations without process arguments or source text."""
+        self._capture_process_diagnostics()
+        samples = self._sample_snapshot()
         return {
             "gpu_uuid": self.gpu_uuid,
             "gpu_temperature_limit_c": self.max_gpu_temperature_c,
             "max_operating_c": (self._temperature_limits or {}).get("max_operating_c"),
             "target_temperature_c": (self._temperature_limits or {}).get("target_temperature_c"),
-            "monitor_sample_count": len(self.samples),
+            "monitor_sample_count": len(samples),
+            "dispatch_count": self._dispatch_count,
+            "dispatch_wait_seconds_total": self._dispatch_wait_seconds_total,
+            "last_dispatch_wait": self._last_dispatch_wait,
             "observed_gpu_peak": {
-                "memory_mib": max((sample["memory_mib"] for sample in self.samples), default=None),
-                "temperature_c": max(
-                    (sample["temperature_c"] for sample in self.samples), default=None
-                ),
+                "memory_mib": max((sample["memory_mib"] for sample in samples), default=None),
+                "temperature_c": max((sample["temperature_c"] for sample in samples), default=None),
             },
-            "hw_thermal_slowdown": any(sample["hw_thermal_slowdown"] for sample in self.samples),
-            "sw_thermal_slowdown": any(sample["sw_thermal_slowdown"] for sample in self.samples),
+            "hw_thermal_slowdown": any(sample["hw_thermal_slowdown"] for sample in samples),
+            "sw_thermal_slowdown": any(sample["sw_thermal_slowdown"] for sample in samples),
             "guard_error": self._guard_error,
+            "server_exit_code": self._exit_code,
+            "server_termination_requested": self._termination_requested,
+            "server_log_tail": self._server_log_tail,
             "last_gpu_check": self._last_gpu_check,
             "last_gpu_sample": self._last_gpu_sample,
         }
+
+    def _capture_process_diagnostics(self) -> None:
+        if self._process is None:
+            return
+        try:
+            code = self._process.poll()
+        except Exception:
+            return
+        if code is None:
+            return
+        self._exit_code = code
+        if self._server_log_tail is None and (
+            self._guard_error is not None or not self._termination_requested
+        ):
+            self._server_log_tail = self._read_error_log_tail()
+
+    def _read_error_log_tail(self) -> str:
+        if self._log is None or self._log.closed:
+            return ""
+        try:
+            self._log.flush()
+            size = os.fstat(self._log.fileno()).st_size
+            raw = os.pread(self._log.fileno(), 8192, max(0, size - 8192))
+        except (AttributeError, OSError, ValueError):
+            return ""
+        token = self._auth_token
+        if token:
+            token_bytes = token.encode("utf-8")
+            raw = raw.replace(token_bytes, b"[REDACTED]")
+            for length in range(min(len(token_bytes) - 1, len(raw)), 0, -1):
+                if raw.startswith(token_bytes[-length:]):
+                    raw = b"[REDACTED]" + raw[length:]
+                    break
+            for length in range(min(len(token_bytes) - 1, len(raw)), 0, -1):
+                if raw.endswith(token_bytes[:length]):
+                    raw = raw[:-length] + b"[REDACTED]"
+                    break
+        lines = raw.decode("utf-8", errors="replace").splitlines()
+        relevant = []
+        for line in lines:
+            if re.search(
+                r"(?i)(?:\"(?:content|input|prompt|text)\"\s*:|bearer\s+|api[-_ ]?key\s*[:=])",
+                line,
+            ):
+                continue
+            if not re.search(
+                r"(?i)\b(error|fatal|failed|exception|cuda|abort|signal|out of memory)\b",
+                line,
+            ):
+                continue
+            line = line.replace(str(self.model_path), "<model>")
+            if self._temporary is not None:
+                line = line.replace(self._temporary.name, "<session>")
+            relevant.append(line[:500])
+        tail = "\n".join(relevant[-12:])
+        return tail.encode("utf-8")[-8192:].decode("utf-8", errors="ignore")
 
     def _watch(self) -> None:
         while not self._stop.wait(0.5):
@@ -402,16 +491,18 @@ class NativeEmbeddingServer:
                 if process_state["unexpected_pids"]:
                     raise _GpuGuardTriggered("unexpected_gpu_process", sample)
                 self._last_gpu_sample = _sample_record(sample, "monitor")
-                self.samples.append(self._last_gpu_sample)
+                self._last_gpu_sample["process_state"] = process_state
+                self._append_sample(self._last_gpu_sample)
             except (RetrievalError, OSError, ValueError) as exc:
                 if isinstance(exc, _GpuGuardTriggered):
                     self._guard_error = exc.category
                     self._last_gpu_sample = _sample_record(exc.sample, "monitor")
-                    self.samples.append(self._last_gpu_sample)
+                    self._append_sample(self._last_gpu_sample)
                 else:
                     self._guard_error = str(exc)
                 with gpu_process_lifecycle():
                     if self._process is not None and self._process.poll() is None:
+                        self._termination_requested = True
                         self._process.terminate()
                 return
 
@@ -420,14 +511,77 @@ class NativeEmbeddingServer:
         if self._guard_error is not None:
             raise RetrievalError(self._guard_error)
         if self._process is None or self._process.poll() is not None:
+            if self._guard_error is None:
+                self._guard_error = "owned_service_exited"
+            self._capture_process_diagnostics()
             raise RetrievalError("owned native embedding server exited")
 
     def _check_cancelled(self) -> None:
         if self._cancel_event is not None and self._cancel_event.is_set():
             raise RetrievalError("owned native embedding request was cancelled")
 
+    def wait_for_gpu_headroom(self, *, timeout_seconds: float = 120.0) -> float:
+        """Use the same soft dispatch gate as generation, preserving hard guards."""
+
+        def check() -> dict:
+            self._check()
+            try:
+                sample, process_state = snapshot_gpu_processes(
+                    lambda: _gpu_sample(
+                        self.gpu_uuid,
+                        max_gpu_temperature_c=self.max_gpu_temperature_c,
+                        temperature_limits=self._temperature_limits,
+                    ),
+                    expected_process=self._process,
+                )
+            except _GpuGuardTriggered as exc:
+                self._guard_error = exc.category
+                self._last_gpu_sample = _sample_record(exc.sample, "dispatch")
+                self._append_sample(self._last_gpu_sample)
+                raise
+            except (OSError, ValueError, subprocess.SubprocessError):
+                self._guard_error = "gpu_status_unavailable"
+                raise RetrievalError(
+                    "GPU status unavailable; stop rather than assume it is safe"
+                ) from None
+            self._last_gpu_check = process_state
+            record = _sample_record(sample, "dispatch")
+            record["process_state"] = process_state
+            self._last_gpu_sample = record
+            self._append_sample(record)
+            if process_state["owned_service_exited"]:
+                self._guard_error = "owned_service_exited"
+                raise _GpuGuardTriggered(self._guard_error, sample)
+            if process_state["unexpected_pids"]:
+                self._guard_error = "unexpected_gpu_process"
+                raise _GpuGuardTriggered(self._guard_error, sample)
+            return sample
+
+        try:
+            record = wait_for_gpu_dispatch(
+                check,
+                self._stop.wait,
+                max_temperature_c=self.max_gpu_temperature_c,
+                timeout_seconds=timeout_seconds,
+                headroom_c=GPU_DISPATCH_HEADROOM_C,
+                recent_samples=self._sample_snapshot,
+            )
+        except GpuDispatchTimeout as exc:
+            raise RetrievalError(str(exc)) from None
+        except GpuDispatchCancelled as exc:
+            raise RetrievalError(str(exc)) from None
+        except (ValueError, RetrievalError):
+            raise
+        self._last_dispatch_wait = record
+        self._dispatch_wait_seconds_total += record["seconds"]
+        self._dispatch_count += 1
+        return record["seconds"]
+
     def _post(self, path: str, payload: dict) -> dict:
         self._check()
+        if path in {"/v1/embeddings", "/v1/rerank"}:
+            self.wait_for_gpu_headroom()
+            self._check()
         try:
             response = self._http.post(path, json=payload)
             response.raise_for_status()
@@ -483,14 +637,17 @@ class NativeEmbeddingServer:
         if self._http is not None:
             self._http.close()
             self._http = None
+        self._capture_process_diagnostics()
         with gpu_process_lifecycle():
             if self._process is not None and self._process.poll() is None:
+                self._termination_requested = True
                 self._process.terminate()
                 try:
                     self._process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self._process.kill()
                     self._process.wait(timeout=5)
+            self._capture_process_diagnostics()
             unregister_owned_gpu_process(self._process)
         if self._watcher is not None and self._watcher is not threading.current_thread():
             self._watcher.join(timeout=5)

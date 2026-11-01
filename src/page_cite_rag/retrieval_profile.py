@@ -1,21 +1,24 @@
-"""One explicit local hybrid retrieval profile shared by product and evaluation.
+"""One hybrid profile shared by the product and evaluation paths.
 
-The values are starting engineering choices from prior local runs, not universal
-optima: 20 candidates per branch, RRF k=60, at most 10 final source blocks.
+Each lexical/dense branch returns 50 candidates. The fused result can contain up to
+100 source groups; exact token admission, rather than a fixed ten-group cutoff,
+determines how much evidence reaches the writer.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+MAX_CONTEXT_GROUPS = 100
+
 
 @dataclass(frozen=True)
 class RetrievalProfile:
-    version: str = "formal-hybrid-v1"
-    candidates_per_branch: int = 20
+    version: str = "formal-hybrid-v2"
+    candidates_per_branch: int = 50
     rrf_constant: int = 60
-    final_k: int = 10
-    neighbor_blocks: int = 1
+    final_k: int = MAX_CONTEXT_GROUPS
+    neighbor_blocks: int = 0
 
     def as_dict(self) -> dict[str, int | str]:
         return {

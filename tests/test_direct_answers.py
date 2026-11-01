@@ -3,6 +3,7 @@
 import pytest
 
 from page_cite_rag import cli
+from page_cite_rag.full_answer import PROMPT_VERSION
 from test_answer_cli import FakeClient
 from test_workflows import setup as setup
 
@@ -26,7 +27,7 @@ def test_cli_uses_unified_cited_answer_contract(setup, monkeypatch, capsys):
         )
         == 0
     )
-    assert '"prompt_version": "complete-cited-answer-v4"' in capsys.readouterr().out
+    assert f'"prompt_version": "{PROMPT_VERSION}"' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("command", ["ask", "explain"])

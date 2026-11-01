@@ -14,6 +14,83 @@ from page_cite_rag.models import DocumentMetadata, ParsedUnit
 from page_cite_rag.store import SQLiteDocumentStore, StoreError
 
 
+@pytest.mark.parametrize(
+    "phrase", ["檢索需要保留數字、條件與否定。", "Preserve numbers and conditions. "]
+)
+def test_token_chunks_cover_source_and_have_versioned_identity(tmp_path, phrase):
+    pytest.importorskip("tokenizers")
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    from page_cite_rag.ingest import prepare_source
+    from page_cite_rag.store import SQLiteDocumentStore
+    from page_cite_rag.text import TokenBlockFactory
+
+    text = (phrase * 180) + "\r\n最後一行。\n"
+    tokenizer = Tokenizer(models.WordLevel({c: i + 1 for i, c in enumerate(sorted(set(text)))}))
+    tokenizer.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    source = tmp_path / "source.txt"
+    source.write_text(text, encoding="utf-8", newline="")
+    original = prepare_source(source)
+    chunker = TokenBlockFactory(tmp_path)
+    prepared = prepare_source(source, chunker=chunker)
+    assert original.document.document_id != prepared.document.document_id
+    store = SQLiteDocumentStore(tmp_path / "chunks.sqlite3")
+    first = store.ingest(
+        prepared.document, prepared.iter_units(), block_factory=prepared.block_factory
+    )
+    second = store.ingest(
+        prepared.document, prepared.iter_units(), block_factory=prepared.block_factory
+    )
+    assert not first.duplicate and second.duplicate
+    blocks = store.get_blocks(prepared.document.document_id)
+    covered = set()
+    for block in blocks:
+        assert text[block.char_start : block.char_end] == block.text
+        assert len(tokenizer.encode(block.text).ids) <= 512
+        covered.update(range(block.char_start, block.char_end))
+    assert covered == set(range(len(text)))
+    assert len(blocks) > 1
+    assert (
+        TokenBlockFactory(tmp_path, max_tokens=256).bind_document(original.document).document_id
+        != prepared.document.document_id
+    )
+
+
+def test_chunked_parser_identity_fits_document_metadata_and_is_stable(tmp_path):
+    pytest.importorskip("tokenizers")
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    from page_cite_rag.models import DocumentMetadata
+    from page_cite_rag.text import TokenBlockFactory
+
+    tokenizer = Tokenizer(models.WordLevel({"sample": 1}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    document = DocumentMetadata(
+        document_id="a" * 64,
+        source_sha256="b" * 64,
+        source_name="sample.pdf",
+        media_type="application/pdf",
+        parser_name="pdfplumber",
+        parser_version=(
+            "pdfplumber-0.11.10;extract-v2;use-text-flow-false;"
+            "x-tolerance-ratio-0.15;y-tolerance-3;layout-false"
+        ),
+        page_count=1,
+    )
+    chunker = TokenBlockFactory(tmp_path)
+
+    bound = chunker.bind_document(document)
+
+    assert len(bound.parser_version) <= 160
+    assert bound.parser_version.startswith("pdfplumber-p")
+    assert chunker.bind_document(bound) == bound
+    assert TokenBlockFactory(tmp_path, max_tokens=256).bind_document(document).document_id != (
+        bound.document_id
+    )
+
+
 def _write_two_page_pdf(path, text_stream=None) -> None:
     if text_stream is None:
         text_stream = b"BT /F1 12 Tf 72 720 Td (English PDF page one.) Tj ET\n"
@@ -191,7 +268,7 @@ def test_pdf_ingest_tracks_each_page_and_cli_reads_page_back(tmp_path, capsys) -
     assert "no extractable text" in capsys.readouterr().err
 
 
-def test_opt_in_pdf_stream_order_preserves_columns_and_separates_source_identity(
+def test_pdf_spacing_default_and_stream_order_have_distinct_source_identity(
     tmp_path, capsys
 ) -> None:
     source = tmp_path / "two-columns.pdf"
@@ -202,9 +279,11 @@ def test_opt_in_pdf_stream_order_preserves_columns_and_separates_source_identity
     )
     default = prepare_source(source)
     flowed = prepare_source(source, pdf_reading_order="text-flow")
+    geometric_ratio = prepare_source(source, pdf_x_tolerance_ratio=0.15)
     assert default.document.source_sha256 == flowed.document.source_sha256
     assert default.document.document_id != flowed.document.document_id
-    assert ";extract-v1;x-tolerance-3;" in default.document.parser_version
+    assert geometric_ratio.document.document_id == default.document.document_id
+    assert "use-text-flow-false;x-tolerance-ratio-0.15" in default.document.parser_version
     assert "use-text-flow-true;x-tolerance-ratio-0.15" in flowed.document.parser_version
     assert list(default.iter_units())[0].text.splitlines()[0] == "LEFT first. RIGHT first."
     assert list(flowed.iter_units())[0].text == (
@@ -225,6 +304,22 @@ def test_opt_in_pdf_stream_order_preserves_columns_and_separates_source_identity
         unit.text[b.char_start : b.char_end] == b.text
         for b in store.get_blocks(flowed.document.document_id)
     )
+    ratio_database = tmp_path / "columns-ratio.sqlite3"
+    assert (
+        main(
+            [
+                "ingest",
+                str(source),
+                "--db",
+                str(ratio_database),
+                "--pdf-x-tolerance-ratio",
+                "0.15",
+            ]
+        )
+        == 0
+    )
+    ratio_result = json.loads(capsys.readouterr().out)
+    assert ratio_result["document"]["document_id"] == default.document.document_id
 
 
 def test_pdf_order_rejects_unknown_or_non_pdf_inputs_before_creating_store(tmp_path, capsys):
@@ -232,6 +327,8 @@ def test_pdf_order_rejects_unknown_or_non_pdf_inputs_before_creating_store(tmp_p
     source.write_text("NOT a PDF.")
     with pytest.raises(DocumentIngestError, match="unsupported PDF reading order"):
         prepare_source(source, pdf_reading_order="automatic")
+    with pytest.raises(DocumentIngestError, match="x-tolerance ratio"):
+        prepare_source(source, pdf_x_tolerance_ratio=0.15)
     database = tmp_path / "should-not-exist.sqlite3"
     assert (
         main(["ingest", str(source), "--db", str(database), "--pdf-reading-order", "text-flow"])
@@ -239,6 +336,14 @@ def test_pdf_order_rejects_unknown_or_non_pdf_inputs_before_creating_store(tmp_p
     )
     assert "only to PDF" in capsys.readouterr().err
     assert not database.exists()
+
+
+@pytest.mark.parametrize("ratio", [0, -0.1, 1.1, float("nan"), float("inf"), True])
+def test_pdf_x_tolerance_ratio_rejects_invalid_values(tmp_path, ratio):
+    source = tmp_path / "one-page.pdf"
+    _write_two_page_pdf(source, b"BT /F1 12 Tf 72 720 Td (Sample text.) Tj ET\n")
+    with pytest.raises(DocumentIngestError, match="x-tolerance ratio"):
+        prepare_source(source, pdf_x_tolerance_ratio=ratio)
 
 
 def test_installed_cli_ingests_and_reads_text_from_outside_repository(

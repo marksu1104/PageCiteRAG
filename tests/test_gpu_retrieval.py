@@ -61,6 +61,43 @@ def build_search(monkeypatch):
     return staged, search
 
 
+def test_cli_and_api_reranking_share_order_and_release_embedding_first(monkeypatch):
+    from page_cite_rag import reranker_server
+    from test_hybrid import result
+
+    staged, search = build_search(monkeypatch)
+    staged.reranker_model_path = Path("reranker.gguf")
+    source = result([1, 2, 3])
+    monkeypatch.setattr(search, "search", lambda query, **kwargs: source)
+    seen = []
+
+    class Ranker:
+        def __init__(self, *_args, **kwargs):
+            assert all(server.closed for server in FakeEmbeddingServer.instances)
+            assert not kwargs["cancel_event"].is_set()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def rerank(self, query, texts):
+            seen.append((query, texts))
+            return [(2, 0.9), (1, 0.2), (0, 0.1)]
+
+        def diagnostics(self):
+            return {"ranked": True}
+
+    monkeypatch.setattr(reranker_server, "NativeRerankerServer", Ranker)
+    cli_result = staged.search("q", top_k=2)
+    api_result = staged("q", 2)
+    assert cli_result.hits == api_result.hits
+    assert [hit.block.ordinal for hit in cli_result.hits] == [3, 2]
+    assert len(seen) == 2
+    assert staged.last_trace["reranker"] == {"ranked": True}
+
+
 def test_explicit_request_session_reuses_one_embedding_server(monkeypatch):
     staged, search = build_search(monkeypatch)
 
@@ -240,3 +277,43 @@ def test_request_session_cleans_up_when_a_query_fails(monkeypatch):
     assert FakeEmbeddingServer.instances[0].closed
     assert staged._slot.active is None
     assert staged._current_cancel is None
+
+
+def test_embedding_exit_diagnostics_keep_only_bounded_redacted_error_lines(tmp_path):
+    from page_cite_rag.embedding_server import NativeEmbeddingServer
+
+    log_path = tmp_path / "server.log"
+    with log_path.open("w+b") as log:
+        log.write(
+            b"CUDA error: failed to load /private/model.gguf with credential secret-key\n"
+            b'{"content":"private document text"}\n'
+        )
+        log.flush()
+        server = object.__new__(NativeEmbeddingServer)
+        server.gpu_uuid = "GPU-test"
+        server.max_gpu_temperature_c = 88
+        server._temperature_limits = {}
+        server.samples = []
+        server._samples_lock = threading.Lock()
+        server._dispatch_count = 0
+        server._dispatch_wait_seconds_total = 0.0
+        server._last_dispatch_wait = None
+        server._guard_error = "owned_service_exited"
+        server._last_gpu_check = None
+        server._last_gpu_sample = None
+        server._process = SimpleNamespace(poll=lambda: -15)
+        server._exit_code = None
+        server._termination_requested = False
+        server._server_log_tail = None
+        server._log = log
+        server._auth_token = "secret-key"
+        server.model_path = Path("/private/model.gguf")
+        server._temporary = SimpleNamespace(name=str(tmp_path))
+
+        diagnostics = server.diagnostics()
+
+    assert diagnostics["server_exit_code"] == -15
+    assert "CUDA error: failed to load <model>" in diagnostics["server_log_tail"]
+    assert "secret-key" not in diagnostics["server_log_tail"]
+    assert "private document text" not in diagnostics["server_log_tail"]
+    assert len(diagnostics["server_log_tail"].encode("utf-8")) <= 8192

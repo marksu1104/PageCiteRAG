@@ -252,7 +252,7 @@ def test_gpu_guard_retains_bounded_timestamped_samples_before_termination(tmp_pa
     monkeypatch.setattr(client, "_gpu_snapshot", lambda: sample)
     for _ in range(125):
         client._check_gpu(before=True)
-    sample = {"memory_mib": 12001, "temperature_c": 40, "pids": []}
+    sample = {"memory_mib": 24001, "temperature_c": 40, "pids": []}
     monkeypatch.setattr(client._stop, "wait", lambda _: False)
     client._watch_gpu()
     client.close()
@@ -260,12 +260,12 @@ def test_gpu_guard_retains_bounded_timestamped_samples_before_termination(tmp_pa
     assert snapshot["guard_error"] == "gpu_memory_limit"
     samples = snapshot["monitor_samples"]
     assert len(samples) == 120
-    assert samples[-1]["memory_mib"] == 12001
+    assert samples[-1]["memory_mib"] == 24001
     assert [item["elapsed_seconds"] for item in samples] == list(range(7, 127))
     samples[-1]["pids"].append(99)
     assert client.diagnostics()["monitor_samples"][-1]["pids"] == []
     assert state.signals == [(12345, signal.SIGTERM)]
-    assert client.config.max_gpu_memory_mib == 12000
+    assert client.config.max_gpu_memory_mib == 24000
     assert client.config.max_gpu_temperature_c == 80
 
 
@@ -273,7 +273,7 @@ def test_gpu_guard_retains_bounded_timestamped_samples_before_termination(tmp_pa
     ("sample", "expected"),
     [
         ({"memory_mib": 77, "temperature_c": 40, "pids": [99999]}, "unexpected_gpu_process"),
-        ({"memory_mib": 12001, "temperature_c": 40, "pids": []}, "gpu_memory_limit"),
+        ({"memory_mib": 24001, "temperature_c": 40, "pids": []}, "gpu_memory_limit"),
         ({"memory_mib": 77, "temperature_c": 81, "pids": []}, "gpu_temperature_limit"),
     ],
 )
@@ -419,10 +419,12 @@ def test_startup_failure_retains_diagnostics_after_cleanup(tmp_path, monkeypatch
     factory, state = make_client(
         tmp_path, monkeypatch, startup_failure=True, log=b"startup details"
     )
-    with pytest.raises(ModelError, match="synthetic startup"):
+    with pytest.raises(ModelError, match="synthetic startup") as caught:
         factory()
-    snapshot = state.created.diagnostics(include_log=True)
+    snapshot = caught.value.diagnostics
+    assert snapshot == state.created.diagnostics(include_log=True)
     assert snapshot["closed"] and snapshot["server_pid"] == 12345
     assert snapshot["exit_code_before_termination"] is None
     assert snapshot["exit_code_after_termination"] == -signal.SIGTERM
     assert snapshot["server_log_tail"] == "startup details"
+    assert "startup details" not in str(caught.value)

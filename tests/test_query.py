@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import pytest
 from pydantic import ValidationError
 
 from page_cite_rag.generation import GenerationResult, GenerationStats, ModelError, check_budget
-from page_cite_rag.query import EnglishQuery, QueryRewriteConfig, QueryRewriter
+from page_cite_rag.query import QueryRewriteConfig, QueryRewriter
 
 
 @dataclass
@@ -29,353 +29,258 @@ STATS = GenerationStats(
 
 
 class FakeModel:
-    def __init__(self, query="Why does BM25 fail when recall < 0.5%?"):
+    def __init__(self, value="retrieval, ranking"):
         self.identity = {"backend": "fake", "revision": "test-1"}
-        self.query = query
+        self.value = value
         self.calls = []
-        self.closed = False
 
     def generate(self, messages, response_model):
         self.calls.append((messages, response_model))
-        if isinstance(self.query, Exception):
-            raise self.query
-        value = response_model(query=self.query)
-        return GenerationResult(
-            value, STATS, check_budget(messages, response_model.model_json_schema(), Budget())
-        )
-
-    def close(self):
-        self.closed = True
+        if isinstance(self.value, Exception):
+            raise self.value
+        schema = None if response_model is None else response_model.model_json_schema()
+        return GenerationResult(self.value, STATS, check_budget(messages, schema, Budget()))
 
 
-def test_chinese_question_rewrites_only_lexical_and_records_real_cost():
-    model = FakeModel()
-    rewriter = QueryRewriter(model, Budget())
-    original = "為什麼 BM25 在 recall < 0.5% 時失效？"
-    result = rewriter.rewrite(original)
-    assert result.original_query == original
-    assert result.lexical_query == model.query
-    assert result.status == "rewritten"
-    assert result.stats == STATS
-    assert result.meaning_requires_human_review
-    assert result.elapsed_ms >= 0
-    assert not result.cache_hit
-    assert len(model.calls) == 1
-    assert model.calls[0][1] is EnglishQuery
-    assert "negation" in model.calls[0][0][0].content
-    assert not model.closed
-
-
-def test_english_passthrough_never_calls_or_inspects_model():
-    class Untouchable:
-        @property
-        def identity(self):
-            raise AssertionError("English passthrough must not inspect model")
-
-        def generate(self, *_args):
-            raise AssertionError("English passthrough must not generate")
-
-    result = QueryRewriter(Untouchable(), Budget()).rewrite("Why does BM25 fail?")
-    assert result.status == "not_needed"
-    assert result.lexical_query == result.original_query
-    assert result.stats is None and result.model_identity_sha256 is None
-    assert not result.meaning_requires_human_review
-
-
-@pytest.mark.parametrize(
-    ("original", "candidate"),
-    [
-        ("BM25 是否在 n > 64 時有效？", "Is BM25 effective when n > 65?"),
-        ("BM25 是否在 n > 64 時有效？", "Is BM25 effective when n >= 64?"),
-        ("模型 ID abc-12 與 F1 的結果？", "Results of model ID abc-13 and F1?"),
-        ("差異是否為 -3.25%？", "Is the difference 3.25%?"),
-        ("差異是否為 +3.25%？", "Is the difference 3.25%?"),
-        ("BM25 與 BM25 的不同？", "How is BM25 different?"),
-        ("BM25 的效果？", "How effective is BM250?"),
-        ("Qwen 的效果？", "How effective is qwen?"),
-        ("門檻是 .5 與 1e-3？", "Are thresholds 0.5 and 0.001?"),
-    ],
-)
-def test_dropped_or_changed_literals_degrade_without_silent_repair(original, candidate):
-    model = FakeModel(candidate)
-    result = QueryRewriter(model, Budget()).rewrite(original)
-    assert result.status == "degraded"
-    assert result.reason == "required_literal_missing"
-    assert result.lexical_query == original
-    assert result.stats == STATS
-    assert len(model.calls) == 1
-
-
-@pytest.mark.parametrize("candidate", ["", "只有中文", "123", "English\nquery", "  "])
-def test_nonenglish_empty_and_control_outputs_degrade(candidate):
-    result = QueryRewriter(FakeModel(candidate), Budget()).rewrite("說明方法")
-    assert result.status == "degraded"
-    assert result.lexical_query == "說明方法"
-
-
-def test_english_query_output_limit_is_bounded():
-    result = QueryRewriter(
-        FakeModel("An excessively long query"), Budget(), QueryRewriteConfig(max_query_chars=10)
-    ).rewrite("說明方法")
-    assert result.reason == "invalid_english_query"
-
-
-def test_exact_quoted_english_phrase_and_numbers_are_preserved():
-    original = '「結果」中的 "not significant" 是否僅在 n > 64 才成立？'
-    model = FakeModel('Does "not significant" only hold when n > 64?')
-    result = QueryRewriter(model, Budget()).rewrite(original)
-    assert result.status == "rewritten"
-    assert result.original_query == original
-    assert result.lexical_query == model.query
-    assert result.meaning_requires_human_review
-
-
-@pytest.mark.parametrize(
-    "candidate",
-    [
-        'Does "significant not" only hold when n > 64?',
-        "Does not significant only hold when n > 64?",
-    ],
-)
-def test_same_words_are_not_proof_of_preserved_quoted_phrase(candidate):
-    original = '"not significant" 是否僅在 n > 64 才成立？'
-    result = QueryRewriter(FakeModel(candidate), Budget()).rewrite(original)
-    assert result.reason == "required_literal_missing"
-    assert result.lexical_query == original
-
-
-def test_numeric_facts_cannot_be_added_to_query():
-    result = QueryRewriter(FakeModel("Explain the method with 99 samples"), Budget()).rewrite(
-        "說明方法"
+def test_keyword_expansion_appends_terms_but_retains_original_verbatim():
+    model = FakeModel("hybrid retrieval, ranking methods")
+    question = "BM25 為什麼在 recall < 0.5% 時失效？"
+    result = QueryRewriter(model, Budget(), QueryRewriteConfig.for_document_language("en")).rewrite(
+        question
     )
-    assert result.reason == "numeric_or_comparison_literal_added"
-    assert result.status == "degraded"
+    assert result.status == "rewritten"
+    assert result.lexical_query.startswith(question + " ")
+    assert result.expansion_terms == ("hybrid retrieval", "ranking methods")
+    assert result.meaning_requires_human_review
+    assert len(model.calls) == 1 and model.calls[0][1] is None
 
 
-def test_model_failure_is_safe_explicit_and_not_retried():
-    model = FakeModel(ModelError("private server error with question contents"))
-    result = QueryRewriter(model, Budget()).rewrite("說明方法")
-    assert result.status == "degraded"
-    assert result.reason == "generation_or_schema_failure"
-    assert "private" not in result.reason
-    assert result.stats is None
+@pytest.mark.parametrize(
+    ("language", "question", "rewritten"),
+    [
+        (
+            "en",
+            "How does model A compare with model B when accuracy is >= 90%?",
+            "Compare model A and model B when accuracy is >= 90%.",
+        ),
+        (
+            "zh-Hant",
+            "方法在準確率 >= 90% 時，與基準相比有何限制？",
+            "說明該方法在準確率 >= 90% 時相較基準的限制。",
+        ),
+    ],
+)
+def test_full_sentence_mode_returns_one_bounded_query_in_document_language(
+    language, question, rewritten
+):
+    model = FakeModel(rewritten)
+    result = QueryRewriter(
+        model,
+        Budget(),
+        QueryRewriteConfig.for_document_language(language, mode="full_sentence"),
+    ).rewrite(question)
+
+    assert result.status == "rewritten"
+    assert result.mode == "full_sentence"
+    assert result.lexical_query == rewritten
+    assert result.expansion_terms == ()
+    assert result.version == "full-sentence-document-language/v1"
+    assert result.prompt_id == "retrieval.full-sentence.v1"
+    assert result.meaning_requires_human_review
     assert len(model.calls) == 1
+    system, user = model.calls[0][0]
+    assert "Do not answer the question" in system.content
+    assert "Traditional Chinese" in system.content if language == "zh-Hant" else True
+    assert question in user.content
 
 
-def test_budget_rejects_before_any_model_generation():
+@pytest.mark.parametrize(
+    "rewritten",
+    [
+        "The accuracy is >= 91%.",
+        "The accuracy is <= 90%.",
+        "The accuracy is >= 90%.\nAlso include other models.",
+        "   ",
+    ],
+)
+def test_full_sentence_mode_falls_back_if_output_changes_constraints_or_is_unbounded(
+    rewritten,
+):
+    question = "What happens at accuracy >= 90%?"
+    result = QueryRewriter(
+        FakeModel(rewritten),
+        Budget(),
+        QueryRewriteConfig(source_language="en", mode="full_sentence"),
+    ).rewrite(question)
+
+    assert result.status == "degraded"
+    assert result.lexical_query == question
+    assert result.expansion_terms == ()
+
+
+def test_full_sentence_mode_reports_unchanged_question_without_changing_it():
+    question = "Explain this method."
+    result = QueryRewriter(
+        FakeModel(question),
+        Budget(),
+        QueryRewriteConfig(source_language="en", mode="full_sentence"),
+    ).rewrite(question)
+
+    assert result.status == "not_needed"
+    assert result.lexical_query == question
+    assert result.reason == "full_sentence_unchanged"
+
+
+def test_budget_aware_rewrite_uses_the_same_schema_as_plain_text_generation():
+    class BudgetAwareFakeModel(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.prepared_schemas = []
+
+        def prepare_budget(self, messages, schema):
+            self.prepared_schemas.append(schema)
+            return check_budget(messages, schema, Budget())
+
+        def generate(self, messages, response_model):
+            self.calls.append((messages, response_model))
+            return GenerationResult(
+                self.value,
+                STATS,
+                self.prepare_budget(messages, None),
+            )
+
+    model = BudgetAwareFakeModel()
+
+    result = QueryRewriter(model, Budget()).rewrite("What retrieval method is used?")
+
+    assert result.status == "rewritten"
+    assert result.reason != "generation_budget_mismatch"
+    assert model.prepared_schemas == [None, None]
+
+
+def test_chinese_keyword_separators_keep_terms_and_limit_individual_terms():
+    result = QueryRewriter(
+        FakeModel("效能評估，準確率、推論速度"),
+        Budget(),
+        QueryRewriteConfig.for_document_language("zh-Hant"),
+    ).rewrite("方法的準確率與速度如何？")
+    assert result.status == "rewritten"
+    assert result.expansion_terms == ("效能評估", "準確率", "推論速度")
+
+    too_many = QueryRewriter(FakeModel("一，二，三，四，五，六，七，八，九"), Budget()).rewrite(
+        "方法比較"
+    )
+    assert too_many.status == "degraded"
+    assert too_many.reason == "keyword_output_out_of_bounds"
+
+
+@pytest.mark.parametrize(
+    ("document_language", "expected"),
+    [("en", "English"), ("zh-Hant", "Traditional Chinese"), (None, "English")],
+)
+def test_querygym_prompt_is_one_call_and_targets_known_document_language(
+    document_language, expected
+):
     model = FakeModel()
-    result = QueryRewriter(model, Budget(num_ctx=1000)).rewrite("請說明方法")
-    assert result.reason == "context_budget_exceeded"
-    assert result.stats is None and not model.calls
+    result = QueryRewriter(
+        model, Budget(), QueryRewriteConfig.for_document_language(document_language)
+    ).rewrite("What limits the method?")
+    assert result.status == "rewritten"
+    messages, response_model = model.calls[0]
+    assert response_model is None
+    assert len(messages) == 2
+    assert "comma-separated keywords" in messages[0].content
+    assert expected in messages[0].content
+    assert "Suggest keywords to improve retrieval" in messages[1].content
 
 
-def test_character_limit_rejects_before_model_generation():
+@pytest.mark.parametrize(
+    "value",
+    ["", ", ,", "one, two, three, four, five, six, seven, eight, nine", "term\nextra"],
+)
+def test_invalid_or_unbounded_expansion_degrades_to_original(value):
+    question = "Explain the method"
+    result = QueryRewriter(FakeModel(value), Budget()).rewrite(question)
+    assert result.status == "degraded"
+    assert result.lexical_query == question
+    assert result.expansion_terms == ()
+
+
+def test_expansion_cannot_inject_new_numeric_or_comparison_claims():
+    result = QueryRewriter(FakeModel("sample size 99, method"), Budget()).rewrite(
+        "sample size in method"
+    )
+    assert result.status == "degraded"
+    assert result.reason == "keyword_added_literal"
+    assert result.lexical_query == "sample size in method"
+
+
+def test_query_is_not_rewritten_if_it_exceeds_the_bound():
     model = FakeModel()
     result = QueryRewriter(model, Budget(), QueryRewriteConfig(max_question_chars=3)).rewrite(
-        "請說明方法"
+        "question"
     )
+    assert result.status == "degraded"
     assert result.reason == "question_character_limit"
     assert not model.calls
 
 
-def test_cache_hit_has_no_new_stats_and_changed_identity_invalidates():
-    model = FakeModel("Explain the method")
+def test_failure_is_explicit_and_never_retried():
+    model = FakeModel(ModelError("private content must not leak"))
+    result = QueryRewriter(model, Budget()).rewrite("why this method?")
+    assert result.status == "degraded"
+    assert result.reason == "generation_failure"
+    assert "private" not in result.reason
+    assert len(model.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "GPU temperature limit exceeded",
+        "GPU thermal slowdown observed; own server stopped",
+        "another GPU compute process is present; own server stopped",
+        "GPU status unavailable; stop rather than assume it is safe",
+    ],
+)
+def test_gpu_safety_stops_are_not_hidden_by_rewrite_fallback(message):
+    model = FakeModel(ModelError(message))
+    with pytest.raises(ModelError, match="GPU"):
+        QueryRewriter(model, Budget()).rewrite("find the evidence")
+    assert len(model.calls) == 1
+
+
+def test_cache_records_cost_once_and_changes_with_model_identity():
+    model = FakeModel("retrieval")
     rewriter = QueryRewriter(model, Budget())
-    first = rewriter.rewrite("說明方法")
-    cached = rewriter.rewrite("說明方法")
-    assert first.stats == STATS and cached.stats is None
-    assert cached.cache_hit and cached.lexical_query == first.lexical_query
-    assert cached.meaning_requires_human_review
+    first = rewriter.rewrite("Explain the method")
+    second = rewriter.rewrite("Explain the method")
+    assert first.stats == STATS
+    assert second.stats is None and second.cache_hit
     assert len(model.calls) == 1
     model.identity["revision"] = "test-2"
-    changed = rewriter.rewrite("說明方法")
-    assert changed.model_identity_sha256 != first.model_identity_sha256
-    assert not changed.cache_hit and len(model.calls) == 2
-    rewriter.clear_cache()
-    assert not rewriter.rewrite("說明方法").cache_hit
-    assert len(model.calls) == 3
+    third = rewriter.rewrite("Explain the method")
+    assert not third.cache_hit
+    assert third.model_identity_sha256 != first.model_identity_sha256
+    assert len(model.calls) == 2
 
 
-def test_cache_budget_change_cannot_bypass_preflight():
-    model = FakeModel("Explain the method")
-    budget = Budget()
-    rewriter = QueryRewriter(model, budget)
-    assert rewriter.rewrite("說明方法").status == "rewritten"
-    budget.num_ctx = 1000
-    result = rewriter.rewrite("說明方法")
-    assert result.reason == "context_budget_exceeded"
-    assert not result.cache_hit and len(model.calls) == 1
-
-
-def test_lru_eviction_and_disabled_cache_are_bounded():
-    model = FakeModel("Explain the method")
-    rewriter = QueryRewriter(model, Budget(), QueryRewriteConfig(cache_size=1))
-    rewriter.rewrite("方法一")
-    rewriter.rewrite("方法二")
-    assert not rewriter.rewrite("方法一").cache_hit
-    assert len(model.calls) == 3
-    uncached = QueryRewriter(model, Budget(), QueryRewriteConfig(cache_size=0))
-    uncached.rewrite("方法一")
-    assert not uncached.rewrite("方法一").cache_hit
-    assert len(model.calls) == 5
-
-
-def test_failed_rewrite_is_cached_without_new_generation_or_fake_cost():
-    model = FakeModel(ModelError("unavailable"))
-    rewriter = QueryRewriter(model, Budget())
-    assert rewriter.rewrite("說明方法").status == "degraded"
-    cached = rewriter.rewrite("說明方法")
-    assert cached.status == "degraded" and cached.cache_hit and cached.stats is None
-    assert len(model.calls) == 1
-
-
-def test_invalid_model_identity_degrades_without_generation():
-    model = FakeModel()
-    model.identity = {"backend": object()}
-    result = QueryRewriter(model, Budget()).rewrite("說明方法")
-    assert result.reason == "model_identity_or_budget_invalid"
-    assert not model.calls
-
-
-@pytest.mark.parametrize("question", ["", "  ", None, 123])
-def test_empty_and_nonstring_questions_are_rejected(question):
-    with pytest.raises(ValueError, match="nonempty"):
-        QueryRewriter(FakeModel(), Budget()).rewrite(question)
+def test_source_language_mapping_is_conservative():
+    assert QueryRewriteConfig.for_document_language("en-US").source_language == "en"
+    assert QueryRewriteConfig.for_document_language("zh-Hant").source_language == "zh-Hant"
+    assert QueryRewriteConfig.for_document_language("mixed").source_language == "mixed"
+    assert QueryRewriteConfig.for_document_language(None).source_language == "unknown"
 
 
 @pytest.mark.parametrize(
     "config",
     [
-        {"target_language": "zh"},
-        {"cache_size": 129},
-        {"max_question_chars": 2001},
-        {"max_query_chars": 2001},
-        {"cache_size": True},
+        {"source_language": "zh"},
+        {"max_terms": 9},
+        {"cache_size": 513},
+        {"max_question_chars": True},
     ],
 )
-def test_configuration_bounds_and_english_only_target(config):
+def test_configuration_rejects_invalid_values(config):
     with pytest.raises(ValidationError):
         QueryRewriteConfig(**config)
-
-
-def test_identity_records_version_configuration_and_no_semantic_claim():
-    identity = QueryRewriter(FakeModel(), Budget()).identity
-    assert identity["config"]["target_language"] == "en"
-    assert identity["version"].endswith("/v2")
-    assert len(identity["model_identity_sha256"]) == 64
-    assert identity["meaning_verified"] is False
-
-
-def test_translation_prompt_and_schema_require_english_without_answer_evidence():
-    model = FakeModel("What limits the sample size?")
-    QueryRewriter(model, Budget()).rewrite("樣本數有哪些限制？")
-    messages, schema = model.calls[0]
-    assert messages[-1].role == "user"
-    assert '"target_language": "English"' in messages[-1].content
-    assert "English-language" in schema.model_json_schema()["properties"]["query"]["description"]
-    assert len(messages) == 4
-    assert messages[2].role == "assistant"
-    assert "evidence" not in messages[-1].content
-
-
-class MalformedModel(FakeModel):
-    def __init__(self, *, value=None, stats=None, returned_budget=None):
-        super().__init__()
-        self.value = EnglishQuery(query="Explain the method") if value is None else value
-        self.stats = STATS if stats is None else stats
-        self.returned_budget = returned_budget
-
-    def generate(self, messages, response_model):
-        self.calls.append((messages, response_model))
-        budget = check_budget(messages, response_model.model_json_schema(), Budget())
-        if self.returned_budget:
-            budget = self.returned_budget(budget)
-        return GenerationResult(self.value, self.stats, budget)
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        EnglishQuery.model_construct(query=123),
-        EnglishQuery.model_construct(query="x" * 2001),
-    ],
-)
-def test_constructed_invalid_values_are_revalidated_without_warning_or_exception(value):
-    import warnings
-
-    with warnings.catch_warnings(record=True) as recorded:
-        result = QueryRewriter(MalformedModel(value=value), Budget()).rewrite("說明方法")
-    assert result.status == "degraded"
-    assert result.reason == "generation_or_schema_failure"
-    assert not recorded
-
-
-def test_output_dictionary_cannot_add_unexpected_schema_fields():
-    model = MalformedModel(value={"query": "Explain the method", "unexpected": "field"})
-    result = QueryRewriter(model, Budget()).rewrite("說明方法")
-    assert result.reason == "generation_or_schema_failure"
-
-
-@pytest.mark.parametrize(
-    "stats",
-    [
-        STATS.model_copy(update={"done_reason": "length"}),
-        STATS.model_copy(update={"eval_count": -1}),
-        STATS.model_copy(update={"elapsed_ms": float("nan")}),
-        STATS.model_copy(update={"prompt_eval_count": True}),
-    ],
-)
-def test_constructed_invalid_stats_are_rejected_not_reported_as_real_cost(stats):
-    result = QueryRewriter(MalformedModel(stats=stats), Budget()).rewrite("說明方法")
-    assert result.status == "degraded"
-    assert result.reason == "generation_or_schema_failure"
-    assert result.stats is None
-
-
-@pytest.mark.parametrize(
-    "stats",
-    [
-        STATS.model_copy(update={"eval_count": 513}),
-        STATS.model_copy(update={"prompt_eval_count": 8192}),
-    ],
-)
-def test_actual_valid_stats_outside_budget_are_reported_but_answer_is_not_accepted(stats):
-    result = QueryRewriter(MalformedModel(stats=stats), Budget()).rewrite("說明方法")
-    assert result.status == "degraded"
-    assert result.reason == "generation_budget_mismatch"
-    assert result.stats == stats
-
-
-def test_returned_budget_must_exactly_match_preflight():
-    model = MalformedModel(
-        returned_budget=lambda budget: replace(
-            budget, input_upper_estimate=budget.input_upper_estimate + 1
-        )
-    )
-    result = QueryRewriter(model, Budget()).rewrite("說明方法")
-    assert result.status == "degraded"
-    assert result.reason == "generation_budget_mismatch"
-    assert result.stats == STATS
-
-
-def test_malformed_generated_object_degrades_safely_without_retry():
-    class MissingAttributes(FakeModel):
-        def generate(self, messages, response_model):
-            self.calls.append((messages, response_model))
-            return object()
-
-    model = MissingAttributes()
-    result = QueryRewriter(model, Budget()).rewrite("說明方法")
-    assert result.status == "degraded"
-    assert result.reason == "generation_or_schema_failure"
-    assert result.stats is None and len(model.calls) == 1
-
-
-@pytest.mark.parametrize(
-    "budget", [Budget(num_ctx=True), Budget(num_predict=-1), Budget(template_reserve=-1)]
-)
-def test_invalid_budget_types_and_ranges_degrade_before_generation(budget):
-    model = FakeModel()
-    result = QueryRewriter(model, budget).rewrite("說明方法")
-    assert result.reason == "model_identity_or_budget_invalid"
-    assert not model.calls

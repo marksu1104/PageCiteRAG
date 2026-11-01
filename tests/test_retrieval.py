@@ -66,6 +66,19 @@ def test_tokenizer_keeps_details_and_searches_mixed_chinese_and_english(tmp_path
     assert store.get_unit(document_id, 1).text == text
 
 
+def test_tokenizer_preserves_common_technical_identifiers_and_scientific_notation():
+    tokens = LexicalTokenizer().tokenize("C++ C C# C++20 foo_bar 1e-3 -2.5E+4")
+    assert {"c++", "c", "c#", "c++20", "foo_bar", "1e-3", "-2.5e+4"}.issubset(tokens)
+
+
+def test_bm25_indexes_and_queries_technical_identifiers_with_one_token_contract(tmp_path):
+    store, document_id = _ingest(tmp_path, "C++20 and foo_bar use 1e-3 as a threshold.")
+    build_bm25_index(store, document_id)
+    result = BM25Retriever(store, document_id).search("C++20 foo_bar 1e-3")
+    assert len(result.hits) == 1
+    assert "1e-3" in result.hits[0].block.text
+
+
 def test_many_queries_reuse_loaded_index_without_building_or_loading_again(tmp_path, monkeypatch):
     store, document_id = _ingest(tmp_path)
     manifest = build_bm25_index(store, document_id)

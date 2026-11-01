@@ -10,7 +10,7 @@ import time
 from bisect import bisect_right
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Literal, Sequence
+from typing import Callable, Literal, Sequence
 
 import opencc
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -24,12 +24,14 @@ from page_cite_rag.generation import (
     GenerationStats,
     ModelClient,
     ModelError,
+    OutputFailureAccounting,
     PromptBudget,
     budget_for_model,
 )
 from page_cite_rag.hybrid import Retriever
 from page_cite_rag.models import Block, ParsedUnit, UnitSummary
 from page_cite_rag.retrieval import SearchBranchTrace, SearchContextGroup, SearchResult
+from page_cite_rag.retrieval_profile import MAX_CONTEXT_GROUPS
 from page_cite_rag.source_outline import (
     OUTLINE_KIND,
     SourceOutline,
@@ -77,9 +79,21 @@ class WorkflowError(ModelError):
 class CitationOutputError(WorkflowError):
     """A returned draft selected an invalid citation; source integrity is not waived."""
 
-    def __init__(self, reason_code: str) -> None:
+    def __init__(self, reason_code: str, generated: GenerationResult | None = None) -> None:
         super().__init__("generated citations failed source provenance validation")
         self.reason_code = reason_code
+        self.validation_errors = ({"type": reason_code, "stage": "citation_validation"},)
+        self.raw_model_output = generated.raw_model_output if generated is not None else None
+        self.accounting = (
+            OutputFailureAccounting(
+                prompt_eval_count=generated.stats.prompt_eval_count,
+                eval_count=generated.stats.eval_count,
+                elapsed_ms=generated.stats.elapsed_ms,
+                stop_type="eos",
+            )
+            if generated is not None
+            else None
+        )
 
 
 _MODEL_CITATION_ERRORS = {
@@ -95,7 +109,8 @@ _MODEL_CITATION_ERRORS = {
 
 @lru_cache(maxsize=1)
 def _traditional_chinese_converter() -> opencc.OpenCC:
-    return opencc.OpenCC("s2twp.json")
+    # Normalize script without context-free terminology replacement (e.g. 军分区).
+    return opencc.OpenCC("s2tw.json")
 
 
 def _format_output_text(text: str, language: Language) -> str:
@@ -103,6 +118,23 @@ def _format_output_text(text: str, language: Language) -> str:
     if language == "zh-Hant":
         return _traditional_chinese_converter().convert(text)
     return text
+
+
+def resolve_answer_language(question: str, language: Language) -> Literal["en", "zh-Hant"]:
+    """Resolve bilingual auto mode, choosing Traditional Chinese for Chinese input."""
+    if language != "auto":
+        return language
+    if not isinstance(question, str):
+        return "en"
+    has_cjk = any(
+        "\u3400" <= char <= "\u4dbf"
+        or "\u4e00" <= char <= "\u9fff"
+        or "\uf900" <= char <= "\ufaff"
+        or "\U00020000" <= char <= "\U0002fa1f"
+        for char in question
+    )
+    has_kana = any("\u3040" <= char <= "\u30ff" for char in question)
+    return "zh-Hant" if has_cjk and not has_kana else "en"
 
 
 def _verify_block_in_unit(block: Block, unit: ParsedUnit | None) -> Block:
@@ -141,7 +173,7 @@ def read_verified_source(store: SQLiteDocumentStore, document_id: str, block_id:
 class WorkflowConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    top_k: int = Field(default=6, ge=1, le=20)
+    top_k: int = Field(default=6, ge=1, le=MAX_CONTEXT_GROUPS)
     neighbor_blocks: int = Field(default=1, ge=0, le=2)
     max_question_chars: int = Field(default=4000, ge=1, le=16000)
 
@@ -156,6 +188,39 @@ class RetrievalTrace(BaseModel):
     elapsed_ms: float = Field(ge=0, allow_inf_nan=False)
     query_plan: dict | None = None
     branches: tuple[SearchBranchTrace, ...] = ()
+
+
+class AgentUsage(BaseModel):
+    """Observed shared-budget usage for navigation plus the final writer."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    model_calls: int = Field(ge=1)
+    tool_calls: int = Field(ge=0)
+    input_tokens: int = Field(ge=1)
+    output_tokens: int | None = Field(default=None, ge=0)
+    output_tokens_reserved: int = Field(ge=0)
+    output_usage_complete: bool
+    final_input_tokens: int = Field(ge=1)
+    final_output_tokens: int | None = Field(default=None, ge=0)
+    final_output_limit: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_accounting(self) -> AgentUsage:
+        if self.final_input_tokens > self.input_tokens:
+            raise ValueError("final call input must be included in total agent input")
+        if (
+            self.final_output_tokens is not None
+            and self.final_output_tokens > self.final_output_limit
+        ):
+            raise ValueError("final call output exceeds its recorded limit")
+        if self.output_usage_complete and (
+            self.output_tokens is None or self.output_tokens_reserved != 0
+        ):
+            raise ValueError("complete agent output usage must have no unobserved reservation")
+        if not self.output_usage_complete and self.output_tokens is not None:
+            raise ValueError("incomplete agent output usage must remain unknown")
+        return self
 
 
 class AnswerResult(BaseModel):
@@ -181,12 +246,21 @@ class AnswerResult(BaseModel):
     ]
     retrieval: RetrievalTrace | None
     generation_stats: GenerationStats | None
+    agent_usage: AgentUsage | None = None
     model_identity: dict
     prompt_version: Literal[
         "complete-cited-answer-v1",
         "complete-cited-answer-v2",
         "complete-cited-answer-v3",
         "complete-cited-answer-v4",
+        "complete-cited-answer-v5-task-aligned",
+        "complete-cited-answer-v5-source-facts-first",
+        "complete-cited-answer-v6-contract-consistent",
+        "complete-cited-answer-v7-answer-evidence-alignment",
+        "complete-cited-answer-v9-requirement-examples",
+        "complete-cited-answer-v10-source-backed-absence",
+        "integrated-reading-agent/v1",
+        "agentic-reading-v2",
         "source-backed-claims-v1",
     ] = PROMPT_VERSION
     budget: PromptBudget
@@ -202,12 +276,36 @@ class AnswerResult(BaseModel):
             ):
                 raise ValueError("answer text must be derived only from verified answer claims")
             expected_reason = "partial" if self.status == "partial" else "answered"
-            if self.stop_reason != expected_reason or self.generation_stats is None:
+            if self.stop_reason != expected_reason or (
+                self.generation_stats is None and self.agent_usage is None
+            ):
                 raise ValueError("answered results require a completed generation")
             if self.status == "partial" and len(self.limitations) <= 1:
                 raise ValueError("partial results must identify the missing requested information")
         elif answer_claims or detail_claims or self.stop_reason in ("answered", "partial"):
             raise ValueError("insufficient results cannot contain answer or detail claims")
+        if self.agent_usage is not None:
+            if self.prompt_version == "integrated-reading-agent/v1":
+                valid_usage = (
+                    self.generation_stats is None
+                    and self.budget.exact_input_tokens == self.agent_usage.final_input_tokens
+                    and self.budget.output_reserved == self.agent_usage.final_output_limit
+                )
+            elif self.prompt_version == "agentic-reading-v2":
+                valid_usage = (
+                    self.generation_stats is not None
+                    and self.budget.exact_input_tokens == self.agent_usage.final_input_tokens
+                    and self.budget.output_reserved == self.agent_usage.final_output_limit
+                    and self.generation_stats.prompt_eval_count
+                    == self.agent_usage.final_input_tokens
+                    and self.generation_stats.eval_count == self.agent_usage.final_output_tokens
+                )
+            else:
+                valid_usage = False
+            if not valid_usage:
+                raise ValueError("agent usage must match the integrated-agent final-call budget")
+        elif self.prompt_version in ("integrated-reading-agent/v1", "agentic-reading-v2"):
+            raise ValueError("integrated-agent results require their full agent usage ledger")
         if len(set(self.included_block_ids)) != len(self.included_block_ids):
             raise ValueError("included source block IDs must be unique")
         if set(self.included_block_ids) & set(self.omitted_block_ids):
@@ -434,8 +532,9 @@ class AnswerWorkflow:
         """Allow format-specific workflows to add retrieved context to the prompt."""
         return self._messages(question, language, mode, blocks, requested_block_id)
 
-    def ask(self, question: str, *, language: Language = "en") -> AnswerResult:
+    def ask(self, question: str, *, language: Language = "zh-Hant") -> AnswerResult:
         start = time.perf_counter()
+        language = resolve_answer_language(question, language)
         self._validate_request(question, language)
         # An oversized question/schema must fail even when retrieval would return no hits.
         self._context(question, language, "local", (), None)
@@ -460,11 +559,14 @@ class AnswerWorkflow:
         question: str,
         blocks: Sequence[Block],
         *,
-        language: Language = "en",
+        language: Language = "zh-Hant",
         context_groups: Sequence[SearchContextGroup] = (),
+        before_generation: Callable[[PromptBudget], None] | None = None,
+        after_generation: Callable[[GenerationStats], None] | None = None,
     ) -> AnswerResult:
         """Answer from verified blocks selected by a bounded upstream workflow."""
         start = time.perf_counter()
+        language = resolve_answer_language(question, language)
         self._validate_request(question, language)
         self._context(question, language, "local", (), None)
         verified = []
@@ -488,6 +590,8 @@ class AnswerWorkflow:
             None,
             start,
             context_groups=context_groups,
+            before_generation=before_generation,
+            after_generation=after_generation,
         )
 
     def _query_plan(self) -> dict | None:
@@ -559,9 +663,10 @@ class AnswerWorkflow:
         block_id: str,
         *,
         question: str = DEFAULT_EXPLANATION,
-        language: Language = "en",
+        language: Language = "zh-Hant",
     ) -> AnswerResult:
         start = time.perf_counter()
+        language = resolve_answer_language(question, language)
         self._validate_request(question, language)
         target = self.read_source(block_id)
         neighbors = self._store.get_neighbor_blocks(
@@ -682,6 +787,8 @@ class AnswerWorkflow:
         retrieval: RetrievalTrace | None,
         start: float,
         context_groups: Sequence[SearchContextGroup] = (),
+        before_generation: Callable[[PromptBudget], None] | None = None,
+        after_generation: Callable[[GenerationStats], None] | None = None,
     ) -> AnswerResult:
         if context_groups:
             selected, omitted, messages, budget = self._context(
@@ -748,6 +855,8 @@ class AnswerWorkflow:
                 elapsed_ms=(time.perf_counter() - start) * 1000,
             )
         response_model = self._response_model_for(selected)
+        if before_generation is not None:
+            before_generation(budget)
         generated = self._model.generate(messages, response_model)
         if (
             not isinstance(generated, GenerationResult)
@@ -761,6 +870,8 @@ class AnswerWorkflow:
             )
         except (AttributeError, ValidationError):
             raise WorkflowError("generation returned invalid completion statistics") from None
+        if after_generation is not None:
+            after_generation(generation_stats)
         if (
             generation_stats.eval_count > self._budget_config.num_predict
             or (
@@ -773,11 +884,14 @@ class AnswerWorkflow:
             raise WorkflowError("generation token counts exceeded the explicit context budget")
         # validate_claims rereads source again and rejects any citation outside the admitted set.
         try:
-            claims, extra_fields = self._verify_output(generated.value, selected)
+            claims, extra_fields = self._verify_output(generated.value, selected, language=language)
         except CitationError as error:
             reason = _MODEL_CITATION_ERRORS.get(str(error))
             if reason is not None:
-                raise CitationOutputError(reason) from None
+                failure = CitationOutputError(reason, generated)
+                if errors := getattr(error, "validation_errors", ()):
+                    failure.validation_errors = errors
+                raise failure from None
             raise WorkflowError("generated citations failed source provenance validation") from None
         answer_claims = extra_fields.pop("answer_claims", claims)
         detail_claims = extra_fields.pop("detail_claims", ())
@@ -827,7 +941,7 @@ class AnswerWorkflow:
     def _verify_claims(self, draft, blocks) -> tuple[VerifiedClaim, ...]:
         return validate_claims(self._store, self.document_id, draft, blocks)
 
-    def _verify_output(self, draft, blocks):
+    def _verify_output(self, draft, blocks, *, language: Language = "zh-Hant"):
         """Extensions may expose additional fields only after source verification."""
         return self._verify_claims(draft, blocks), {}
 

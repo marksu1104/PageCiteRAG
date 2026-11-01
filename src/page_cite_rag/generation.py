@@ -1,10 +1,11 @@
-"""Small, injectable local generation boundary; no retrieval or agent workflow yet."""
+"""Injectable local structured generation, token budgets, and completion accounting."""
 
 from __future__ import annotations
 
 import hashlib
 import ipaddress
 import json
+import math
 import time
 from dataclasses import dataclass
 from importlib.metadata import version
@@ -17,6 +18,7 @@ DEFAULT_LLM = "qwen3.5:9b-q4_K_M"
 DEFAULT_DIGEST = "6488c96fa5faab64bb65cbd30d4289e20e6130ef535a93ef9a49f42eda893ea7"
 BUDGET_VERSION = "utf8-byte-upper-estimate/message64/template-reserve/v1"
 T = TypeVar("T", bound=BaseModel)
+ResultValue = TypeVar("ResultValue")
 
 
 class BudgetConfig(Protocol):
@@ -56,10 +58,10 @@ class GenerationConfig(BaseModel):
     digest: str = Field(default=DEFAULT_DIGEST, pattern=r"^[0-9a-f]{64}$")
     runtime_version: str = "0.35.0"
     num_ctx: int = Field(default=16384, ge=2048, le=262144)
-    num_predict: int = Field(default=2048, ge=1, le=8192)
+    num_predict: int = Field(default=3072, ge=1, le=8192)
     template_reserve: int = Field(default=1024, ge=256, le=8192)
     keep_alive: str = Field(default="30m", pattern=r"^[1-9][0-9]*(s|m|h)$")
-    timeout_seconds: float = Field(default=120.0, gt=0, le=600, allow_inf_nan=False)
+    timeout_seconds: float = Field(default=600.0, gt=0, le=600, allow_inf_nan=False)
     num_thread: int = Field(default=6, ge=1, le=64)
     num_gpu: int = Field(default=0, ge=0, le=999)
 
@@ -219,10 +221,12 @@ class OutputValidationError(StructuredOutputError):
 
 
 @dataclass(frozen=True)
-class GenerationResult(Generic[T]):
-    value: T
+class GenerationResult(Generic[ResultValue]):
+    value: ResultValue
     stats: GenerationStats
     budget: PromptBudget
+    # Retained only in memory; local evaluation may save it on validation failure.
+    raw_model_output: str | None = None
 
 
 class ModelClient(Protocol):
@@ -231,7 +235,11 @@ class ModelClient(Protocol):
     identity: dict
 
     def generate(
-        self, messages: Sequence[ChatMessage], response_model: type[T]
+        self,
+        messages: Sequence[ChatMessage],
+        response_model: type[T],
+        *,
+        include_schema_in_prompt: bool = True,
     ) -> GenerationResult[T]: ...
 
     def close(self) -> None: ...
@@ -257,6 +265,7 @@ class OllamaModelClient:
             transport=transport,
         )
         self._closed = False
+        self._request_deadline: float | None = None
         try:
             runtime = self._request("/api/version").get("version")
             if runtime != config.runtime_version:
@@ -303,14 +312,20 @@ class OllamaModelClient:
 
         if self._closed:
             raise ModelError("generation client is closed")
+        timeout = self.remaining_request_timeout_seconds()
         start = time.perf_counter()
         try:
-            with self._http.stream("GET" if payload is None else "POST", path, json=payload) as r:
+            with self._http.stream(
+                "GET" if payload is None else "POST",
+                path,
+                json=payload,
+                timeout=timeout,
+            ) as r:
                 if not 200 <= r.status_code < 300:
                     raise ModelError(f"local Ollama request failed with HTTP {r.status_code}")
                 body = bytearray()
                 for chunk in r.iter_bytes():
-                    if time.perf_counter() - start > self.config.timeout_seconds:
+                    if time.perf_counter() - start > timeout:
                         raise ModelTimeoutError(
                             "local generation response exceeded its time budget"
                         )
@@ -327,6 +342,22 @@ class OllamaModelClient:
         if not isinstance(value, dict) or "error" in value:
             raise ModelError("local Ollama returned an invalid or failed response")
         return value
+
+    def set_request_deadline(self, deadline: float) -> None:
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError("request deadline must be a finite monotonic timestamp")
+        self._request_deadline = float(deadline)
+
+    def clear_request_deadline(self) -> None:
+        self._request_deadline = None
+
+    def remaining_request_timeout_seconds(self) -> float:
+        if self._request_deadline is None:
+            return self.config.timeout_seconds
+        remaining = self._request_deadline - time.monotonic()
+        if remaining <= 0:
+            raise ModelTimeoutError("local request exceeded its total deadline")
+        return min(self.config.timeout_seconds, remaining)
 
     def _verify_model(self) -> None:
         models = self._request("/api/tags").get("models")
@@ -351,11 +382,21 @@ class OllamaModelClient:
         ]
 
     def generate(
-        self, messages: Sequence[ChatMessage], response_model: type[T]
+        self,
+        messages: Sequence[ChatMessage],
+        response_model: type[T],
+        *,
+        include_schema_in_prompt: bool = True,
     ) -> GenerationResult[T]:
+        if type(include_schema_in_prompt) is not bool:
+            raise ValueError("schema prompt inclusion must be boolean")
         messages = tuple(messages)
         schema = response_model.model_json_schema()
-        budget = check_budget(messages, schema, self.config)
+        budget = check_budget(
+            messages,
+            schema if include_schema_in_prompt else {},
+            self.config,
+        )
         self._verify_model()
         start = time.perf_counter()
         response = self._request(
@@ -423,7 +464,7 @@ class OllamaModelClient:
             or stats.eval_count > self.config.num_predict
         ):
             raise ContextBudgetError("runtime token counts violate the configured budget")
-        return GenerationResult(value, stats, budget)
+        return GenerationResult(value, stats, budget, message.get("content"))
 
     def close(self) -> None:
         if not self._closed:

@@ -9,6 +9,7 @@ import uuid
 from collections import deque
 from concurrent.futures import Future
 from contextlib import closing
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
@@ -16,7 +17,6 @@ from typing import Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from page_cite_rag.application import (
-    FrozenSearchRetriever,
     RetrievalMethod,
     ask_document,
     document_retriever_parts,
@@ -25,8 +25,14 @@ from page_cite_rag.application import (
 )
 from page_cite_rag.hybrid import Retriever
 from page_cite_rag.retrieval import SearchResult
+from page_cite_rag.retrieval_profile import FORMAL_RETRIEVAL
 from page_cite_rag.store import SQLiteDocumentStore
-from page_cite_rag.workflows import AnswerResult, Language, read_verified_source
+from page_cite_rag.workflows import (
+    AnswerResult,
+    Language,
+    read_verified_source,
+    resolve_answer_language,
+)
 
 
 class ServiceBusyError(RuntimeError):
@@ -47,11 +53,13 @@ class ServiceConfig(BaseModel):
     database_path: Path
     document_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     method: RetrievalMethod = "bm25"
-    top_k: int = Field(default=6, ge=1, le=20)
+    top_k: int = Field(default=FORMAL_RETRIEVAL.final_k, ge=1, le=100)
     neighbor_blocks: int = Field(default=1, ge=0, le=2)
     queue_capacity: int = Field(default=2, ge=0, le=8)
-    request_timeout_seconds: float = Field(default=180, gt=1, le=300)
+    request_timeout_seconds: float = Field(default=600, gt=1, le=600)
     idle_seconds: float = Field(default=300, gt=0, le=300)
+    reading_agent: bool = False
+    delegate_readers: bool = False
 
 
 class ServiceTrace(BaseModel):
@@ -67,6 +75,8 @@ class ServiceTrace(BaseModel):
     load_count: int = Field(ge=0)
     model_pid: int | None = None
     retrieval_mode: Literal["resident", "staged"]
+    gpu_retrieval_trace: dict | None = None
+    reading_trace: dict | None = None
 
 
 class ServiceAnswer(BaseModel):
@@ -107,6 +117,15 @@ class _Job:
     future: Future[ServiceAnswer] = field(default_factory=Future)
     cancel_reason: Literal["cancelled", "deadline"] | None = None
     deadline_timer: threading.Timer | None = None
+    model: object | None = None
+
+
+@dataclass(frozen=True)
+class _SearchCallback:
+    callback: Callable[[str, int], SearchResult]
+
+    def search(self, query: str, *, top_k: int = 5) -> SearchResult:
+        return self.callback(query, top_k)
 
 
 class DocumentService:
@@ -125,12 +144,18 @@ class DocumentService:
         *,
         encoder=None,
         versioned_dense: bool = False,
-        staged_search: Callable[[str, int], SearchResult] | None = None,
+        staged_search: Retriever | Callable[[str, int], SearchResult] | None = None,
     ) -> None:
         self.config = config
+        if config.delegate_readers and not config.reading_agent:
+            raise ValueError("delegated readers require the reading agent")
         self.model_config = model_config
         self._model_factory = model_factory
-        self._staged_search = staged_search
+        self._staged_search = (
+            _SearchCallback(staged_search)
+            if callable(staged_search) and not callable(getattr(staged_search, "search", None))
+            else staged_search
+        )
         self._lock = threading.Condition()
         self._jobs: deque[_Job] = deque()
         self._active: _Job | None = None
@@ -145,6 +170,7 @@ class DocumentService:
         record = self.store.get_document(config.document_id)
         if record is None:
             raise ValueError("bound document was not found")
+        self._source_language = record.language
         self._docling_source = False
         if record.parser_name == "docling":
             from page_cite_rag.docling_document import has_native_source
@@ -156,7 +182,11 @@ class DocumentService:
 
                 self._lexical, self._dense = None, None
                 self.retriever = document_retriever(
-                    self.store, config.document_id, config.method, encoder=encoder
+                    self.store,
+                    config.document_id,
+                    config.method,
+                    encoder=encoder,
+                    candidates=FORMAL_RETRIEVAL.candidates_per_branch,
                 )
             else:
                 self._lexical, self._dense = document_retriever_parts(
@@ -169,7 +199,11 @@ class DocumentService:
             if not self._docling_source and config.method == "hybrid":
                 from page_cite_rag.hybrid import HybridRetriever
 
-                self.retriever: Retriever | None = HybridRetriever(self._lexical, self._dense)
+                self.retriever: Retriever | None = HybridRetriever(
+                    self._lexical,
+                    self._dense,
+                    candidates=FORMAL_RETRIEVAL.candidates_per_branch,
+                )
             elif not self._docling_source:
                 self.retriever = self._lexical if self._lexical is not None else self._dense
         else:
@@ -215,7 +249,7 @@ class DocumentService:
         mode: Literal["ask", "explain"],
         question: str,
         *,
-        language: Language = "en",
+        language: Language = "zh-Hant",
         block_id: str | None = None,
         rewrite_query: bool = False,
     ) -> tuple[str, Future[ServiceAnswer]]:
@@ -223,12 +257,17 @@ class DocumentService:
             raise ValueError("invalid mode or question")
         if language not in ("en", "zh-Hant", "auto"):
             raise ValueError("invalid answer language")
+        language = resolve_answer_language(question, language)
         if type(rewrite_query) is not bool:
             raise ValueError("query rewrite option must be boolean")
-        if rewrite_query and (
-            mode != "ask" or self._staged_search is not None or self.config.method == "dense"
-        ):
-            raise ValueError("query rewriting requires resident BM25 or hybrid ask")
+        if rewrite_query and (mode != "ask" or self.config.method == "dense"):
+            raise ValueError("query rewriting requires BM25 or hybrid ask")
+        if self.config.reading_agent and rewrite_query:
+            raise ValueError(
+                "the reading Agent already uses planned query routes; disable rewrite_query"
+            )
+        if self.config.reading_agent and self.config.method != "hybrid":
+            raise ValueError("the reading Agent requires an existing hybrid index")
         question.encode("utf-8")
         if mode == "explain":
             if block_id is None:
@@ -318,42 +357,38 @@ class DocumentService:
     def _execute(self, job: _Job, queue_ms: float) -> ServiceAnswer:
         self._check_job(job)
         retrieval_stage_ms = 0.0
-        retriever = self.retriever
-        if job.mode == "ask" and self._staged_search is not None:
-            # Existing GPU guard rejects another compute PID. Stage query embedding
-            # before loading the LLM; report the real reload cost, never overlap them.
-            with self._lock:
-                old_model, self._model = self._model, None
-            if old_model is not None:
-                old_model.close()
-            started = time.perf_counter()
-            search = self._staged_search(job.question, self.config.top_k)
-            retrieval_stage_ms = (time.perf_counter() - started) * 1000
-            if (
-                search.document_id != self.config.document_id
-                or search.query != job.question
-                or search.method != self.config.method
-            ):
-                raise ValueError("staged retrieval scope/query changed")
-            retriever = FrozenSearchRetriever(search, top_k=self.config.top_k)
+        gpu_retrieval_trace = None
+        retriever = self._staged_search or self.retriever
         self._check_job(job)
         model, startup_ms = self._get_model(job)
+        job.model = model
+        set_deadline = getattr(model, "set_request_deadline", None)
+        if callable(set_deadline):
+            set_deadline(job.deadline)
         self._check_job(job)
         if job.rewrite_query:
-            from page_cite_rag.query import QueryRewriter
+            from page_cite_rag.query import QueryRewriteConfig, QueryRewriter
 
-            if self._docling_source:
+            rewriter = QueryRewriter(
+                model,
+                self.model_config,
+                QueryRewriteConfig.for_document_language(self._source_language),
+            )
+
+            if self._staged_search is not None:
+                from page_cite_rag.query_retrieval import RewritingRetriever
+
+                retriever = RewritingRetriever(None, rewriter, search_backend=self._staged_search)
+            elif self._docling_source:
                 from page_cite_rag.docling_retrieval import RewritingDoclingRetriever
 
-                retriever = RewritingDoclingRetriever(
-                    self.retriever, QueryRewriter(model, self.model_config)
-                )
+                retriever = RewritingDoclingRetriever(self.retriever, rewriter)
             else:
                 from page_cite_rag.query_retrieval import RewritingRetriever
 
-                retriever = RewritingRetriever(
-                    self._lexical, QueryRewriter(model, self.model_config), self._dense
-                )
+                retriever = RewritingRetriever(self._lexical, rewriter, self._dense)
+        if self.config.reading_agent and self.config.method != "hybrid":
+            raise ValueError("the reading Agent requires an existing hybrid index")
         workflow = document_workflow(
             self.store,
             self.config.document_id,
@@ -364,8 +399,47 @@ class DocumentService:
             neighbor_blocks=(self.config.neighbor_blocks if job.mode == "explain" else 0),
         )
         started = time.perf_counter()
+        reading_trace = None
         if job.mode == "ask":
-            result = ask_document(workflow, job.question, language=job.language)
+            if self.config.reading_agent:
+                from contextlib import nullcontext
+
+                from page_cite_rag.application import ask_with_agent
+
+                session = (
+                    self._staged_search.session()
+                    if self._staged_search is not None
+                    and self._staged_search.reranker_model_path is None
+                    else nullcontext()
+                )
+                with session:
+                    from page_cite_rag.application import prepare_agent_question
+
+                    workflow, planned_search, planned_blocks, planning_trace = (
+                        prepare_agent_question(
+                            workflow,
+                            job.question,
+                            language=job.language,
+                            source_language=self._source_language,
+                        )
+                    )
+                    reviewed = ask_with_agent(
+                        workflow,
+                        job.question,
+                        language=job.language,
+                        delegated=self.config.delegate_readers,
+                        initial_search=planned_search,
+                        initial_blocks=planned_blocks,
+                    )
+                reading_trace = {**reviewed.trace, "planning": planning_trace}
+                result = reviewed.result
+            else:
+                result = ask_document(workflow, job.question, language=job.language)
+            if self._staged_search is not None:
+                retrieval_stage_ms = (
+                    result.retrieval.elapsed_ms if result.retrieval is not None else 0.0
+                )
+                gpu_retrieval_trace = deepcopy(getattr(self._staged_search, "last_trace", None))
         else:
             result = explain_source(workflow, job.block_id, job.question, language=job.language)
         workflow_ms = (time.perf_counter() - started) * 1000
@@ -387,6 +461,8 @@ class DocumentService:
                 load_count=self.load_count,
                 model_pid=pid,
                 retrieval_mode="staged" if self._staged_search is not None else "resident",
+                gpu_retrieval_trace=gpu_retrieval_trace,
+                reading_trace=reading_trace,
             ),
         )
 
@@ -400,27 +476,39 @@ class DocumentService:
                 job = self._jobs.popleft()
                 self._active = job
             queue_ms = (time.monotonic() - job.created) * 1000
+            reply = None
+            error: BaseException | None = None
             try:
                 reply = self._execute(job, queue_ms)
                 if job.cancel_reason is not None:
                     raise self._cancel_exception(job)
-                job.future.set_result(reply)
             except BaseException as exc:
-                with self._lock:
-                    model, self._model = self._model, None
-                if model is not None:
-                    model.close()
-                if not job.future.done():
-                    job.future.set_exception(
-                        self._cancel_exception(job) if job.cancel_reason is not None else exc
-                    )
+                error = exc
             finally:
                 job.deadline_timer.cancel()
                 if job.deadline_timer is not threading.current_thread():
                     job.deadline_timer.join(timeout=5)
+                model = job.model
+                clear_deadline = getattr(model, "clear_request_deadline", None)
+                if callable(clear_deadline):
+                    clear_deadline()
+                if job.cancel_reason is not None and error is None:
+                    error = self._cancel_exception(job)
+                model_to_close = None
                 with self._lock:
+                    if error is not None:
+                        model_to_close, self._model = self._model, None
                     self._active = None
+                if model_to_close is not None:
+                    model_to_close.close()
                 self._schedule_idle()
+                if not job.future.done():
+                    if error is not None:
+                        job.future.set_exception(
+                            self._cancel_exception(job) if job.cancel_reason is not None else error
+                        )
+                    else:
+                        job.future.set_result(reply)
 
     def document(self) -> dict:
         metadata = self.store.get_document(self.config.document_id)

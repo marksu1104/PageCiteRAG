@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_right
-from typing import Literal, Protocol, Sequence
+from typing import Annotated, Literal, Protocol, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -18,6 +18,9 @@ from page_cite_rag.models import Block, ParsedUnit
 
 class CitationError(RuntimeError):
     """Safe, fail-closed error without source text or raw storage exceptions."""
+
+
+LimitationText = Annotated[str, Field(min_length=1, max_length=1000)]
 
 
 class CitationDraft(BaseModel):
@@ -59,7 +62,7 @@ class AnswerDraft(BaseModel):
 
     status: Literal["answered", "insufficient_evidence"]
     claims: tuple[ClaimDraft, ...] = Field(default=(), max_length=12)
-    limitations: tuple[str, ...] = Field(default=(), max_length=8)
+    limitations: tuple[LimitationText, ...] = Field(default=(), max_length=8)
 
     @field_validator("limitations")
     @classmethod

@@ -80,6 +80,23 @@ def test_text_uses_saved_item_not_search_representation_or_fake_single_page():
     assert source["span_alignment"] == "mismatch"
 
 
+def test_enumerated_marker_is_preserved_only_when_original_proves_it():
+    document = _document()
+    item = document["texts"][0]
+    item.update(label="list_item", enumerated=True, marker="124.", orig="124. " + item["text"])
+    legacy = read_native_item(document, "#/texts/0", page_count=2)
+    current = read_native_item(document, "#/texts/0", page_count=2, include_enumerated_marker=True)
+    assert legacy["saved_item_text"] == item["text"]
+    assert current["saved_item_text"] == item["orig"]
+    item["orig"] = "125. unrelated content"
+    assert (
+        read_native_item(document, "#/texts/0", page_count=2, include_enumerated_marker=True)[
+            "saved_item_text"
+        ]
+        == item["text"]
+    )
+
+
 def test_table_cells_and_caption_remain_separate_native_sources():
     document = _document()
     table = read_native_item(document, "#/tables/0", page_count=2)

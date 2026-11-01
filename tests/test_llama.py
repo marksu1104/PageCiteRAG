@@ -51,12 +51,13 @@ def make_client(
     recover_output_errors=False,
     sampling_profile="greedy",
     sampling_seed=42,
+    config_updates=None,
 ):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "fake-model").write_bytes(b"fake weights")
     (bundle / "manifest.json").write_text("{}")
-    monkeypatch.setattr(llama, "verify_bundle", lambda _: {"files": {"fake-model": "test"}})
+    monkeypatch.setattr(llama, "verify_bundle", lambda *_: {"files": {"fake-model": "test"}})
     calls = []
     lifecycle = {"starts": 0, "stops": 0, "returncode": None}
 
@@ -70,8 +71,17 @@ def make_client(
         if request.url.path == "/tokenize":
             return httpx.Response(200, json={"tokens": tokens if tokens is not None else [7] * 30})
         if request.url.path == "/v1/chat/completions/input_tokens":
-            return httpx.Response(200, json={"input_tokens": 128})
-        if request.url.path == "/completion":
+            return httpx.Response(
+                200,
+                json={
+                    "input_tokens": (len(tokens) if tokens is not None else 30)
+                    if (config_updates or {}).get("thinking")
+                    else 128
+                },
+            )
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": "<|im_start|>assistant\n<think>\n"})
+        if request.url.path in ("/completion", "/v1/chat/completions"):
             return (
                 result(request)
                 if callable(result)
@@ -100,7 +110,7 @@ def make_client(
 
     monkeypatch.setattr(llama.LlamaModelClient, "_start", start)
     monkeypatch.setattr(llama.LlamaModelClient, "_terminate_process", terminate)
-    config = llama.LlamaConfig(bundle_dir=bundle)
+    config = llama.LlamaConfig(bundle_dir=bundle, **(config_updates or {}))
     return (
         llama.LlamaModelClient(
             config,
@@ -138,6 +148,41 @@ def test_sequential_requests_reuse_owned_server_and_close_once(tmp_path, monkeyp
     assert "tools" not in payload
 
 
+@pytest.mark.parametrize("budget_policy", ["exact", "conservative"])
+def test_explicit_plain_text_uses_same_runtime_budget_and_usage(
+    tmp_path, monkeypatch, budget_policy
+):
+    text = "The result is 42% [S1]."
+    client, calls, lifecycle = make_client(
+        tmp_path, monkeypatch, result=completion() | {"content": text}, budget_policy=budget_policy
+    )
+    with client:
+        result = client.generate(MESSAGES, None)
+        assert result.value == result.raw_model_output == text
+        assert result.stats.prompt_eval_count == 30
+        assert result.stats.eval_count == 12
+        assert result.budget.output_reserved == 1024
+    request = next(payload for path, payload in calls if path == "/completion")
+    assert "json_schema" not in request
+    assert request["n_predict"] == 1024 and request["temperature"] == 0
+    plain_prompt = llama.render_prompt(MESSAGES, None)
+    assert "Return only JSON" not in plain_prompt
+    assert plain_prompt.endswith("<think>\n\n</think>\n\n")
+    assert lifecycle["starts"] == lifecycle["stops"] == 1
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_plain_text_does_not_bypass_output_or_context_limits(tmp_path, monkeypatch, truncated):
+    raw = completion() | {"content": "Partial text", "truncated": truncated}
+    if not truncated:
+        raw.update(stop_type="limit", tokens_predicted=1024)
+    client, calls, lifecycle = make_client(tmp_path, monkeypatch, result=raw)
+    with pytest.raises(ContextBudgetError if truncated else OutputValidationError):
+        client.generate(MESSAGES, None)
+    assert sum(path == "/completion" for path, _ in calls) == 1
+    assert lifecycle["stops"] == 1
+
+
 def test_qwen_general_sampling_is_explicit_and_server_confirmed(tmp_path, monkeypatch):
     expected = {
         "temperature": 0.7,
@@ -167,6 +212,53 @@ def test_qwen_general_sampling_is_explicit_and_server_confirmed(tmp_path, monkey
     assert {key: payload[key] for key in expected} == expected
 
 
+def test_longbench_sampling_profile_uses_official_temperature_and_is_confirmed(
+    tmp_path, monkeypatch
+):
+    expected = {"temperature": 0.1, "seed": 42, "repeat_penalty": 1.0}
+
+    def reply(request):
+        payload = json.loads(request.content)
+        settings = {"n_predict": 1024, **{key: payload[key] for key in expected}}
+        return httpx.Response(200, json={**completion(), "generation_settings": settings})
+
+    client, calls, _ = make_client(
+        tmp_path,
+        monkeypatch,
+        result=reply,
+        sampling_profile="longbench-official",
+    )
+    with client:
+        result = client.generate(MESSAGES, None)
+
+    payload = next(payload for path, payload in calls if path == "/completion")
+    assert {key: payload[key] for key in expected} == expected
+    assert result.value == '{"answer":"not significant"}'
+
+
+def test_longbench_sampling_profile_rejects_ignored_temperature(tmp_path, monkeypatch):
+    response = {
+        **completion(),
+        "generation_settings": {
+            "n_predict": 1024,
+            "temperature": 0.0,
+            "seed": 42,
+            "repeat_penalty": 1.0,
+        },
+    }
+    client, _, lifecycle = make_client(
+        tmp_path,
+        monkeypatch,
+        result=response,
+        sampling_profile="longbench-official",
+    )
+
+    with pytest.raises(ModelError, match="server did not confirm sampling setting"):
+        client.generate(MESSAGES, None)
+
+    assert lifecycle["stops"] == 1
+
+
 def test_qwen_general_rejects_silently_ignored_setting(tmp_path, monkeypatch):
     response = {**completion(), "generation_settings": {"n_predict": 1024}}
     client, _, lifecycle = make_client(
@@ -178,6 +270,191 @@ def test_qwen_general_rejects_silently_ignored_setting(tmp_path, monkeypatch):
     with pytest.raises(ModelError, match="server did not confirm sampling setting"):
         client.generate(MESSAGES, Output)
     assert lifecycle["stops"] == 1
+
+
+def thinking_completion(*, limit=False, final='{"answer":"not significant"}'):
+    raw = "Evidence reasoning.\n</think>\n\n" + final
+    native = completion() | {
+        "content": raw,
+        "tokens_predicted": 6144 if limit else 52,
+        "stop_type": "limit" if limit else "eos",
+        "generation_settings": {
+            "n_predict": 6144,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repeat_penalty": 1.0,
+            "seed": 42,
+            "reasoning_format": "deepseek",
+            "reasoning_in_content": False,
+            "generation_prompt": "<|im_start|>assistant\n<think>\n",
+            "grammar": 'root ::= "reasoning followed by final JSON"',
+        },
+    }
+    return {
+        "model": "page-cite-rag-qwen35",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "length" if limit else "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": final,
+                    "reasoning_content": "Evidence reasoning.",
+                },
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 30,
+            "completion_tokens": native["tokens_predicted"],
+            "total_tokens": 30 + native["tokens_predicted"],
+        },
+        "__verbose": native,
+    }
+
+
+def thinking_client(tmp_path, monkeypatch, **kwargs):
+    return make_client(
+        tmp_path,
+        monkeypatch,
+        budget_policy="exact",
+        sampling_profile="qwen-general",
+        config_updates={"thinking": True, "reasoning_budget_tokens": 4096, "num_predict": 6144},
+        **kwargs,
+    )
+
+
+def test_thinking_uses_native_parser_and_accounts_for_all_generated_tokens(tmp_path, monkeypatch):
+    response = thinking_completion()
+    client, calls, lifecycle = thinking_client(tmp_path, monkeypatch, result=response)
+    with client:
+        result = client.generate(MESSAGES, Output)
+        assert result.value.answer == "not significant"
+        assert result.raw_model_output == response["choices"][0]["message"]["content"]
+        assert result.stats.eval_count == 52  # Includes reasoning, not only final JSON.
+        assert result.budget.output_reserved == 6144
+        assert client.completion_trace() == response
+        trace = client.completion_trace()
+        trace["usage"]["completion_tokens"] = -1
+        assert client.completion_trace()["usage"]["completion_tokens"] == 52
+        assert client.identity["thinking"] is True
+    request = next(payload for path, payload in calls if path == "/v1/chat/completions")
+    assert request["chat_template_kwargs"] == {"enable_thinking": True}
+    assert request["reasoning_format"] == "deepseek"
+    assert request["reasoning_budget_tokens"] == 4096 and request["max_tokens"] == 6144
+    assert request["response_format"]["json_schema"]["schema"] == Output.model_json_schema()
+    assert "json_schema" not in request and "grammar" not in request and "prompt" not in request
+    assert all(path != "/completion" for path, _ in calls)
+    assert lifecycle["starts"] == lifecycle["stops"] == 1
+
+
+def test_thinking_length_failure_preserves_full_raw_reasoning_and_cost(tmp_path, monkeypatch):
+    response = thinking_completion(limit=True, final="")
+    response["choices"][0]["message"]["content"] = None
+    client, calls, lifecycle = thinking_client(
+        tmp_path, monkeypatch, result=response, recover_output_errors=True
+    )
+    with client:
+        with pytest.raises(OutputValidationError) as caught:
+            client.generate(MESSAGES, Output)
+        assert caught.value.reason == "output_limit"
+        assert caught.value.accounting.eval_count == 6144
+        assert caught.value.raw_model_output == response["__verbose"]["content"]
+        assert client.completion_trace() == response
+        assert lifecycle["stops"] == 0
+    assert sum(path == "/v1/chat/completions" for path, _ in calls) == 1
+
+
+@pytest.mark.parametrize(
+    "kind", ["usage", "reasoning", "empty_reasoning", "limit", "final", "grammar"]
+)
+def test_thinking_rejects_inconsistent_runtime_metadata(tmp_path, monkeypatch, kind):
+    response = thinking_completion()
+    if kind == "usage":
+        response["usage"]["completion_tokens"] = 12
+    elif kind == "reasoning":
+        response["__verbose"]["generation_settings"]["reasoning_in_content"] = True
+    elif kind == "empty_reasoning":
+        response["choices"][0]["message"]["reasoning_content"] = ""
+    elif kind == "limit":
+        response["choices"][0]["finish_reason"] = "length"
+    elif kind == "grammar":
+        response["__verbose"]["generation_settings"]["grammar"] = ""
+    else:
+        response["choices"][0]["message"]["content"] = None
+    client, _, lifecycle = thinking_client(tmp_path, monkeypatch, result=response)
+    with pytest.raises(StructuredOutputError):
+        client.generate(MESSAGES, Output)
+    assert client.completion_trace() == response
+    assert lifecycle["stops"] == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"num_predict": 6144},
+        {"reasoning_budget_tokens": 100},
+        {"thinking": True},
+        {"thinking": True, "reasoning_budget_tokens": 1024},
+    ],
+)
+def test_extended_output_requires_explicit_bounded_thinking(kwargs):
+    with pytest.raises(ValidationError):
+        llama.LlamaConfig(**kwargs)
+
+
+def test_nonthinking_allows_planned_3072_output_budget():
+    config = llama.LlamaConfig(num_predict=3072)
+    assert config.thinking is False
+    assert config.num_predict == 3072
+
+
+def test_thinking_budget_rejects_chat_tokenizer_disagreement_before_generation(
+    tmp_path, monkeypatch
+):
+    client, calls, lifecycle = thinking_client(tmp_path, monkeypatch)
+    monkeypatch.setattr(client, "count_chat_input_tokens", lambda _: 31)
+    with pytest.raises(ContextBudgetError, match="counts disagree"):
+        client.generate(MESSAGES, Output)
+    assert not any(path == "/v1/chat/completions" for path, _ in calls)
+    assert lifecycle["stops"] == 1
+
+
+def test_thinking_schema_failure_keeps_native_reasoning_and_never_repairs(tmp_path, monkeypatch):
+    response = thinking_completion(final='{"answer":123}')
+    client, calls, lifecycle = thinking_client(
+        tmp_path, monkeypatch, result=response, recover_output_errors=True
+    )
+    with client:
+        with pytest.raises(OutputValidationError) as caught:
+            client.generate(MESSAGES, Output)
+        assert caught.value.reason == "schema_invalid"
+        assert caught.value.raw_model_output == response["__verbose"]["content"]
+        assert caught.value.accounting.eval_count == 52
+        assert lifecycle["stops"] == 0
+    assert sum(path == "/v1/chat/completions" for path, _ in calls) == 1
+
+
+def test_model_size_selects_an_explicit_identity_not_manifest_claims():
+    assert llama.model_spec()["sha256"] == llama.MODEL_SHA256
+    small = llama.model_spec("4b")
+    assert small["file"] == "Qwen3.5-4B-Q4_K_M.gguf" and small["bytes"] == 2740937888
+    assert small["sha256"] != llama.model_spec()["sha256"]
+    reference = llama.model_spec("27b")
+    assert reference == {
+        "repo": "unsloth/Qwen3.5-27B-GGUF",
+        "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a",
+        "file": "Qwen3.5-27B-Q4_K_M.gguf",
+        "bytes": 16740812704,
+        "sha256": "84b5f7f112156d63836a01a69dc3f11a6ba63b10a23b8ca7a7efaf52d5a2d806",
+        "layers": 64,
+    }
+    assert llama.LlamaConfig().model_size == "9b"
+    assert llama.LlamaConfig(model_size="27b").model_size == "27b"
+    with pytest.raises(ValueError, match="unsupported"):
+        llama.model_spec("other")
 
 
 @pytest.mark.parametrize("text", ["中" * 6000, "padding " * 10000], ids=["chinese", "english"])
@@ -383,6 +660,17 @@ def test_http_failure_has_safe_message_stops_owned_process_and_no_retry(
     assert sum(path == "/completion" for path, _ in calls) == 1
 
 
+def test_expired_total_request_deadline_blocks_tokenization_and_completion(tmp_path, monkeypatch):
+    import time
+
+    client, calls, _ = make_client(tmp_path, monkeypatch)
+    client.set_request_deadline(time.monotonic() - 0.01)
+    with pytest.raises(ModelTimeoutError, match="total time budget"):
+        client.generate(MESSAGES, Output)
+    assert not any(path in {"/tokenize", "/completion"} for path, _ in calls)
+    client.close()
+
+
 def test_bundle_changes_stop_before_content_request(tmp_path, monkeypatch):
     client, calls, lifecycle = make_client(tmp_path, monkeypatch)
     (client.config.bundle_dir / "fake-model").write_bytes(b"changed")
@@ -411,10 +699,33 @@ def test_gpu_requires_explicit_single_uuid_and_valid_limits():
 
 
 @pytest.mark.parametrize(
+    "model_size,log,accepted",
+    [
+        ("4b", "load_tensors: offloaded 33/33 layers to GPU", True),
+        ("9b", "load_tensors: offloaded 33/33 layers to GPU", True),
+        ("27b", "load_tensors: offloaded 65/65 layers to GPU", True),
+        ("27b", "load_tensors: offloaded 33/33 layers to GPU", False),
+        ("27b", "load_tensors: offloaded 64/65 layers to GPU", False),
+        ("9b", "load_tensors: offloaded 65/65 layers to GPU", False),
+    ],
+)
+def test_gpu_offload_requires_all_layers_of_the_selected_model(
+    tmp_path, monkeypatch, model_size, log, accepted
+):
+    client, _, _ = make_client(tmp_path, monkeypatch, config_updates={"model_size": model_size})
+    with client:
+        if accepted:
+            client._verify_gpu_offload(log)
+        else:
+            with pytest.raises(ModelError, match="full GPU offload"):
+                client._verify_gpu_offload(log)
+
+
+@pytest.mark.parametrize(
     "sample",
     [
         {"memory_mib": 77, "temperature_c": 40, "pids": [888]},
-        {"memory_mib": 12001, "temperature_c": 40, "pids": []},
+        {"memory_mib": 24001, "temperature_c": 40, "pids": []},
         {"memory_mib": 77, "temperature_c": 81, "pids": []},
     ],
 )
@@ -431,6 +742,36 @@ def test_reserved_template_tokens_not_silently_rewritten():
     prompt = llama.render_prompt(MESSAGES, Output.model_json_schema())
     assert prompt.endswith("<think>\n\n</think>\n\n")
     assert "A synthetic question." in prompt
+
+
+def test_schema_can_remain_native_grammar_without_prompt_injection():
+    schema = Output.model_json_schema()
+    message = ChatMessage(role="system", content="Answer the question concisely.")
+    messages = (message, *MESSAGES)
+    prompt = llama.render_prompt(messages, schema, include_schema_in_prompt=False)
+    assert "Return only JSON matching this schema" not in prompt
+    assert json.dumps(schema, ensure_ascii=False) not in prompt
+    assert message.content in prompt
+
+    client = object.__new__(llama.LlamaModelClient)
+    client.config = llama.LlamaConfig()
+    payload = client._chat_payload(messages, schema, include_schema_in_prompt=False)
+    assert payload["messages"] == [item.model_dump() for item in messages]
+    assert payload["response_format"]["json_schema"]["schema"] == schema
+
+
+def test_schema_prompt_budget_flag_is_explicit_and_validated(tmp_path, monkeypatch):
+    client, _, lifecycle = make_client(tmp_path, monkeypatch, budget_policy="exact")
+    client._tokenized_prompt = lambda prompt: list(prompt.encode("utf-8"))
+    with client:
+        schema = Output.model_json_schema()
+        messages = [ChatMessage(role="system", content="Concise answer."), *MESSAGES]
+        with_schema = client.prepare_budget(messages, schema)
+        without_schema = client.prepare_budget(messages, schema, include_schema_in_prompt=False)
+        assert without_schema.exact_input_tokens < with_schema.exact_input_tokens
+        with pytest.raises(ValueError, match="boolean"):
+            client.prepare_budget(messages, schema, include_schema_in_prompt=1)
+    assert lifecycle["starts"] == lifecycle["stops"] == 1
 
 
 def test_missing_or_corrupt_bundle_does_not_download(tmp_path):
@@ -488,6 +829,8 @@ def test_verified_bundle_file_set_hashes_and_symlinks(tmp_path, monkeypatch):
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
     assert llama.verify_bundle(tmp_path) == manifest
+    with pytest.raises(ModelError):
+        llama.verify_bundle(tmp_path, "27b")
     binary.write_bytes(b"tampered")
     with pytest.raises(ModelError):
         llama.verify_bundle(tmp_path)

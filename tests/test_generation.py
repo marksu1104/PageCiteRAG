@@ -100,7 +100,7 @@ def test_structured_generation_pins_controls_and_reuses_client(monkeypatch):
     assert payload["think"] is False and payload["truncate"] is False
     assert payload["stream"] is False and payload["keep_alive"] == "30m"
     assert payload["options"]["num_ctx"] == 16384
-    assert payload["options"]["num_predict"] == 2048
+    assert payload["options"]["num_predict"] == 3072
     assert payload["options"]["num_gpu"] == 0
     assert payload["format"] == Output.model_json_schema()
     assert "tools" not in payload
@@ -224,7 +224,7 @@ def test_invalid_incomplete_or_unexpected_output_is_not_repaired(change):
     [
         {"prompt_eval_count": 0},
         {"prompt_eval_count": 10000},
-        {"eval_count": 2049},
+        {"eval_count": 3073},
     ],
 )
 def test_invalid_runtime_token_counts(change):
@@ -257,3 +257,14 @@ def test_transport_failures_have_safe_errors_and_no_retry(kind):
             client.generate(MESSAGES, Output)
         assert secret not in str(error.value)
     assert sum(path == "/api/chat" for path, _ in calls) == 1
+
+
+def test_expired_total_request_deadline_blocks_the_next_model_dispatch():
+    import time
+
+    transport, calls = backend()
+    with OllamaModelClient(GenerationConfig(), transport=transport) as client:
+        client.set_request_deadline(time.monotonic() - 0.01)
+        with pytest.raises(ModelTimeoutError, match="total deadline"):
+            client.generate(MESSAGES, Output)
+    assert not any(path == "/api/chat" for path, _ in calls)

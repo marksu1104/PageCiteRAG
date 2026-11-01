@@ -48,6 +48,8 @@ class StagedGpuSearch:
         *,
         tokenizer_directory: Path = DEFAULT_MODEL_DIR,
         gpu_temperature_limit_c: int = 80,
+        reranker_model_path: Path | None = None,
+        candidates: int | None = None,
     ) -> None:
         if method not in ("dense", "hybrid"):
             raise ValueError("GPU staged search requires dense or hybrid retrieval")
@@ -55,17 +57,25 @@ class StagedGpuSearch:
         self._slot = _TransportSlot()
         self.encoder = NativeEmbeddingEncoder(self._slot, tokenizer_directory)
         self.retriever = document_retriever(
-            store, document_id, method, encoder=self.encoder, versioned_dense=True
+            store,
+            document_id,
+            method,
+            encoder=self.encoder,
+            versioned_dense=True,
+            candidates=candidates,
         )
         self.document_id = document_id
         self.method = method
         self.model_path = model_path
         self.gpu_uuid = gpu_uuid
         self.gpu_temperature_limit_c = gpu_temperature_limit_c
+        self.reranker_model_path = reranker_model_path
+        self._store = store
         self.last_trace: dict | None = None
         self._cancel_lock = threading.Lock()
         self._query_lock = threading.Lock()
         self._current_cancel: threading.Event | None = None
+        self._rerank_cancel: threading.Event | None = None
         self._session_context: ContextVar[object | None] = ContextVar(
             f"page_cite_rag_gpu_search_session_{id(self)}", default=None
         )
@@ -81,9 +91,51 @@ class StagedGpuSearch:
         with self._cancel_lock:
             if self._current_cancel is not None:
                 self._current_cancel.set()
+            if self._rerank_cancel is not None:
+                self._rerank_cancel.set()
 
     def __call__(self, question: str, top_k: int) -> SearchResult:
-        return self._query(question, top_k)
+        return self._run_search(question, top_k)
+
+    def search_with_lexical_query(
+        self, question: str, lexical_query: str, *, top_k: int
+    ) -> SearchResult:
+        """Use one expanded BM25 query while dense retrieval keeps the original."""
+        if not isinstance(lexical_query, str) or not lexical_query.strip():
+            raise ValueError("lexical query must be nonempty")
+        return self._run_search(question, top_k, lexical_query=lexical_query)
+
+    def _run_search(
+        self, question: str, top_k: int, *, lexical_query: str | None = None
+    ) -> SearchResult:
+        if self.reranker_model_path is None:
+            return self._query(question, top_k, lexical_query=lexical_query)
+        if self._session_token is not None:
+            raise ValueError("reranking requires a completed embedding session")
+        from page_cite_rag.hybrid import rerank_search_result
+        from page_cite_rag.reranker_server import NativeRerankerServer
+
+        with self._cancel_lock:
+            if self._rerank_cancel is not None:
+                raise RuntimeError("reranked search belongs to another request")
+            cancel = self._rerank_cancel = threading.Event()
+        try:
+            # Exit embedding before starting reranking; cancellation covers both stages.
+            result = self._query(question, max(top_k, 40), lexical_query=lexical_query)
+            if cancel.is_set():
+                raise RuntimeError("reranked search was cancelled")
+            with NativeRerankerServer(
+                self.reranker_model_path,
+                self.gpu_uuid,
+                max_gpu_temperature_c=self.gpu_temperature_limit_c,
+                cancel_event=cancel,
+            ) as ranker:
+                ranked = rerank_search_result(result, ranker, top_k=top_k, store=self._store)
+                self.last_trace = {**(self.last_trace or {}), "reranker": ranker.diagnostics()}
+            return ranked
+        finally:
+            with self._cancel_lock:
+                self._rerank_cancel = None
 
     def search_scoped(
         self,
@@ -103,18 +155,53 @@ class StagedGpuSearch:
             or top_k < 1
         ):
             raise ValueError("invalid scoped GPU retrieval request")
-        return self._query(
-            query,
-            top_k,
-            allowed_block_ids=allowed_block_ids,
-            candidate_k=candidate_k,
-        )
+        if self.reranker_model_path is None:
+            return self._query(
+                query,
+                top_k,
+                allowed_block_ids=allowed_block_ids,
+                candidate_k=candidate_k,
+            )
+        if self._session_token is not None:
+            raise ValueError("scoped reranking requires sequential owned model sessions")
+        from page_cite_rag.hybrid import rerank_search_result
+        from page_cite_rag.reranker_server import NativeRerankerServer
+
+        with self._cancel_lock:
+            if self._rerank_cancel is not None:
+                raise RuntimeError("reranked search belongs to another request")
+            cancel = self._rerank_cancel = threading.Event()
+        try:
+            candidate = self._query(
+                query,
+                candidate_k,
+                allowed_block_ids=allowed_block_ids,
+                candidate_k=candidate_k,
+            )
+            if cancel.is_set():
+                raise RuntimeError("reranked search was cancelled")
+            with NativeRerankerServer(
+                self.reranker_model_path,
+                self.gpu_uuid,
+                max_gpu_temperature_c=self.gpu_temperature_limit_c,
+                cancel_event=cancel,
+            ) as ranker:
+                ranked = rerank_search_result(candidate, ranker, top_k=top_k, store=self._store)
+                self.last_trace = {
+                    **(self.last_trace or {}),
+                    "reranker": ranker.diagnostics(),
+                }
+            return ranked
+        finally:
+            with self._cancel_lock:
+                self._rerank_cancel = None
 
     def _query(
         self,
         query: str,
         top_k: int,
         *,
+        lexical_query: str | None = None,
         allowed_block_ids: set[str] | None = None,
         candidate_k: int | None = None,
     ) -> SearchResult:
@@ -131,6 +218,7 @@ class StagedGpuSearch:
                 return self._search_active(
                     query,
                     top_k,
+                    lexical_query=lexical_query,
                     allowed_block_ids=allowed_block_ids,
                     candidate_k=candidate_k,
                 )
@@ -138,6 +226,7 @@ class StagedGpuSearch:
             return self._query(
                 query,
                 top_k,
+                lexical_query=lexical_query,
                 allowed_block_ids=allowed_block_ids,
                 candidate_k=candidate_k,
             )
@@ -147,6 +236,7 @@ class StagedGpuSearch:
         query: str,
         top_k: int,
         *,
+        lexical_query: str | None = None,
         allowed_block_ids: set[str] | None = None,
         candidate_k: int | None = None,
     ) -> SearchResult:
@@ -156,7 +246,25 @@ class StagedGpuSearch:
         started = time.perf_counter()
         try:
             if allowed_block_ids is None:
-                result = self.retriever.search(query, top_k=top_k)
+                if lexical_query is None:
+                    result = self.retriever.search(query, top_k=top_k)
+                else:
+                    search_with_lexical_query = getattr(
+                        self.retriever, "search_with_lexical_query", None
+                    )
+                    if callable(search_with_lexical_query):
+                        result = search_with_lexical_query(query, lexical_query, top_k=top_k)
+                    else:
+                        overrides = getattr(self.retriever, "lexical_overrides", None)
+                        if not isinstance(overrides, dict):
+                            raise ValueError(
+                                "bound hybrid retriever cannot apply a lexical query override"
+                            )
+                        overrides[query] = lexical_query
+                        try:
+                            result = self.retriever.search(query, top_k=top_k)
+                        finally:
+                            overrides.pop(query, None)
             else:
                 if candidate_k is None:
                     raise RuntimeError("scoped GPU retrieval is missing its candidate budget")

@@ -88,25 +88,29 @@ def _store():
     )
 
 
-def test_virtual_units_are_exact_native_items_or_cells_not_pdf_offsets():
+def test_virtual_units_are_native_items_or_structured_tables_not_pdf_offsets():
     store = _store()
     blocks = store.get_blocks(store.document_id)
-    assert [block.text for block in blocks] == ["Only when the condition holds.", "Metric", "42"]
-    assert all(block.page_number is None for block in blocks)
+    assert len(blocks) == 2
+    assert blocks[0].text == "Only when the condition holds."
+    assert "Metric" in blocks[1].text and "42" in blocks[1].text
+    assert "columns 1–2" in blocks[1].text
+    assert blocks[0].page_number is None
+    assert blocks[1].page_number == 2
     assert store.chunk_block_ids == [tuple(block.block_id for block in blocks)]
     assert read_verified_source(store, store.document_id, blocks[0].block_id) == blocks[0]
     assert store.location_for(store.document_id, blocks[0].block_id)["pages"] == [1, 2]
-    cell = store.location_for(store.document_id, blocks[2].block_id)
-    assert cell["native_ref"] == "#/tables/0"
-    assert cell["cell"]["column_start"] == 1
-    assert cell["cell"]["cell_page_mapping"] == "unverified"
-    assert cell["pdf_character_offsets"] == "unavailable"
+    table = store.location_for(store.document_id, blocks[1].block_id)
+    assert table["native_ref"] == "#/tables/0"
+    assert table["kind"] == "table"
+    assert table["table"]["cell_page_mapping"] == "unverified"
+    assert table["pdf_character_offsets"] == "unavailable"
 
 
-def test_existing_span_validator_accepts_exact_cell_but_no_fabricated_page():
+def test_existing_span_validator_accepts_table_cell_text_without_fabricated_page():
     store = _store()
-    block = store.get_blocks(store.document_id)[2]
-    span = source_spans((block,))[0]
+    block = store.get_blocks(store.document_id)[1]
+    span = next(span for span in source_spans((block,)) if "42" in span.text)
     draft = SpanAnswerDraft(
         status="answered",
         claims=(
@@ -116,9 +120,9 @@ def test_existing_span_validator_accepts_exact_cell_but_no_fabricated_page():
         ),
     )
     citation = validate_span_claims(store, store.document_id, draft, (block,))[0].citations[0]
-    assert citation.quote == "42"
-    assert citation.page_number is None
-    assert citation.char_start == 0 and citation.char_end == 2
+    assert "42" in citation.quote
+    assert citation.page_number == 2
+    assert citation.char_end <= len(block.text)
 
 
 def test_unreadable_only_chunk_and_scope_violation_fail_closed():
@@ -155,7 +159,7 @@ def test_chunk_retrieval_returns_native_blocks_not_search_representation():
     result = retriever.search("condition", top_k=3)
     assert result.method == "hybrid"
     assert result.document_id == store.document_id
-    assert len(result.hits) == 3
+    assert len(result.hits) == 2
     assert result.hits[0].block.text == "Only when the condition holds."
     assert all("Metadata heading" not in hit.block.text for hit in result.hits)
     assert retriever.last_query_plan["lexical_query"] == "condition"
@@ -176,7 +180,7 @@ def test_chunk_retrieval_can_restrict_candidate_chunks_before_ranking():
         retriever.search("condition", top_k=1, allowed_chunk_indices=(1,))
 
 
-def test_table_hit_keeps_all_native_cells_available_with_query_relevance_order():
+def test_table_hit_uses_table_scope_when_chunker_does_not_expose_row_ids():
     document, chunks = _source()
     document["tables"][0]["data"]["num_cols"] = 12
     document["tables"][0]["data"]["table_cells"] = [
@@ -195,24 +199,20 @@ def test_table_hit_keeps_all_native_cells_available_with_query_relevance_order()
     store = DoclingSourceStore(
         document, chunks, source_sha256="a" * 64, source_name="sample.pdf", page_count=2
     )
-    assert len(store.get_blocks(store.document_id)) == 13
+    assert len(store.get_blocks(store.document_id)) == 2
     retriever = DoclingChunkRetriever(store, chunks, _FakeEncoder())
     result = retriever.search("condition", top_k=1)
     assert len(result.context_groups) == 1
-    assert len(result.hits) == 13
+    assert len(result.hits) == 2
     assert result.hits[0].block.text == "Only when the condition holds."
-    assert (
-        sum(
-            store.location_for(store.document_id, hit.block.block_id)["kind"] == "table_cell"
-            for hit in result.hits
-        )
-        == 12
-    )
+    table_hit = next(hit for hit in result.hits if "Table (1 rows, 12 columns)" in hit.block.text)
+    assert all(f"value-{index}" in table_hit.block.text for index in range(12))
+    assert store.location_for(store.document_id, table_hit.block.block_id)["table"]["columns"] == 12
     assert result.context_groups[0].text == chunks[0]["search_text"]
     assert result.context_groups[0].source_refs == ("#/texts/0", "#/texts/1", "#/tables/0")
     assert set(result.context_groups[0].source_block_ids) == {
         hit.block.block_id for hit in result.hits
     }
     assert retriever.last_query_plan["selected_context_chunk_count"] == 1
-    assert retriever.last_query_plan["selected_source_block_count"] == 13
+    assert retriever.last_query_plan["selected_source_block_count"] == 2
     assert "context_groups" not in result.model_dump()

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
 from typing import Iterator, Literal
 
 from page_cite_rag.models import DocumentMetadata, ParsedUnit
+from page_cite_rag.text import TokenBlockFactory, iter_blocks
+
+DEFAULT_PDF_X_TOLERANCE_RATIO = 0.15
 
 
 class DocumentIngestError(Exception):
@@ -20,11 +24,20 @@ class PreparedSource:
     document: DocumentMetadata
     path: Path
     pdf_reading_order: Literal["geometric", "text-flow"] = "geometric"
+    pdf_x_tolerance_ratio: float | None = DEFAULT_PDF_X_TOLERANCE_RATIO
+    chunker: TokenBlockFactory | None = None
+
+    @property
+    def block_factory(self):
+        return self.chunker or iter_blocks
 
     def iter_units(self) -> Iterator[ParsedUnit]:
         if self.document.parser_name == "pdfplumber":
             yield from _iter_pdf_units(
-                self.path, self.document, text_flow=self.pdf_reading_order == "text-flow"
+                self.path,
+                self.document,
+                text_flow=self.pdf_reading_order == "text-flow",
+                x_tolerance_ratio=(self.pdf_x_tolerance_ratio or DEFAULT_PDF_X_TOLERANCE_RATIO),
             )
         else:
             yield from _iter_text_units(self.path, self.document)
@@ -52,6 +65,8 @@ def prepare_source(
     language: str | None = None,
     usage_scope: str = "not-recorded",
     pdf_reading_order: Literal["geometric", "text-flow"] = "geometric",
+    pdf_x_tolerance_ratio: float | None = None,
+    chunker: TokenBlockFactory | None = None,
 ) -> PreparedSource:
     """Validate an input and capture stable identity before opening the database."""
     path = Path(source_path).expanduser()
@@ -63,7 +78,21 @@ def prepare_source(
         raise DocumentIngestError("unsupported PDF reading order")
     if pdf_reading_order != "geometric" and suffix != ".pdf":
         raise DocumentIngestError("PDF reading order applies only to PDF inputs")
+    if pdf_x_tolerance_ratio is not None and (
+        suffix != ".pdf"
+        or type(pdf_x_tolerance_ratio) not in (int, float)
+        or not math.isfinite(pdf_x_tolerance_ratio)
+        or not 0 < pdf_x_tolerance_ratio <= 1
+    ):
+        raise DocumentIngestError("PDF x-tolerance ratio must be finite and between 0 and 1")
     page_count: int | None = None
+    effective_ratio = (
+        pdf_x_tolerance_ratio
+        if pdf_x_tolerance_ratio is not None
+        else DEFAULT_PDF_X_TOLERANCE_RATIO
+        if suffix == ".pdf"
+        else None
+    )
     source_sha256 = _sha256_file(path)
     if suffix == ".txt":
         media_type = "text/plain"
@@ -80,14 +109,10 @@ def prepare_source(
             import pdfplumber
 
             parser_version = (
-                f"pdfplumber-{version('pdfplumber')};extract-v1;"
-                "x-tolerance-3;y-tolerance-3;layout-false"
+                f"pdfplumber-{version('pdfplumber')};extract-v2;"
+                f"use-text-flow-{str(pdf_reading_order == 'text-flow').lower()};"
+                f"x-tolerance-ratio-{effective_ratio:g};y-tolerance-3;layout-false"
             )
-            if pdf_reading_order == "text-flow":
-                parser_version = (
-                    f"pdfplumber-{version('pdfplumber')};extract-v2;"
-                    "use-text-flow-true;x-tolerance-ratio-0.15;y-tolerance-3;layout-false"
-                )
             with pdfplumber.open(path) as pdf:
                 page_count = len(pdf.pages)
             if _sha256_file(path) != source_sha256:
@@ -115,7 +140,15 @@ def prepare_source(
         usage_scope=usage_scope,
         page_count=page_count,
     )
-    return PreparedSource(document=document, path=path, pdf_reading_order=pdf_reading_order)
+    if chunker is not None:
+        document = chunker.bind_document(document)
+    return PreparedSource(
+        document=document,
+        path=path,
+        pdf_reading_order=pdf_reading_order,
+        pdf_x_tolerance_ratio=effective_ratio,
+        chunker=chunker,
+    )
 
 
 def _iter_text_units(path: Path, document: DocumentMetadata) -> Iterator[ParsedUnit]:
@@ -137,7 +170,11 @@ def _iter_text_units(path: Path, document: DocumentMetadata) -> Iterator[ParsedU
 
 
 def _iter_pdf_units(
-    path: Path, document: DocumentMetadata, *, text_flow: bool = False
+    path: Path,
+    document: DocumentMetadata,
+    *,
+    text_flow: bool = False,
+    x_tolerance_ratio: float | None = None,
 ) -> Iterator[ParsedUnit]:
     import pdfplumber
 
@@ -149,7 +186,9 @@ def _iter_pdf_units(
                     # Keep parser output authoritative; never repair it with a model.
                     options = {"x_tolerance": 3, "y_tolerance": 3, "layout": False}
                     if text_flow:
-                        options.update(use_text_flow=True, x_tolerance_ratio=0.15)
+                        options["use_text_flow"] = True
+                    if x_tolerance_ratio is not None:
+                        options["x_tolerance_ratio"] = x_tolerance_ratio
                     text = page.extract_text(**options) or ""
                 except MemoryError:
                     raise

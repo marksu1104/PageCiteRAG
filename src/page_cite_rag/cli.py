@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import sqlite3
 import sys
+import threading
 import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -15,8 +17,13 @@ from typing import Sequence
 
 from pydantic import ValidationError
 
-from page_cite_rag.ingest import DocumentIngestError, prepare_source
+from page_cite_rag.ingest import (
+    DocumentIngestError,
+    prepare_source,
+)
+from page_cite_rag.retrieval_profile import FORMAL_RETRIEVAL
 from page_cite_rag.store import SQLiteDocumentStore, StoreError
+from page_cite_rag.text import TokenBlockFactory
 
 _DISTRIBUTION_NAME = "page-cite-rag"
 _DEFAULT_DATABASE = Path("data/page-cite-rag.sqlite3")
@@ -76,9 +83,14 @@ def _run_ingest(args: argparse.Namespace) -> int:
             from page_cite_rag.docling_document import convert_pdf
             from page_cite_rag.embedding import DEFAULT_MODEL_DIR
 
-            if args.pdf_reading_order != "geometric" or args.docling_artifacts is None:
+            if (
+                args.pdf_reading_order != "geometric"
+                or args.pdf_x_tolerance_ratio is not None
+                or args.docling_artifacts is None
+            ):
                 raise DocumentIngestError(
-                    "Docling requires --docling-artifacts and does not use --pdf-reading-order"
+                    "Docling requires --docling-artifacts and does not use pdfplumber "
+                    "spacing/order options"
                 )
             bundle = convert_pdf(
                 args.source,
@@ -101,11 +113,18 @@ def _run_ingest(args: argparse.Namespace) -> int:
             language=args.language,
             usage_scope=args.usage_scope,
             pdf_reading_order=args.pdf_reading_order,
+            pdf_x_tolerance_ratio=args.pdf_x_tolerance_ratio,
+            chunker=(
+                TokenBlockFactory(args.tokenizer_dir) if args.tokenizer_dir is not None else None
+            ),
         )
         store = SQLiteDocumentStore(args.db)
-        result = store.ingest(prepared.document, prepared.iter_units())
+        result = store.ingest(
+            prepared.document, prepared.iter_units(), block_factory=prepared.block_factory
+        )
     except (
         DocumentIngestError,
+        ImportError,
         StoreError,
         OSError,
         sqlite3.Error,
@@ -237,6 +256,19 @@ def _positive_integer(value: str) -> int:
     return parsed
 
 
+def _gpu_temperature_limit(args: argparse.Namespace) -> int:
+    explicit = getattr(args, "gpu_temperature_limit", None)
+    if explicit is not None:
+        return explicit
+    if (
+        getattr(args, "native_gpu", False)
+        or getattr(args, "device", None) == "cuda"
+        or getattr(args, "embedding_backend", None) == "native-gpu"
+    ):
+        return 88
+    return 80
+
+
 def _run_retrieval(args: argparse.Namespace) -> int:
     # Keep lexical libraries out of imports, --help and doctor startup.
     from page_cite_rag.generation import ModelError
@@ -277,7 +309,7 @@ def _run_retrieval(args: argparse.Namespace) -> int:
                 with NativeEmbeddingServer(
                     args.embedding_gguf or DEFAULT_GGUF_PATH,
                     args.gpu_uuid,
-                    max_gpu_temperature_c=args.gpu_temperature_limit or 80,
+                    max_gpu_temperature_c=_gpu_temperature_limit(args),
                 ) as server:
                     encoder = NativeEmbeddingEncoder(server, args.model_dir or DEFAULT_MODEL_DIR)
                     result = (
@@ -322,7 +354,7 @@ def _run_retrieval(args: argparse.Namespace) -> int:
                     with NativeEmbeddingServer(
                         args.embedding_gguf or DEFAULT_GGUF_PATH,
                         args.gpu_uuid,
-                        max_gpu_temperature_c=args.gpu_temperature_limit or 80,
+                        max_gpu_temperature_c=_gpu_temperature_limit(args),
                     ) as server:
                         encoder = NativeEmbeddingEncoder(
                             server, args.model_dir or DEFAULT_MODEL_DIR
@@ -352,7 +384,7 @@ def _run_retrieval(args: argparse.Namespace) -> int:
                     args.embedding_gguf or DEFAULT_GGUF_PATH,
                     args.gpu_uuid,
                     tokenizer_directory=args.model_dir or DEFAULT_MODEL_DIR,
-                    gpu_temperature_limit_c=args.gpu_temperature_limit or 80,
+                    gpu_temperature_limit_c=_gpu_temperature_limit(args),
                 )
                 result = staged_search(args.query, args.top_k)
                 gpu_trace = staged_search.last_trace
@@ -486,15 +518,16 @@ def _generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--gpu-temperature-limit",
         type=_positive_integer,
-        help="Explicit llama CUDA temperature guard, at most 88 C; default 80 C.",
+        help="GPU temperature stop threshold (max 88 C; defaults to 88 C for explicit GPU use).",
     )
     parser.add_argument("--bundle-dir", type=Path, help="Explicitly prepared llama runtime/model.")
     parser.add_argument("--llm-host", default="http://127.0.0.1:11435")
     parser.add_argument("--context-window", type=_positive_integer, default=16384)
     parser.add_argument("--output-tokens", type=_positive_integer, default=1024)
-    parser.add_argument("--generation-timeout", type=float, default=120.0)
+    parser.add_argument("--generation-timeout", type=float, default=600.0)
+    parser.add_argument("--request-timeout-seconds", type=float, default=600.0)
     parser.add_argument("--llm-threads", type=_positive_integer, default=2)
-    parser.add_argument("--language", choices=("en", "zh-Hant", "auto"), default="en")
+    parser.add_argument("--language", choices=("en", "zh-Hant", "auto"), default="zh-Hant")
     parser.add_argument("--format", choices=("text", "json"), default="text")
 
 
@@ -533,7 +566,7 @@ def _generation_config(args: argparse.Namespace):
         num_predict=args.output_tokens,
         timeout_seconds=args.generation_timeout,
         num_thread=args.llm_threads,
-        max_gpu_temperature_c=args.gpu_temperature_limit or 80,
+        max_gpu_temperature_c=_gpu_temperature_limit(args),
     )
 
 
@@ -620,28 +653,61 @@ def _run_answer(args: argparse.Namespace) -> int:
         document_workflow,
         explain_source,
     )
-    from page_cite_rag.generation import ModelError
+    from page_cite_rag.generation import ModelError, ModelTimeoutError
     from page_cite_rag.retrieval import RetrievalError
     from page_cite_rag.workflows import WorkflowConfig
 
     client = None
     retrieval_session = None
+    retrieval_owner = [None]
     agent_enabled = getattr(args, "agent", False)
     delegate_readers = getattr(args, "delegate_readers", False)
     native_gpu = getattr(args, "native_gpu", False)
+    request_timeout = args.request_timeout_seconds
+    if (
+        type(request_timeout) not in (int, float)
+        or not math.isfinite(request_timeout)
+        or not 1 < request_timeout <= 600
+    ):
+        print(
+            "page-cite-rag: request timeout must be greater than 1 and at most 600 seconds",
+            file=sys.stderr,
+        )
+        return 1
+    request_deadline = time.monotonic() + request_timeout
+    deadline_expired = threading.Event()
+
+    def stop_request() -> None:
+        deadline_expired.set()
+        cancel_retrieval = getattr(retrieval_owner[0], "cancel", None)
+        if callable(cancel_retrieval):
+            try:
+                cancel_retrieval()
+            except Exception:
+                pass
+        close_model = getattr(client, "close", None)
+        if callable(close_model):
+            try:
+                close_model()
+            except Exception:
+                pass
+
+    deadline_timer = threading.Timer(request_timeout, stop_request)
+    deadline_timer.daemon = True
+    deadline_timer.start()
+
+    def ensure_request_time() -> None:
+        if deadline_expired.is_set() or time.monotonic() >= request_deadline:
+            deadline_expired.set()
+            raise ModelTimeoutError("local request exceeded its total deadline")
+
     try:
         if delegate_readers and not agent_enabled:
             raise ValueError("--delegate-readers requires --agent")
         if agent_enabled and (
-            args.command != "ask"
-            or args.backend != "llama"
-            or args.token_budget != "exact"
-            or args.rewrite_query
+            args.command != "ask" or args.backend != "llama" or args.token_budget != "exact"
         ):
-            raise ValueError(
-                "--agent requires ask with --backend llama --token-budget exact "
-                "and no query rewrite"
-            )
+            raise ValueError("--agent requires ask with --backend llama --token-budget exact")
         config = _generation_config(args)
         if not args.question.strip() or len(args.question) > 4000:
             raise ValueError("question must be nonblank and at most 4000 characters")
@@ -660,43 +726,70 @@ def _run_answer(args: argparse.Namespace) -> int:
             store, args.document_id
         )
         if args.command == "ask" and args.method is None:
-            args.method = "hybrid" if docling_source else "bm25"
+            args.method = "hybrid" if docling_source or native_gpu or agent_enabled else "bm25"
         if args.command == "ask":
+            if agent_enabled and args.method != "hybrid":
+                raise ValueError("the reading Agent requires an existing hybrid index")
+            if agent_enabled and (args.rewrite_query or args.rerank):
+                raise ValueError(
+                    "the reading Agent uses the shared planner profile; disable lexical "
+                    "rewrite and reranking"
+                )
+            if args.rerank and not native_gpu:
+                raise ValueError("--rerank requires --native-gpu")
             if native_gpu and (
                 args.backend != "llama"
                 or args.device != "cuda"
                 or not args.gpu_uuid
                 or args.method not in ("dense", "hybrid")
-                or args.rewrite_query
             ):
-                raise ValueError(
-                    "--native-gpu requires dense/hybrid llama CUDA without query rewriting"
-                )
+                raise ValueError("--native-gpu requires dense/hybrid llama CUDA")
             if args.rewrite_query and args.method == "dense":
                 raise ValueError("query rewriting is lexical-only; use bm25 or hybrid")
             if native_gpu:
                 from page_cite_rag.embedding import DEFAULT_MODEL_DIR
                 from page_cite_rag.embedding_server import DEFAULT_GGUF_PATH
                 from page_cite_rag.gpu_retrieval import StagedGpuSearch
+                from page_cite_rag.reranker_server import DEFAULT_MODEL_PATH
 
-                retriever = StagedGpuSearch(
+                gpu_retriever = StagedGpuSearch(
                     store,
                     args.document_id,
                     args.method,
                     args.embedding_gguf or DEFAULT_GGUF_PATH,
                     args.gpu_uuid,
                     tokenizer_directory=args.model_dir or DEFAULT_MODEL_DIR,
-                    gpu_temperature_limit_c=args.gpu_temperature_limit or 80,
+                    gpu_temperature_limit_c=_gpu_temperature_limit(args),
+                    reranker_model_path=DEFAULT_MODEL_PATH if args.rerank else None,
+                    candidates=FORMAL_RETRIEVAL.candidates_per_branch,
                 )
-                if agent_enabled:
-                    retrieval_session = retriever.session()
+                retrieval_owner[0] = gpu_retriever
+                if args.rewrite_query:
+                    from page_cite_rag.query import QueryRewriteConfig, QueryRewriter
+                    from page_cite_rag.query_retrieval import RewritingRetriever
+
+                    client = _open_generation_client(args, config)
+                    rewriter = QueryRewriter(
+                        client,
+                        config,
+                        QueryRewriteConfig.for_document_language(document.language),
+                    )
+                    retriever = RewritingRetriever(None, rewriter, search_backend=gpu_retriever)
+                else:
+                    retriever = gpu_retriever
+                if agent_enabled and not args.rerank:
+                    retrieval_session = gpu_retriever.session()
                     retrieval_session.__enter__()
                 lexical, dense = None, None
             elif docling_source:
                 if args.method != "hybrid":
                     raise ValueError("Docling source requires --method hybrid")
                 retriever = document_retriever(
-                    store, args.document_id, "hybrid", encoder=_load_encoder(args)
+                    store,
+                    args.document_id,
+                    "hybrid",
+                    encoder=_load_encoder(args),
+                    candidates=FORMAL_RETRIEVAL.candidates_per_branch,
                 )
                 lexical, dense = None, None
             else:
@@ -709,7 +802,7 @@ def _run_answer(args: argparse.Namespace) -> int:
         precomputed_search = None
         precomputed_blocks = ()
         initial_gpu_search_trace = None
-        if native_gpu:
+        if native_gpu and not agent_enabled:
             search_workflow = document_workflow(
                 store,
                 args.document_id,
@@ -722,10 +815,16 @@ def _run_answer(args: argparse.Namespace) -> int:
             precomputed_blocks = search_workflow._context_blocks(
                 precomputed_search, precomputed_blocks
             )
-            if isinstance(getattr(retriever, "last_trace", None), dict):
-                initial_gpu_search_trace = dict(retriever.last_trace)
+            gpu_backend = getattr(retriever, "_search_backend", retriever)
+            if isinstance(getattr(gpu_backend, "last_trace", None), dict):
+                initial_gpu_search_trace = dict(gpu_backend.last_trace)
 
-        client = _open_generation_client(args, config)
+        if client is None:
+            client = _open_generation_client(args, config)
+        set_deadline = getattr(client, "set_request_deadline", None)
+        if callable(set_deadline):
+            set_deadline(request_deadline)
+        ensure_request_time()
         if args.command != "ask":
             retriever = None
         elif native_gpu:
@@ -733,21 +832,37 @@ def _run_answer(args: argparse.Namespace) -> int:
         elif docling_source:
             if args.rewrite_query:
                 from page_cite_rag.docling_retrieval import RewritingDoclingRetriever
-                from page_cite_rag.query import QueryRewriter
+                from page_cite_rag.query import QueryRewriteConfig, QueryRewriter
 
-                retriever = RewritingDoclingRetriever(retriever, QueryRewriter(client, config))
+                rewriter = QueryRewriter(
+                    client,
+                    config,
+                    QueryRewriteConfig.for_document_language(document.language),
+                )
+                retriever = RewritingDoclingRetriever(retriever, rewriter)
         else:
             if args.rewrite_query:
-                from page_cite_rag.query import QueryRewriter
+                from page_cite_rag.query import QueryRewriteConfig, QueryRewriter
                 from page_cite_rag.query_retrieval import RewritingRetriever
 
-                retriever = RewritingRetriever(lexical, QueryRewriter(client, config), dense)
+                rewriter = QueryRewriter(
+                    client,
+                    config,
+                    QueryRewriteConfig.for_document_language(document.language),
+                )
+                retriever = RewritingRetriever(lexical, rewriter, dense)
             elif args.method == "hybrid":
                 from page_cite_rag.hybrid import HybridRetriever
 
-                retriever = HybridRetriever(lexical, dense)
+                retriever = HybridRetriever(
+                    lexical,
+                    dense,
+                    candidates=FORMAL_RETRIEVAL.candidates_per_branch,
+                )
             else:
                 retriever = lexical if lexical is not None else dense
+        if retrieval_owner[0] is None:
+            retrieval_owner[0] = retriever
         workflow = document_workflow(
             store,
             args.document_id,
@@ -758,26 +873,24 @@ def _run_answer(args: argparse.Namespace) -> int:
             neighbor_blocks=workflow_config.neighbor_blocks,
         )
         if agent_enabled:
-            from page_cite_rag.agent import local_chat_model, run_bounded_reading_agent
-            from page_cite_rag.workflows import RetrievalTrace
+            from page_cite_rag.application import ask_with_agent, prepare_agent_question
 
-            search_result, blocks = (
-                (precomputed_search, precomputed_blocks)
-                if precomputed_search is not None
-                else workflow.search_sources(args.question)
+            workflow, search_result, blocks, planning_trace = prepare_agent_question(
+                workflow,
+                args.question,
+                language=args.language,
+                source_language=document.language,
             )
-            blocks = workflow._context_blocks(search_result, blocks)
-            with local_chat_model(client) as chat_model:
-                agent_run = run_bounded_reading_agent(
-                    workflow,
-                    args.question,
-                    args.language,
-                    search_result,
-                    blocks,
-                    chat_model,
-                    count_chat_input_tokens=client.count_chat_input_tokens,
-                    delegated=delegate_readers,
-                )
+            reading_run = ask_with_agent(
+                workflow,
+                args.question,
+                language=args.language,
+                delegated=delegate_readers,
+                initial_search=search_result,
+                initial_blocks=blocks,
+            )
+            ensure_request_time()
+            reading_run.trace["planning"] = planning_trace
             if retrieval_session is not None:
                 retrieval_session.__exit__(None, None, None)
                 retrieval_session = None
@@ -785,29 +898,12 @@ def _run_answer(args: argparse.Namespace) -> int:
             agent_gpu_search_trace = (
                 dict(final_gpu_trace) if native_gpu and isinstance(final_gpu_trace, dict) else None
             )
-            result = workflow.answer_from_context(
-                args.question,
-                agent_run.context.blocks,
-                language=args.language,
-                context_groups=agent_run.context.context_groups,
-            )
-            result = result.model_copy(
-                update={
-                    "retrieval": RetrievalTrace(
-                        method=search_result.method,
-                        index_id=search_result.index_id,
-                        query=search_result.query,
-                        hit_count=len(search_result.hits),
-                        elapsed_ms=search_result.elapsed_ms,
-                        query_plan=workflow._query_plan(),
-                        branches=search_result.branches,
-                    )
-                }
-            )
+            result = reading_run.result
             if args.format == "json":
                 report = {
                     "answer": result.model_dump(mode="json"),
-                    "agent_trace": agent_run.trace,
+                    "reading_trace": reading_run.trace,
+                    "agent_trace": reading_run.trace["agent"],
                 }
                 if initial_gpu_search_trace is not None:
                     report["initial_gpu_search_trace"] = initial_gpu_search_trace
@@ -831,11 +927,7 @@ def _run_answer(args: argparse.Namespace) -> int:
                 )
             else:
                 _print_answer(result, args.format)
-                print(
-                    "Agent trace: "
-                    f"{agent_run.trace['model_calls_completed']} decision calls, "
-                    f"{agent_run.trace['tool_calls_recorded']} read-only tool calls."
-                )
+                print("Reading trace: source navigation and cited answer.")
         else:
             if args.command == "ask" and precomputed_search is not None:
                 result = workflow.answer_from_context(
@@ -850,6 +942,7 @@ def _run_answer(args: argparse.Namespace) -> int:
                 result = explain_source(
                     workflow, args.block_id, args.question, language=args.language
                 )
+            ensure_request_time()
             if args.format == "json" and (initial_gpu_search_trace or args.device == "cuda"):
                 report = result.model_dump(mode="json")
                 if initial_gpu_search_trace is not None:
@@ -867,6 +960,7 @@ def _run_answer(args: argparse.Namespace) -> int:
                 )
             else:
                 _print_answer(result, args.format)
+        ensure_request_time()
         return 0  # Evidence insufficiency is a visible result, not a transport error.
     except (ModelError, RetrievalError, StoreError, OSError, sqlite3.Error, ValueError) as exc:
         # ValidationError/OS errors can contain raw user input or paths; don't dump them.
@@ -878,6 +972,9 @@ def _run_answer(args: argparse.Namespace) -> int:
         print(f"page-cite-rag: {args.command} failed: {detail}", file=sys.stderr)
         return 1
     finally:
+        deadline_timer.cancel()
+        if deadline_timer is not threading.current_thread():
+            deadline_timer.join(timeout=5)
         if retrieval_session is not None:
             retrieval_session.__exit__(None, None, None)
         if client is not None:
@@ -897,9 +994,13 @@ def _run_serve(args: argparse.Namespace) -> int:
             record = store.get_document(args.document_id)
             args.method = (
                 "hybrid"
-                if record is not None
-                and record.parser_name == "docling"
-                and _has_native_docling_source(store, args.document_id)
+                if args.agent
+                or args.embedding_backend == "native-gpu"
+                or (
+                    record is not None
+                    and record.parser_name == "docling"
+                    and _has_native_docling_source(store, args.document_id)
+                )
                 else "bm25"
             )
         if not 1 <= args.port <= 65535:
@@ -910,6 +1011,12 @@ def _run_serve(args: argparse.Namespace) -> int:
         from page_cite_rag.api import create_app
         from page_cite_rag.service import DocumentService, ServiceConfig
 
+        if args.rerank and args.embedding_backend != "native-gpu":
+            raise ValueError("--rerank requires --embedding-backend native-gpu")
+        if args.delegate_readers and not args.agent:
+            raise ValueError("--delegate-readers requires --agent")
+        if args.agent and (args.backend != "llama" or args.token_budget != "exact"):
+            raise ValueError("--agent requires --backend llama --token-budget exact")
         if args.embedding_backend == "native-gpu" and (
             args.method == "bm25" or args.device != "cuda" or not args.gpu_uuid
         ):
@@ -924,6 +1031,7 @@ def _run_serve(args: argparse.Namespace) -> int:
             from page_cite_rag.embedding import DEFAULT_MODEL_DIR
             from page_cite_rag.embedding_server import DEFAULT_GGUF_PATH
             from page_cite_rag.gpu_retrieval import StagedGpuSearch
+            from page_cite_rag.reranker_server import DEFAULT_MODEL_PATH
 
             staged_search = StagedGpuSearch(
                 SQLiteDocumentStore(args.db, read_only=True),
@@ -932,6 +1040,9 @@ def _run_serve(args: argparse.Namespace) -> int:
                 args.embedding_gguf or DEFAULT_GGUF_PATH,
                 args.gpu_uuid,
                 tokenizer_directory=args.model_dir or DEFAULT_MODEL_DIR,
+                gpu_temperature_limit_c=_gpu_temperature_limit(args),
+                reranker_model_path=DEFAULT_MODEL_PATH if args.rerank else None,
+                candidates=FORMAL_RETRIEVAL.candidates_per_branch,
             )
         runtime = DocumentService(
             ServiceConfig(
@@ -942,6 +1053,8 @@ def _run_serve(args: argparse.Namespace) -> int:
                 queue_capacity=args.queue_capacity,
                 idle_seconds=args.idle_seconds,
                 request_timeout_seconds=args.request_timeout_seconds,
+                reading_agent=args.agent,
+                delegate_readers=args.delegate_readers,
             ),
             config,
             lambda: _open_generation_client(args, config),
@@ -1018,6 +1131,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     ingest_parser.add_argument(
+        "--pdf-x-tolerance-ratio",
+        type=float,
+        help=(
+            "Font-relative pdfplumber character spacing (0, 1]; defaults to 0.15 and is "
+            "independent of geometric/text-flow reading order. Parser identity includes it."
+        ),
+    )
+    ingest_parser.add_argument(
         "--parser",
         choices=("pdfplumber", "docling"),
         default="pdfplumber",
@@ -1070,7 +1191,9 @@ def build_parser() -> argparse.ArgumentParser:
         retrieval_parser.add_argument(
             "--gpu-temperature-limit",
             type=_positive_integer,
-            help="Explicit native GPU temperature guard, at most 88 C; default 80 C.",
+            help=(
+                "GPU temperature stop threshold (max 88 C; defaults to 88 C for explicit GPU use)."
+            ),
         )
         retrieval_parser.add_argument("document_id", help="Document ID returned by ingest.")
         retrieval_parser.add_argument(
@@ -1136,17 +1259,18 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("document_id", help="Document ID returned by ingest.")
     ask_parser.add_argument("question", help="Question; quote text containing spaces.")
     ask_parser.add_argument("--method", choices=("bm25", "dense", "hybrid"), default=None)
-    ask_parser.add_argument("--top-k", type=_positive_integer, default=10)
+    ask_parser.add_argument("--rerank", action="store_true", help="Rerank native GPU candidates.")
+    ask_parser.add_argument("--top-k", type=_positive_integer, default=FORMAL_RETRIEVAL.final_k)
     ask_parser.add_argument(
         "--rewrite-query",
         action="store_true",
-        help="Opt in to Chinese-to-English lexical query rewriting; dense keeps the original.",
+        help="Opt in to lexical keyword expansion; dense keeps the original question.",
     )
     ask_parser.add_argument(
         "--agent",
         action="store_true",
         help=(
-            "Use a bounded local LangChain reading agent; requires --backend llama "
+            "Use an Agent to search, read and provide a cited answer; requires --backend llama "
             "--token-budget exact and the optional agent extra."
         ),
     )
@@ -1165,7 +1289,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Use the pinned native GPU embedding model for one dense/hybrid retrieval, "
             "then close it before generation; bounded Agent follow-up searches may co-reside "
-            "with generation under the combined 12,000 MiB limit."
+            "with generation under the combined 24,000 MiB limit."
         ),
     )
     ask_parser.add_argument("--embedding-gguf", type=Path)
@@ -1183,7 +1307,7 @@ def build_parser() -> argparse.ArgumentParser:
     for answer_parser in (ask_parser, explain_parser):
         answer_parser.add_argument("--db", type=Path, default=_DEFAULT_DATABASE)
         _generation_options(answer_parser)
-    ask_parser.set_defaults(output_tokens=1536)
+    ask_parser.set_defaults(output_tokens=3072)
     explain_parser.set_defaults(output_tokens=2048)
 
     serve_parser = subparsers.add_parser(
@@ -1192,16 +1316,20 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("document_id", help="The only document accessible to this API.")
     serve_parser.add_argument("--db", type=Path, default=_DEFAULT_DATABASE)
     serve_parser.add_argument("--method", choices=("bm25", "dense", "hybrid"), default=None)
-    serve_parser.add_argument("--top-k", type=_positive_integer, default=10)
+    serve_parser.add_argument("--rerank", action="store_true", help="Rerank native GPU candidates.")
+    serve_parser.add_argument(
+        "--agent", action="store_true", help="Enable source-aware reading/repair."
+    )
+    serve_parser.add_argument("--delegate-readers", action="store_true")
+    serve_parser.add_argument("--top-k", type=_positive_integer, default=FORMAL_RETRIEVAL.final_k)
     serve_parser.add_argument("--port", type=_positive_integer, default=8765)
     serve_parser.add_argument("--queue-capacity", type=int, default=2)
     serve_parser.add_argument("--idle-seconds", type=float, default=300.0)
-    serve_parser.add_argument("--request-timeout-seconds", type=float, default=180.0)
     serve_parser.add_argument("--embedding-backend", choices=("cpu", "native-gpu"), default="cpu")
     serve_parser.add_argument("--embedding-gguf", type=Path)
     _embedding_options(serve_parser)
     _generation_options(serve_parser)
-    serve_parser.set_defaults(output_tokens=2048)
+    serve_parser.set_defaults(output_tokens=3072)
     serve_parser.set_defaults(backend="llama", token_budget="exact")
 
     return parser

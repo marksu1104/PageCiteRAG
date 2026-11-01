@@ -17,7 +17,7 @@ from page_cite_rag.retrieval import RetrievalError, SearchResult
 from page_cite_rag.retrieval_profile import FORMAL_RETRIEVAL
 from page_cite_rag.store import SQLiteDocumentStore
 
-_INDEX_VERSION = "docling-chunk-dense-v1"
+_INDEX_VERSION = "docling-structured-source-v2"
 
 
 def _identity(encoder: EmbeddingEncoder) -> str:
@@ -111,8 +111,8 @@ def load_retriever(
     document_id: str,
     encoder: EmbeddingEncoder,
     *,
-    candidates: int = 20,
-    constant: int = 60,
+    candidates: int = FORMAL_RETRIEVAL.candidates_per_branch,
+    constant: int = FORMAL_RETRIEVAL.rrf_constant,
 ) -> DoclingChunkRetriever:
     bundle = load_bundle(store, document_id)
     raw = store.get_retrieval_manifest(document_id, _kind(encoder))
@@ -152,12 +152,17 @@ def load_retriever(
 
 
 class RewritingDoclingRetriever:
-    """Apply the existing bounded English lexical rewrite to Docling's hybrid search."""
+    """Apply one bounded keyword expansion to the BM25 branch of Docling search."""
 
     def __init__(self, retriever: DoclingChunkRetriever, rewriter: QueryRewriter) -> None:
         self._retriever = retriever
         self._rewriter = rewriter
         self.last_query_plan: dict | None = None
+        self._rewrite_enabled = True
+
+    def disable_rewrites(self) -> None:
+        """Keep later Agent searches focused without another generation call."""
+        self._rewrite_enabled = False
 
     def search(
         self,
@@ -166,19 +171,31 @@ class RewritingDoclingRetriever:
         top_k: int = 5,
         allowed_chunk_indices: tuple[int, ...] | None = None,
     ) -> SearchResult:
-        plan = self._rewriter.rewrite(query)
-        self._retriever.lexical_overrides[query] = plan.lexical_query
+        plan = self._rewriter.rewrite(query) if self._rewrite_enabled else None
+        if plan is not None:
+            self._retriever.lexical_overrides[query] = plan.lexical_query
         try:
             result = self._retriever.search(
                 query, top_k=top_k, allowed_chunk_indices=allowed_chunk_indices
             )
             self.last_query_plan = {
                 **(self._retriever.last_query_plan or {}),
-                "rewrite": plan.model_dump(mode="json"),
+                "rewrite": (
+                    plan.model_dump(mode="json")
+                    if plan is not None
+                    else {
+                        "status": "not_needed",
+                        "reason": "focused_agent_query_no_extra_rewrite",
+                        "original_query": query,
+                        "lexical_query": query,
+                        "elapsed_ms": 0.0,
+                    }
+                ),
                 "scope_chunk_indexes": list(allowed_chunk_indices)
                 if allowed_chunk_indices is not None
                 else None,
             }
             return result
         finally:
-            self._retriever.lexical_overrides.pop(query, None)
+            if plan is not None:
+                self._retriever.lexical_overrides.pop(query, None)

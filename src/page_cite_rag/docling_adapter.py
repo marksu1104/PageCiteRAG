@@ -1,8 +1,8 @@
 """Read-only Docling retrieval over contextualized chunks and native source blocks.
 
-Retrieved chunk text is reading context. Every offered citation span still comes
-from a saved native text item or table cell, with its original page regions kept
-separately for read-back. This adapter does not modify SQLite schema or the parser.
+Retrieved chunk text is reading context. Citations map to saved native text items
+or structured whole tables; table rows are not guessed from serialized text. This
+adapter does not modify SQLite schema or the parser.
 """
 
 from __future__ import annotations
@@ -20,9 +20,11 @@ from page_cite_rag.docling_source import DoclingSourceError, read_native_item
 from page_cite_rag.embedding import EmbeddingEncoder, normalized_vectors
 from page_cite_rag.models import Block, ParsedUnit
 from page_cite_rag.retrieval import SearchContextGroup, SearchHit, SearchResult
+from page_cite_rag.retrieval_profile import FORMAL_RETRIEVAL
 from page_cite_rag.tokenize import LexicalTokenizer
 
-ADAPTER_VERSION = "docling-native-item-or-cell/v1"
+LEGACY_ADAPTER_VERSION = "docling-native-item-or-table/v2"
+ADAPTER_VERSION = "docling-native-item-or-table/v3"
 
 
 @dataclass(frozen=True)
@@ -38,8 +40,8 @@ class DoclingSourceStore:
     """Satisfy the workflow's read-only source interface without false PDF offsets.
 
     The caller must first verify the capture manifest, source PDF SHA and candidate
-    chunk artifact. A virtual unit is exactly one saved text item or table cell,
-    *not* a PDF page. ``location_for`` carries its original Docling provenance.
+    chunk artifact. A virtual unit is one saved text item or structured whole table,
+    *not* a PDF page. ``location_for`` carries Docling's item-level provenance.
     """
 
     def __init__(
@@ -50,6 +52,8 @@ class DoclingSourceStore:
         source_sha256: str,
         source_name: str,
         page_count: int,
+        source_order: tuple[str, ...] = (),
+        adapter_version: str = ADAPTER_VERSION,
     ) -> None:
         if (
             not isinstance(document, dict)
@@ -63,8 +67,10 @@ class DoclingSourceStore:
             or page_count < 1
         ):
             raise DoclingSourceError("invalid Docling comparison source")
+        if adapter_version not in (LEGACY_ADAPTER_VERSION, ADAPTER_VERSION):
+            raise DoclingSourceError("unknown native source adapter version")
         identity = json.dumps(
-            [ADAPTER_VERSION, source_sha256, source_name, page_count, document, chunks],
+            [adapter_version, source_sha256, source_name, page_count, document, chunks],
             sort_keys=True,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -82,17 +88,14 @@ class DoclingSourceStore:
         self._by_id: dict[str, Block] = {}
         self._units: dict[int, ParsedUnit] = {}
         self._locations: dict[str, dict] = {}
-        self._cell_headers: dict[str, tuple[bool, bool]] = {}
         self._ref_blocks: dict[str, tuple[str, ...]] = {}
         self.chunk_native_refs: list[tuple[str, ...]] = []
         self.chunk_block_ids: list[tuple[str, ...]] = []
 
-        def add_block(text: str, *, ref: str, source: dict, cell: dict | None) -> str:
+        def add_block(text: str, *, ref: str, source: dict) -> str:
             ordinal = len(self._blocks) + 1
-            block_id = hashlib.sha256(
-                f"{document_id}\0{ref}\0{cell['cell_index'] if cell else 'item'}".encode()
-            ).hexdigest()
-            page_number = source["pages"][0] if len(source["pages"]) == 1 and cell is None else None
+            block_id = hashlib.sha256(f"{document_id}\0{ref}\0item".encode()).hexdigest()
+            page_number = source["pages"][0] if len(source["pages"]) == 1 else None
             starts = [0]
             for line in text.splitlines(keepends=True):
                 starts.append(starts[-1] + len(line))
@@ -108,15 +111,6 @@ class DoclingSourceStore:
                 char_end=len(text),
                 text=text,
             )
-            public_cell = (
-                {
-                    key: value
-                    for key, value in cell.items()
-                    if key not in {"row_header", "column_header"}
-                }
-                if cell is not None
-                else None
-            )
             self._blocks.append(block)
             self._by_id[block_id] = block
             self._units[ordinal] = ParsedUnit(
@@ -124,61 +118,89 @@ class DoclingSourceStore:
             )
             self._locations[block_id] = {
                 "native_ref": ref,
-                "kind": "table_cell" if cell is not None else source["kind"],
+                "source_type": source["label"],
+                "kind": "table" if source["table"] is not None else source["kind"],
                 "pages": source["pages"],
                 "regions": source["regions"],
                 "pdf_character_offsets": "unavailable",
-                "source_text_scope": (
-                    "saved_native_cell" if cell is not None else "saved_native_item"
+                "source_text_scope": "saved_table_cells_with_coordinates"
+                if source["table"] is not None
+                else "saved_native_item",
+                "cell": None,
+                "table": (
+                    {
+                        "rows": source["table"]["rows"],
+                        "columns": source["table"]["columns"],
+                        "cell_page_mapping": source["table"]["cell_page_mapping"],
+                    }
+                    if source["table"] is not None
+                    else None
                 ),
-                "cell": public_cell,
             }
-            if cell is not None:
-                self._cell_headers[block_id] = (
-                    cell["row_header"],
-                    cell["column_header"],
-                )
             return block_id
 
+        chunk_refs: list[str] = []
         for entry in chunks:
             refs = entry.get("chunk", {}).get("meta", {}).get("doc_items")
             if not isinstance(refs, list) or not refs:
                 raise DoclingSourceError("candidate chunk lacks source refs")
-            block_ids = []
+            current_refs = []
             for item in refs:
                 ref = item.get("self_ref") if isinstance(item, dict) else None
                 if not isinstance(ref, str):
                     raise DoclingSourceError("candidate chunk has invalid native ref")
-                if ref not in self._ref_blocks:
-                    source = read_native_item(document, ref, page_count=page_count)
-                    created = []
-                    if source["saved_item_text"] is not None:
-                        created.append(
-                            add_block(source["saved_item_text"], ref=ref, source=source, cell=None)
+                current_refs.append(ref)
+                if ref not in chunk_refs:
+                    chunk_refs.append(ref)
+            self.chunk_native_refs.append(tuple(dict.fromkeys(current_refs)))
+
+        caption_refs = []
+        for ref in chunk_refs:
+            source = read_native_item(document, ref, page_count=page_count)
+            caption_refs.extend(source["caption_refs"])
+        ordered_refs = list(dict.fromkeys((*source_order, *chunk_refs, *caption_refs)))
+        for ref in ordered_refs:
+            source = read_native_item(
+                document,
+                ref,
+                page_count=page_count,
+                include_enumerated_marker=adapter_version == ADAPTER_VERSION,
+            )
+            created = []
+            if source["table"] is not None:
+                rows, columns = source["table"]["rows"], source["table"]["columns"]
+                lines = [f"Table ({rows} rows, {columns} columns)"]
+                for cell in sorted(
+                    source["table"]["cells"],
+                    key=lambda value: (
+                        value["row_start"],
+                        value["column_start"],
+                        value["row_end"],
+                        value["column_end"],
+                    ),
+                ):
+                    if cell["text"].strip():
+                        lines.append(
+                            f"[rows {cell['row_start']}–{cell['row_end']}; "
+                            f"columns {cell['column_start']}–{cell['column_end']}] {cell['text']}"
                         )
-                    elif source["table"] is not None:
-                        for index, table_cell in enumerate(source["table"]["cells"]):
-                            if table_cell["text"].strip():
-                                cell = {
-                                    "cell_index": index,
-                                    "row_start": table_cell["row_start"],
-                                    "row_end": table_cell["row_end"],
-                                    "column_start": table_cell["column_start"],
-                                    "column_end": table_cell["column_end"],
-                                    "bbox": table_cell["bbox"],
-                                    "cell_page_mapping": "unverified",
-                                }
-                                cell["row_header"] = table_cell["row_header"]
-                                cell["column_header"] = table_cell["column_header"]
-                                created.append(
-                                    add_block(table_cell["text"], ref=ref, source=source, cell=cell)
-                                )
-                    self._ref_blocks[ref] = tuple(created)
-                block_ids.extend(self._ref_blocks[ref])
+                if len(lines) > 1:
+                    created.append(add_block("\n".join(lines), ref=ref, source=source))
+            elif source["saved_item_text"] is not None:
+                created.append(add_block(source["saved_item_text"], ref=ref, source=source))
+            self._ref_blocks[ref] = tuple(created)
+
+        for refs in self.chunk_native_refs:
+            block_ids = tuple(
+                dict.fromkeys(
+                    block_id
+                    for ref in refs
+                    for block_id in self.block_ids_for_ref(self.document_id, ref)
+                )
+            )
             if not block_ids:
                 raise DoclingSourceError("candidate chunk has no readable native source")
-            self.chunk_native_refs.append(tuple(dict.fromkeys(item["self_ref"] for item in refs)))
-            self.chunk_block_ids.append(tuple(dict.fromkeys(block_ids)))
+            self.chunk_block_ids.append(block_ids)
 
     @property
     def document_id(self) -> str:
@@ -228,47 +250,10 @@ class DoclingSourceStore:
         return "\n".join((*captions, text))
 
     def context_block_ids_for_chunk(self, chunk_index: int) -> tuple[str, ...]:
-        """Map serialized table rows to exact cells, row labels and column headers."""
-        text = " ".join(self.contextualized_chunk_text(chunk_index).split()).casefold()
+        """Return honest item-level citations where Docling does not expose row IDs."""
         selected: list[str] = []
         for ref in self.context_refs_for_chunk(chunk_index):
-            block_ids = self.block_ids_for_ref(self.document_id, ref)
-            if not ref.startswith("#/tables/"):
-                selected.extend(block_ids)
-                continue
-            cells = {
-                block_id: {
-                    **self.location_for(self.document_id, block_id)["cell"],
-                    "row_header": self._cell_headers[block_id][0],
-                    "column_header": self._cell_headers[block_id][1],
-                }
-                for block_id in block_ids
-            }
-            matching = [
-                block_id
-                for block_id in block_ids
-                if " ".join(self._by_id[block_id].text.split()).casefold() in text
-            ]
-            related = set(matching)
-            for block_id in matching:
-                cell = cells[block_id]
-                for candidate_id, candidate in cells.items():
-                    same_row = (
-                        candidate["row_start"] < cell["row_end"]
-                        and cell["row_start"] < candidate["row_end"]
-                    )
-                    same_column = (
-                        candidate["column_start"] < cell["column_end"]
-                        and cell["column_start"] < candidate["column_end"]
-                    )
-                    if same_row and (
-                        candidate["row_header"]
-                        or (cell["column_start"] > 0 and candidate["column_start"] == 0)
-                    ):
-                        related.add(candidate_id)
-                    if cell["row_start"] > 0 and candidate["column_header"] and same_column:
-                        related.add(candidate_id)
-            selected.extend(block_id for block_id in block_ids if block_id in related)
+            selected.extend(self.block_ids_for_ref(self.document_id, ref))
         return tuple(dict.fromkeys(selected))
 
     def get_neighbor_blocks(
@@ -305,8 +290,8 @@ class DoclingChunkRetriever:
         chunks: list[dict],
         encoder: EmbeddingEncoder,
         *,
-        candidates: int = 20,
-        constant: int = 60,
+        candidates: int = FORMAL_RETRIEVAL.candidates_per_branch,
+        constant: int = FORMAL_RETRIEVAL.rrf_constant,
         lexical_overrides: dict[str, str] | None = None,
     ) -> None:
         if (
@@ -354,7 +339,7 @@ class DoclingChunkRetriever:
     ) -> SearchResult:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be nonempty")
-        if type(top_k) is not int or not 1 <= top_k <= self.candidates:
+        if type(top_k) is not int or not 1 <= top_k <= 2 * self.candidates:
             raise ValueError("top_k exceeds the candidate budget")
         allowed = tuple(range(len(self.store.chunk_block_ids)))
         if allowed_chunk_indices is not None:
@@ -441,8 +426,8 @@ class DoclingChunkRetriever:
             "selected_context_chunk_count": len(context_groups),
             "selected_source_block_count": len(ordered),
             "scoped_chunk_count": len(allowed) if allowed_chunk_indices is not None else None,
-            "context_serialization": "docling-chunk-plus-native-table-captions/v1",
-            "version": "docling-chunk-top-k-context-to-native-source/v3",
+            "context_serialization": "docling-chunk-plus-native-table-captions/v2",
+            "version": "docling-chunk-top-k-context-to-native-source/v4",
         }
         return SearchResult(
             document_id=self.store.document_id,

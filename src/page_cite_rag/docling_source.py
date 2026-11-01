@@ -11,6 +11,58 @@ import math
 import re
 
 _ITEM_REF = re.compile(r"^#/(texts|tables|pictures|key_value_items|form_items)/([0-9]+)$")
+_SOURCE_COLLECTIONS = ("texts", "tables", "pictures", "key_value_items", "form_items")
+FURNITURE_LABELS = frozenset(
+    {"page_header", "page_footer", "page_number", "running_header", "running_footer", "marginalia"}
+)
+
+
+def body_source_refs(document: dict) -> tuple[str, ...]:
+    """Return readable source refs in Docling body traversal order.
+
+    Older hand-built captures without a body tree use their collection order as a
+    compatibility fallback. Real Docling exports carry ``body.children`` and use
+    that authoritative structural sequence.
+    """
+    if not isinstance(document, dict):
+        raise DoclingSourceError("native document is invalid")
+    body = document.get("body")
+    if not isinstance(body, dict) or not isinstance(body.get("children"), list):
+        return tuple(
+            item["self_ref"]
+            for collection in _SOURCE_COLLECTIONS
+            for item in document.get(collection, [])
+            if isinstance(item, dict) and isinstance(item.get("self_ref"), str)
+        )
+
+    items_by_ref = {
+        item["self_ref"]: item
+        for collection in document.values()
+        if isinstance(collection, list)
+        for item in collection
+        if isinstance(item, dict) and isinstance(item.get("self_ref"), str)
+    }
+    source_refs: list[str] = []
+    visited: set[str] = set()
+
+    def visit(reference: object) -> None:
+        ref = reference.get("$ref") if isinstance(reference, dict) else reference
+        if not isinstance(ref, str) or ref in visited:
+            return
+        visited.add(ref)
+        item = items_by_ref.get(ref)
+        if item is None:
+            return
+        if _ITEM_REF.fullmatch(ref):
+            source_refs.append(ref)
+        children = item.get("children")
+        if isinstance(children, list):
+            for child in children:
+                visit(child)
+
+    for child in body["children"]:
+        visit(child)
+    return tuple(source_refs)
 
 
 class DoclingSourceError(ValueError):
@@ -30,6 +82,12 @@ def _item_by_ref(document: dict, ref: str) -> tuple[str, dict]:
     if not isinstance(item, dict) or item.get("self_ref") != ref:
         raise DoclingSourceError("native item identity changed")
     return collection, item
+
+
+def is_layout_furniture(document: dict, ref: str) -> bool:
+    """Recognize Docling's explicit page-furniture labels for exclusion from search."""
+    _, item = _item_by_ref(document, ref)
+    return item.get("label") in FURNITURE_LABELS
 
 
 def _regions(item: dict, page_count: int) -> list[dict]:
@@ -112,7 +170,9 @@ def _table_cells(item: dict) -> dict:
     }
 
 
-def read_native_item(document: dict, ref: str, *, page_count: int) -> dict:
+def read_native_item(
+    document: dict, ref: str, *, page_count: int, include_enumerated_marker: bool = False
+) -> dict:
     """Return saved item text/structure and honest, item-level location limits.
 
     The caller must first validate the capture manifest and document hash. A
@@ -134,6 +194,20 @@ def read_native_item(document: dict, ref: str, *, page_count: int) -> dict:
         caption_refs.append(caption_ref)
     text = item.get("text")
     saved_text = text if isinstance(text, str) and text.strip() else None
+    marker, original = item.get("marker"), item.get("orig")
+    if (
+        include_enumerated_marker
+        and item.get("label") == "list_item"
+        and item.get("enumerated") is True
+        and isinstance(marker, str)
+        and marker.strip()
+        and isinstance(original, str)
+        and saved_text is not None
+        and original.startswith(marker)
+        and original[len(marker) :].lstrip() == saved_text
+    ):
+        # Only use the exact saved original when it proves the marker belongs to this item.
+        saved_text = original
     return {
         "ref": ref,
         "kind": collection,

@@ -1,4 +1,4 @@
-"""Explicit local CUDA build/model download; no sudo, inference or system changes."""
+"""Explicit pinned model/runtime preparation; no sudo, inference or system changes."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from typing import Literal
 
 from page_cite_rag.llama import (
     DEFAULT_BUNDLE,
@@ -23,6 +24,7 @@ from page_cite_rag.llama import (
     MODEL_REVISION,
     MODEL_SHA256,
     SOURCE_SHA256,
+    model_spec,
     sha256,
     verify_bundle,
 )
@@ -65,22 +67,117 @@ def run(argv: list[str], log: Path, env: dict, timeout: int) -> None:
     print(f"passed {log.stem}", flush=True)
 
 
+def prepare_4b(target: Path, output: Path, runtime_bundle: Path) -> None:
+    """Reuse the verified pinned runtime; download only the selected 4B weights."""
+    prepare_with_runtime(target, output, runtime_bundle, model_size="4b")
+
+
+def prepare_with_runtime(
+    target: Path,
+    output: Path,
+    runtime_bundle: Path,
+    *,
+    model_size: Literal["4b", "27b"],
+    source_model: Path | None = None,
+) -> None:
+    """Reuse the pinned runtime; 27B requires verified local weights and never downloads."""
+    if model_size not in ("4b", "27b"):
+        raise ValueError("runtime reuse supports only pinned 4B or 27B models")
+    if (model_size == "27b") != (source_model is not None):
+        raise ValueError("27B preparation requires local weights; 4B uses its existing download")
+    runtime = verify_bundle(runtime_bundle)
+    spec = model_spec(model_size)
+    if source_model is not None and (
+        source_model.is_symlink()
+        or not source_model.is_file()
+        or source_model.stat().st_size != spec["bytes"]
+        or sha256(source_model) != spec["sha256"]
+    ):
+        raise ValueError("local model differs from the pinned size or checksum")
+    if target.exists() or target.is_symlink():
+        raise ValueError("preparation must not replace an existing bundle")
+    output.mkdir(parents=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "scope": f"explicit pinned {model_size.upper()} preparation, not inference validation",
+        "runtime_source": str(runtime_bundle),
+        "runtime_rebuilt": False,
+        "model_repo": spec["repo"],
+        "model_revision": spec["revision"],
+        "model_bytes": spec["bytes"],
+        "model_sha256": spec["sha256"],
+        "local_source_model": str(source_model) if source_model is not None else None,
+        "prepared": False,
+    }
+    try:
+        # Never replace the 9B model or an existing target on failed preparation.
+        with tempfile.TemporaryDirectory(prefix=".prepare-", dir=target.parent) as staging:
+            bundle = Path(staging) / "bundle"
+            shutil.copytree(runtime_bundle / "bin", bundle / "bin")
+            shutil.copy2(runtime_bundle / "LLAMA-LICENSE", bundle / "LLAMA-LICENSE")
+            if source_model is not None:
+                # Keep one physical copy; verification below rechecks the linked bytes.
+                os.link(source_model, bundle / spec["file"])
+            else:
+                download(
+                    f"https://huggingface.co/{spec['repo']}/resolve/{spec['revision']}/{spec['file']}",
+                    bundle / spec["file"],
+                    spec["bytes"],
+                    600,
+                    spec["sha256"],
+                )
+            manifest = {
+                "format": 1,
+                "llama_commit": LLAMA_COMMIT,
+                "llama_version": LLAMA_VERSION,
+                "source_sha256": SOURCE_SHA256,
+                "model_repo": spec["repo"],
+                "model_revision": spec["revision"],
+                "model_sha256": spec["sha256"],
+                "model_license": "Apache-2.0",
+                "publisher": "Unsloth third-party quantization",
+                "build_flags": runtime["build_flags"],
+                "runtime_source": str(runtime_bundle),
+                "files": {
+                    str(p.relative_to(bundle)): sha256(p) for p in bundle.rglob("*") if p.is_file()
+                },
+            }
+            (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            verify_bundle(bundle, model_size)
+            bundle.rename(target)
+        report["prepared"] = True
+        report["bundle_dir"] = str(target)
+    finally:
+        (output / "preparation.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(
+        f"Pinned {model_size.upper()} bundle prepared; existing runtime reused without rebuilding.",
+        flush=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bundle-dir", type=Path, default=DEFAULT_BUNDLE)
+    parser.add_argument("--model-size", choices=["9b", "4b"], default="9b")
+    parser.add_argument("--bundle-dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--cuda-root", type=Path, required=True)
-    parser.add_argument("--gcc", type=Path, required=True)
-    parser.add_argument("--gxx", type=Path, required=True)
+    parser.add_argument("--runtime-bundle", type=Path, default=DEFAULT_BUNDLE)
+    parser.add_argument("--cuda-root", type=Path)
+    parser.add_argument("--gcc", type=Path)
+    parser.add_argument("--gxx", type=Path)
     parser.add_argument("--architecture", default="86-real", choices=["86-real"])
     args = parser.parse_args()
     os.umask(0o077)
-    target = args.bundle_dir.absolute()
+    spec = model_spec(args.model_size)
+    default_bundle = (
+        Path(f"models/llama-qwen35-{args.model_size}")
+        / f"{LLAMA_COMMIT[:8]}-{spec['revision'][:8]}"
+    )
+    target = (args.bundle_dir or default_bundle).absolute()
     root = Path.cwd().resolve()
     if (root / "models").is_symlink() or not target.resolve().is_relative_to(root / "models"):
         raise ValueError("bundle must be inside this checkout's models directory")
     if target.exists() or target.is_symlink():
-        verify_bundle(target)
+        verify_bundle(target, args.model_size)
         print("Existing pinned bundle verified; no download or build.")
         return
     # Keep preparation artifacts inside the designated output directories.
@@ -92,6 +189,14 @@ def main() -> None:
         or output.is_symlink()
     ):
         raise ValueError("use a new output directory inside this checkout's outputs")
+    if args.model_size == "4b":
+        runtime_bundle = args.runtime_bundle.absolute()
+        if not runtime_bundle.resolve().is_relative_to(root / "models"):
+            raise ValueError("runtime bundle must be inside this checkout's models directory")
+        prepare_4b(target, output, runtime_bundle)
+        return
+    if any(tool is None for tool in (args.gcc, args.gxx, args.cuda_root)):
+        parser.error("9B runtime build requires --cuda-root, --gcc and --gxx")
     for tool in (args.gcc, args.gxx, args.cuda_root / "bin/nvcc"):
         if not tool.is_absolute() or not tool.is_file():
             raise ValueError("provide existing absolute compiler/toolkit paths; no auto install")

@@ -29,6 +29,37 @@ def test_reranker_sorts_by_score_and_preserves_original_order_for_ties():
         (2, 0.7),
     ]
     assert server.last_pair_tokens == (3, 3, 3)
+    assert server.last_batch_sizes == (3,)
+    assert server.last_attempted_batch_count == server.last_completed_batch_count == 1
+
+
+def test_reranker_scores_all_candidates_in_bounded_batches_and_restores_global_indexes():
+    server = NativeRerankerServer.__new__(NativeRerankerServer)
+    request_sizes = []
+
+    def post(path, payload):
+        if path == "/tokenize":
+            return {"tokens": [1, 2, 3]}
+        documents = payload["documents"]
+        request_sizes.append(len(documents))
+        offset = sum(request_sizes[:-1])
+        return {
+            "results": [
+                {"index": index, "relevance_score": float(offset + index)}
+                for index in reversed(range(len(documents)))
+            ]
+        }
+
+    server._post = post
+    documents = [f"document-{index}" for index in range(19)]
+
+    ranked = server.rerank("question", documents)
+
+    assert request_sizes == [8, 8, 3]
+    assert [index for index, _ in ranked] == list(reversed(range(19)))
+    assert server.last_pair_tokens == (3,) * 19
+    assert server.last_batch_sizes == (8, 8, 3)
+    assert server.last_attempted_batch_count == server.last_completed_batch_count == 3
 
 
 @pytest.mark.parametrize(
@@ -77,3 +108,28 @@ def test_local_model_timeout_identifies_endpoint_without_exposing_payload():
 
     with pytest.raises(RetrievalError, match="timed out at /tokenize"):
         server._post("/tokenize", {"content": "private document text"})
+
+
+def test_reranker_diagnostics_keep_completed_batch_count_when_a_later_batch_fails():
+    server = NativeRerankerServer.__new__(NativeRerankerServer)
+    rerank_requests = 0
+
+    def post(path, _payload):
+        nonlocal rerank_requests
+        if path == "/tokenize":
+            return {"tokens": [1, 2]}
+        rerank_requests += 1
+        if rerank_requests == 2:
+            raise RetrievalError("native local request timed out at /v1/rerank")
+        return {
+            "results": [{"index": index, "relevance_score": float(index)} for index in range(8)]
+        }
+
+    server._post = post
+    with pytest.raises(RetrievalError, match="timed out at /v1/rerank"):
+        server.rerank("question", [f"document-{index}" for index in range(16)])
+
+    assert server.last_pair_tokens == (2,) * 16
+    assert server.last_batch_sizes == (8, 8)
+    assert server.last_attempted_batch_count == 2
+    assert server.last_completed_batch_count == 1

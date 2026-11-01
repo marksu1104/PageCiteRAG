@@ -23,6 +23,79 @@ from page_cite_rag.retrieval import build_bm25_index
 from page_cite_rag.store import SQLiteDocumentStore
 
 
+def test_default_answer_retrieval_profile_uses_full_admission_pool():
+    ask = cli.build_parser().parse_args(["ask", "0" * 64, "question"])
+    serve = cli.build_parser().parse_args(["serve", "0" * 64])
+
+    assert ask.top_k == 100
+    assert serve.top_k == 100
+
+
+def _fake_navigation_agent_run(workflow, context, *, model_calls, tool_calls, ledger):
+    from page_cite_rag.agent import AgentRun, ReadingReport
+
+    final_input = max(context.exact_input_tokens or 100, 1)
+    for _ in range(model_calls):
+        ledger.admit(final_input, workflow._budget_config.num_ctx)
+        ledger.complete(24)
+    trace = {
+        "model_calls_completed": model_calls,
+        "tool_calls_recorded": tool_calls,
+        "agent_input_tokens_exact": final_input * model_calls,
+        "agent_output_tokens_observed": 24 * model_calls,
+        "agent_output_tokens_unobserved_reserved": 0,
+        "model_call_records": [
+            {
+                "status": "completed",
+                "input_tokens_exact": final_input,
+                "output_tokens_observed": 24,
+                "output_token_limit": ledger.call_output_limit,
+                "elapsed_ms": 10.0,
+                "role": "navigation",
+            }
+            for _ in range(model_calls)
+        ],
+        "bootstrap_shown_block_ids": [block.block_id for block in context.blocks],
+        "initial_answer_block_ids": [block.block_id for block in context.blocks],
+        "tool_trace": [],
+        "architecture": "single_agent_navigation_with_shared_writer",
+    }
+    return AgentRun(
+        context,
+        trace,
+        structured_response=ReadingReport(
+            requirements=[],
+            unresolved=["the requested fact"],
+        ),
+        acquired_context=context,
+    )
+
+
+def _enable_exact_writer_budget(workflow):
+    from dataclasses import replace
+
+    from page_cite_rag.generation import PromptBudget
+
+    model = workflow._model
+    original_generate = model.generate
+
+    def prepare_budget(_messages, _schema):
+        return PromptBudget(
+            input_upper_estimate=100 + model.config.template_reserve,
+            output_reserved=model.config.num_predict,
+            context_limit=model.config.num_ctx,
+            method="fake-exact-token-test/v1",
+            exact_input_tokens=100,
+        )
+
+    def generate(messages, schema):
+        generated = original_generate(messages, schema)
+        return replace(generated, budget=prepare_budget(messages, schema))
+
+    model.prepare_budget = prepare_budget
+    model.generate = generate
+
+
 class FakeClient:
     def __init__(self, config):
         self.config = config
@@ -37,13 +110,49 @@ class FakeClient:
         self.calls.append((messages, schema_class))
         if self.failure:
             raise self.failure
+        if schema_class is None:
+            return GenerationResult(
+                "document, evidence",
+                GenerationStats(
+                    prompt_eval_count=50,
+                    eval_count=10,
+                    total_duration=100,
+                    load_duration=None,
+                    prompt_eval_duration=40,
+                    eval_duration=60,
+                    done_reason="stop",
+                    elapsed_ms=1.0,
+                ),
+                check_budget(messages, None, self.config),
+            )
         payload = json.loads(messages[1].content)
-        first_evidence = payload["evidence"][0]
-        if self.insufficient:
+        from page_cite_rag.review import SourceReview
+
+        if issubclass(schema_class, SourceReview):
+            already_reviewed = sum(issubclass(schema, SourceReview) for _, schema in self.calls) > 1
+            value = schema_class.model_validate_json(
+                json.dumps(
+                    {
+                        "verdict": "supported" if already_reviewed else "needs_revision",
+                        "needs_reading": not already_reviewed,
+                        "issues": []
+                        if already_reviewed
+                        else [
+                            {
+                                "kind": "missing_evidence",
+                                "description": "Read the eligibility conditions.",
+                                "source_block_ids": [],
+                            }
+                        ],
+                    }
+                )
+            )
+        elif self.insufficient:
             value = schema_class.model_validate_json(
                 json.dumps({"status": "insufficient_evidence", "limitations": ["Not stated."]})
             )
         else:
+            first_evidence = payload["evidence"][0]
             citation = {
                 "source_id": "S999" if self.invalid_citation else first_evidence["source_id"]
             }
@@ -124,7 +233,16 @@ def tokenizer_directory(tmp_path):
 
 def ask_arguments(document, *options):
     store, document_id, _ = document
-    return ["ask", document_id, "significant", "--db", str(store.database_path), *options]
+    return [
+        "ask",
+        document_id,
+        "significant",
+        "--language",
+        "en",
+        "--db",
+        str(store.database_path),
+        *options,
+    ]
 
 
 def test_ask_json_end_to_end_has_program_derived_exact_citations(document, clients, capsys):
@@ -449,7 +567,7 @@ def test_invalid_question_rejected_before_model_start(document, clients, capsys,
 def test_top_k_over_workflow_limit_rejected_before_model_start(document, clients, capsys):
     store, document_id, _ = document
     build_bm25_index(store, document_id)
-    assert cli.main(ask_arguments(document, "--top-k", "21")) == 1
+    assert cli.main(ask_arguments(document, "--top-k", "101")) == 1
     assert clients == []
     assert "ask failed" in capsys.readouterr().err
 
@@ -487,13 +605,31 @@ main([sys.argv[2], '--help'])
         assert "--native-gpu" in result.stdout
 
 
-def test_agent_cli_uses_bounded_context_then_shared_answer_path(
-    document, clients, monkeypatch, capsys
-):
-    from page_cite_rag import agent
+def test_public_cli_defaults_to_traditional_chinese():
+    args = cli.build_parser().parse_args(["ask", "0" * 64, "為什麼結果不顯著？"])
+    assert args.language == "zh-Hant"
+    assert args.generation_timeout == 600
+    assert args.request_timeout_seconds == 600
+
+
+def test_agent_cli_runs_navigation_then_the_shared_writer(document, clients, monkeypatch, capsys):
+    from page_cite_rag import agent, application
+    from page_cite_rag.dense import build_dense_index
+    from page_cite_rag.reading_plan import ReadingNeed, ReadingPlan
+    from test_dense import FakeEncoder
 
     store, document_id, _ = document
     build_bm25_index(store, document_id)
+    encoder = FakeEncoder()
+    build_dense_index(store, document_id, encoder)
+    monkeypatch.setattr(cli, "_load_encoder", lambda _args: encoder)
+    monkeypatch.setattr(
+        application,
+        "plan_document_question",
+        lambda *_args, **_kwargs: ReadingPlan(
+            requirements=(ReadingNeed(need="result", queries=("result",)),)
+        ),
+    )
 
     @contextmanager
     def local_model(_client):
@@ -502,10 +638,14 @@ def test_agent_cli_uses_bounded_context_then_shared_answer_path(
     def run_agent(workflow, question, language, result, blocks, _model, **kwargs):
         assert callable(kwargs["count_chat_input_tokens"])
         assert kwargs["delegated"] is False
+        _enable_exact_writer_budget(workflow)
         context = agent._admit(workflow, question, language, blocks, result.context_groups)
-        return agent.AgentRun(
+        return _fake_navigation_agent_run(
+            workflow,
             context,
-            {"model_calls_completed": 1, "tool_calls_recorded": 1},
+            model_calls=1,
+            tool_calls=1,
+            ledger=kwargs["shared_ledger"],
         )
 
     monkeypatch.setattr(agent, "local_chat_model", local_model)
@@ -525,12 +665,11 @@ def test_agent_cli_uses_bounded_context_then_shared_answer_path(
 
     output = json.loads(capsys.readouterr().out)
     assert output["answer"]["status"] == "answered"
-    assert output["answer"]["retrieval"]["method"] == "bm25"
-    assert output["agent_trace"] == {
-        "model_calls_completed": 1,
-        "tool_calls_recorded": 1,
-    }
+    assert output["answer"]["retrieval"]["method"] == "hybrid"
+    assert output["agent_trace"]["model_calls_completed"] == 2
+    assert output["agent_trace"]["tool_calls_recorded"] == 1
     assert len(clients) == 1 and len(clients[0][2].calls) == 1
+    assert output["reading_trace"]["version"] == "agentic-reading-v2"
     assert clients[0][2].close_count == 1
 
 
@@ -555,13 +694,16 @@ def test_native_gpu_ask_searches_before_opening_the_generation_model(
             *,
             tokenizer_directory,
             gpu_temperature_limit_c,
+            candidates=None,
+            reranker_model_path=None,
         ):
             assert passed_store.database_path == store.database_path
             assert passed_document_id == document_id
             assert method == "hybrid"
             assert model_path.name == "Qwen3-Embedding-0.6B-f16.gguf"
             assert gpu_uuid == "GPU-12345678-1234-1234-1234-123456789abc"
-            assert gpu_temperature_limit_c == 80
+            assert gpu_temperature_limit_c == 88
+            assert candidates == 50
             assert tokenizer_directory == expected_tokenizer_directory
             assert tokenizer_directory.is_dir()
             assert clients == []
@@ -621,11 +763,19 @@ def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
 ):
     from contextlib import contextmanager
 
-    from page_cite_rag import agent, gpu_retrieval
+    from page_cite_rag import agent, application, gpu_retrieval
+    from page_cite_rag.reading_plan import ReadingNeed, ReadingPlan
     from page_cite_rag.retrieval import BM25Retriever
 
     store, document_id, _ = document
     build_bm25_index(store, document_id)
+    monkeypatch.setattr(
+        application,
+        "plan_document_question",
+        lambda *_args, **_kwargs: ReadingPlan(
+            requirements=(ReadingNeed(need="result", queries=("result",)),)
+        ),
+    )
     monkeypatch.setattr(
         cli,
         "_load_encoder",
@@ -645,6 +795,8 @@ def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
             *,
             tokenizer_directory,
             gpu_temperature_limit_c,
+            candidates=None,
+            reranker_model_path=None,
         ):
             assert passed_store.database_path == store.database_path
             assert passed_document_id == document_id
@@ -652,13 +804,15 @@ def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
             assert tokenizer_directory == expected_tokenizer_directory
             assert tokenizer_directory.is_dir()
             assert gpu_temperature_limit_c == 88
+            assert candidates == 50
             assert clients == []
             events.append("GPU search setup")
+            self.method = "hybrid"
             self.retriever = BM25Retriever(store, document_id)
 
         def search(self, query, *, top_k):
             events.append(f"GPU query: {query}")
-            return self.retriever.search(query, top_k=top_k)
+            return self.retriever.search(query, top_k=top_k).model_copy(update={"method": "hybrid"})
 
         @contextmanager
         def session(self):
@@ -674,12 +828,16 @@ def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
 
     def run_agent(workflow, question, language, result, blocks, _model, **kwargs):
         assert kwargs["delegated"] is False
+        _enable_exact_writer_budget(workflow)
         followup, _followup_blocks = workflow.search_sources("independent follow-up query")
         assert followup.query == "independent follow-up query"
         current = agent._admit(workflow, question, language, blocks, result.context_groups)
-        return agent.AgentRun(
+        return _fake_navigation_agent_run(
+            workflow,
             current,
-            {"model_calls_completed": 2, "tool_calls_recorded": 1},
+            model_calls=2,
+            tool_calls=1,
+            ledger=kwargs["shared_ledger"],
         )
 
     monkeypatch.setattr(gpu_retrieval, "StagedGpuSearch", FakeStagedGpuSearch)
@@ -717,12 +875,13 @@ def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
     assert cli.main(arguments) == 0
     output = json.loads(capsys.readouterr().out)
     assert output["answer"]["status"] == "answered"
-    assert output["agent_trace"]["model_calls_completed"] == 2
+    assert output["agent_trace"]["model_calls_completed"] == 3
     assert events == [
         "GPU search setup",
         "GPU session start",
-        "GPU query: significant",
         "generation startup",
+        "GPU query: significant",
+        "GPU query: result",
         "GPU query: independent follow-up query",
         "GPU session cleanup",
     ]

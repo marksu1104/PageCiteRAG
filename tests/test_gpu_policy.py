@@ -9,6 +9,11 @@ import page_cite_rag.embedding_server as embedding_server
 import page_cite_rag.llama as llama
 from page_cite_rag import cli
 from page_cite_rag.generation import ModelError
+from page_cite_rag.gpu_processes import (
+    MAX_GPU_MEMORY_MIB,
+    stable_gpu_headroom_window,
+    wait_for_gpu_dispatch,
+)
 from test_llama import make_client
 
 UUID = "GPU-" + "0" * 36
@@ -43,6 +48,91 @@ def health_sample(**change):
     }
 
 
+def stable_monitor_sample(sampled_at, **change):
+    return {
+        **health_sample(temperature_c=68),
+        "phase": "monitor",
+        "sampled_monotonic": sampled_at,
+        "process_state": {
+            "unexpected_pids": [],
+            "owned_service_exited": False,
+        },
+        **change,
+    }
+
+
+def test_stable_dispatch_window_requires_continuous_recent_safe_samples(monkeypatch):
+    now = 10.0
+    samples = [stable_monitor_sample(value) for value in (7.0, 8.0, 9.0, 10.0)]
+    monkeypatch.setattr("page_cite_rag.gpu_processes.time.monotonic", lambda: now)
+    checks = []
+
+    result = wait_for_gpu_dispatch(
+        lambda: checks.append(True) or health_sample(temperature_c=68),
+        lambda _seconds: pytest.fail("a verified recent safe window should not sleep"),
+        max_temperature_c=88,
+        recent_samples=lambda: samples,
+    )
+
+    assert len(checks) == 1
+    assert result["seconds"] == 0
+    assert result["reused_monitor_window"] is True
+    assert result["safe_sample_count"] == 4
+    assert result["dispatch_temperature_limit_c"] == 69
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"temperature_c": 70},
+        {"sw_thermal_slowdown": True},
+        {"process_state": {"unexpected_pids": [123], "owned_service_exited": False}},
+        {"sampled_monotonic": 6.0},
+    ],
+)
+def test_stable_dispatch_window_fails_closed(changes):
+    samples = [stable_monitor_sample(value) for value in (7.0, 8.0, 9.0, 10.0)]
+    samples[2].update(changes)
+
+    assert (
+        stable_gpu_headroom_window(
+            samples,
+            now=10.0,
+            max_temperature_c=88,
+        )
+        is None
+    )
+
+
+def test_dispatch_wait_uses_driver_headroom_and_records_wait(tmp_path, monkeypatch):
+    client = higher_client(tmp_path, monkeypatch)
+    temperatures = iter((80, 74, 69, 68))
+    monkeypatch.setattr(
+        client, "_gpu_snapshot", lambda: health_sample(temperature_c=next(temperatures))
+    )
+    elapsed = [0.0]
+    monkeypatch.setattr(llama.time, "monotonic", lambda: elapsed[0])
+
+    def wait(seconds):
+        elapsed[0] += seconds
+        return False
+
+    monkeypatch.setattr(client._stop, "wait", wait)
+    with client:
+        assert client.wait_for_gpu_headroom() == 3
+        record = client.diagnostics()["last_dispatch_wait"]
+        assert record["dispatch_temperature_limit_c"] == 69
+        assert record["observed_temperature_c"] == 68
+
+
+def test_dispatch_wait_does_not_wait_through_thermal_slowdown(tmp_path, monkeypatch):
+    client = higher_client(tmp_path, monkeypatch)
+    monkeypatch.setattr(client, "_gpu_snapshot", lambda: health_sample(sw_thermal_slowdown=True))
+    with pytest.raises(ModelError, match="thermal slowdown"):
+        client.wait_for_gpu_headroom()
+    assert client.diagnostics()["closed"] is True
+
+
 @pytest.mark.parametrize("value", [89, 93, 100, 39, True, 88.0, "88"])
 def test_temperature_policy_is_bounded_and_strict(value):
     with pytest.raises(ValidationError):
@@ -51,8 +141,17 @@ def test_temperature_policy_is_bounded_and_strict(value):
 
 def test_default_80_preserved_and_higher_cpu_rejected():
     assert llama.LlamaConfig().max_gpu_temperature_c == 80
+    assert llama.LlamaConfig().max_gpu_memory_mib == MAX_GPU_MEMORY_MIB == 24_000
+    assert (
+        llama.LlamaConfig(
+            device="cuda", gpu_uuid=UUID, max_gpu_memory_mib=24_000
+        ).max_gpu_memory_mib
+        == 24_000
+    )
     with pytest.raises(ValidationError):
         llama.LlamaConfig(max_gpu_temperature_c=88)
+    with pytest.raises(ValidationError):
+        llama.LlamaConfig(device="cuda", gpu_uuid=UUID, max_gpu_memory_mib=24_001)
 
 
 @pytest.mark.parametrize("temp", [81, 84, 88])
@@ -72,7 +171,7 @@ def test_normal_temperatures_allowed_and_telemetry_kept(tmp_path, monkeypatch, t
     "change",
     [
         {"temperature_c": 89},
-        {"memory_mib": 12001},
+        {"memory_mib": 24001},
         {"pids": [999]},
         {"hw_thermal_slowdown": True},
         {"sw_thermal_slowdown": True},
@@ -149,7 +248,7 @@ def test_monitor_timeout_is_not_ignored(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     ("telemetry", "category"),
     [
-        ("12001,40,Not Active,Not Active", "gpu_memory_limit"),
+        ("24001,40,Not Active,Not Active", "gpu_memory_limit"),
         ("6000,89,Not Active,Not Active", "gpu_temperature_limit"),
         ("6000,40,Active,Not Active", "gpu_thermal_slowdown"),
     ],

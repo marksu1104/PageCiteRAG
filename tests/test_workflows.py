@@ -96,7 +96,7 @@ class FakeModel:
         budget = check_budget(messages, response_model.model_json_schema(), self.config)
         if self.change_budget:
             budget = self.change_budget(budget)
-        return GenerationResult(draft, stats(), budget)
+        return GenerationResult(draft, stats(), budget, draft.model_dump_json())
 
     def close(self):
         self.closed = True
@@ -133,7 +133,7 @@ def test_local_answer_rereads_source_and_reuses_dependencies(setup, monkeypatch)
 
     monkeypatch.setattr(store, "get_block", read)
     for question in ("What are the conditions?", "Were children included?"):
-        result = workflow.ask(question)
+        result = workflow.ask(question, language="en")
         assert result.status == "answered"
         assert result.answer == "\n\n".join(claim.text for claim in result.claims)
         assert "not significant unless n > 64" in result.answer
@@ -185,14 +185,36 @@ def test_shared_read_only_search_and_source_methods_keep_formal_scope(setup):
 
 @pytest.mark.parametrize(
     "language,expected",
-    [("en", "English"), ("zh-Hant", "Traditional Chinese"), ("auto", "language of the question")],
+    [("en", "English"), ("zh-Hant", "Traditional Chinese"), ("auto", "English")],
 )
 def test_answer_language_does_not_translate_source_quotes(setup, language, expected):
     _, _, blocks, _, model, workflow = setup
     result = workflow.ask("What happened?", language=language)
     assert expected in model.calls[0][0][0].content
-    assert result.language == language
+    assert result.language == ("en" if language == "auto" else language)
     assert result.claims[0].citations[0].quote == blocks[0].text
+
+
+def test_auto_answer_language_uses_traditional_chinese_for_chinese_questions(setup):
+    from page_cite_rag.workflows import resolve_answer_language
+
+    _, _, blocks, _, model, workflow = setup
+    assert resolve_answer_language("What happened?", "auto") == "en"
+    assert resolve_answer_language("為什麼結果不顯著？", "auto") == "zh-Hant"
+    assert resolve_answer_language("为什么结果不显著？", "auto") == "zh-Hant"
+    assert resolve_answer_language("なぜ結果が有意でない？", "auto") == "en"
+
+    result = workflow.ask("為什麼結果不顯著？", language="auto")
+    assert result.language == "zh-Hant"
+    assert "in Traditional Chinese" in model.calls[0][0][0].content
+    assert result.claims[0].citations[0].quote == blocks[0].text
+
+
+def test_traditional_formatting_preserves_domain_terms_without_localizing_them():
+    from page_cite_rag.workflows import _format_output_text
+
+    assert _format_output_text("八路军冀东军分区", "zh-Hant") == "八路軍冀東軍分區"
+    assert _format_output_text("八路军冀东军分区", "en") == "八路军冀东军分区"
 
 
 def test_context_uses_full_original_blocks_and_exact_schema_budget(setup):
@@ -225,7 +247,7 @@ def test_model_insufficient_evidence_does_not_return_unverified_prose(setup):
     model.make_draft = lambda payload: AnswerDraft(
         status="insufficient_evidence", limitations=("The requested population is not stated.",)
     )
-    result = workflow.ask("What about infants?")
+    result = workflow.ask("What about infants?", language="en")
     assert result.stop_reason == "model_insufficient_evidence"
     assert result.claims == ()
     assert result.answer == "The supplied document evidence is insufficient to answer reliably."
@@ -247,7 +269,7 @@ def limited_workflow(setup, *, question="What happened?", slack=0, config=None):
 def test_all_blocks_over_budget_is_visible_and_does_not_generate(setup):
     _, _, blocks, _, _, _ = setup
     workflow, model = limited_workflow(setup)
-    result = workflow.ask("What happened?")
+    result = workflow.ask("What happened?", language="en")
     assert result.stop_reason == "context_budget_exhausted"
     assert result.included_block_ids == ()
     assert result.omitted_block_ids == tuple(block.block_id for block in blocks)
@@ -264,7 +286,7 @@ def test_budget_admits_whole_blocks_and_reports_omitted_candidates(setup):
     workflow, model = limited_workflow(
         setup, slack=first.input_upper_estimate - base.input_upper_estimate
     )
-    result = workflow.ask(question)
+    result = workflow.ask(question, language="en")
     assert result.included_block_ids == (blocks[0].block_id,)
     assert result.omitted_block_ids == tuple(block.block_id for block in blocks[1:])
     assert json.loads(model.calls[0][0][1].content)["evidence"][0]["text"] == blocks[0].text
@@ -282,7 +304,7 @@ def test_overlong_first_block_does_not_prevent_later_small_block_admission(setup
     )
     # Use a longer first block without corrupting source identity.
     assert len(blocks[0].text) > len(blocks[2].text)
-    result = workflow.ask(question)
+    result = workflow.ask(question, language="en")
     assert result.included_block_ids == (blocks[2].block_id,)
     assert result.omitted_block_ids == (blocks[0].block_id,)
     assert len(model.calls) == 1
@@ -330,7 +352,7 @@ def test_invalid_retrieval_results_fail_closed_before_generation(setup, mutation
 
     retriever.change = change
     with pytest.raises(WorkflowError) as error:
-        workflow.ask("What happened?")
+        workflow.ask("What happened?", language="en")
     assert "PRIVATE_CANARY" not in str(error.value)
     assert model.calls == []
 
@@ -345,7 +367,7 @@ def test_source_unit_corruption_is_rejected_before_generation(setup, monkeypatch
 
     monkeypatch.setattr(store, "get_unit", corrupted)
     with pytest.raises(WorkflowError, match="original parsed unit"):
-        workflow.ask("What happened?")
+        workflow.ask("What happened?", language="en")
     assert model.calls == []
 
 
@@ -381,6 +403,10 @@ def test_invalid_generated_citations_never_return_answer(setup, mutation):
     assert "PRIVATE_CANARY" not in str(error.value)
     assert isinstance(error.value, CitationOutputError)
     assert error.value.reason_code in ("inexact_quote", "unprovided_block", "ambiguous_quote")
+    assert error.value.accounting.prompt_eval_count == 100
+    assert error.value.accounting.eval_count == 30
+    assert error.value.validation_errors[0]["stage"] == "citation_validation"
+    assert json.loads(error.value.raw_model_output)["status"] == "answered"
     assert len(model.calls) == 1
 
 
@@ -397,7 +423,7 @@ def test_citations_cannot_target_a_budget_omitted_block(setup):
         ),
     )
     with pytest.raises(WorkflowError, match="provenance") as error:
-        workflow.ask("What happened?")
+        workflow.ask("What happened?", language="en")
     assert isinstance(error.value, CitationOutputError)
     assert error.value.reason_code == "unprovided_block"
     assert blocks[2].block_id not in [
@@ -469,7 +495,7 @@ def test_malformed_generation_result_fails_safely(setup, monkeypatch, invalid):
 @pytest.mark.parametrize(
     "changed",
     [
-        {"eval_count": 2049},
+        {"eval_count": 3073},
         {"prompt_eval_count": 16384},
         {"eval_count": -1},
         {"done_reason": "length"},
@@ -544,7 +570,7 @@ def test_explain_requested_block_cannot_be_omitted_for_smaller_neighbor(setup):
     model = FakeModel(budget)
     workflow = AnswerWorkflow(store, document_id, None, model, budget)
     with pytest.raises(ContextBudgetError, match="requested explanation block"):
-        workflow.explain(blocks[0].block_id, question=question)
+        workflow.explain(blocks[0].block_id, question=question, language="en")
     assert model.calls == []
 
 
@@ -622,7 +648,7 @@ def test_invalid_languages_fail_without_retrieval_or_generation(setup, language)
     "config",
     [
         {"top_k": 0},
-        {"top_k": 21},
+        {"top_k": 101},
         {"top_k": True},
         {"neighbor_blocks": 3},
         {"max_question_chars": 0},

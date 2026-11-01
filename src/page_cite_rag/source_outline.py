@@ -57,21 +57,35 @@ class SourceOutline(BaseModel):
 
 
 def outline_from_qasper(
-    paper: Paper, document: DocumentMetadata, blocks: list[Block]
+    paper: Paper,
+    document: DocumentMetadata,
+    blocks: list[Block],
+    *,
+    block_to_passage: dict[str, str] | None = None,
 ) -> SourceOutline | None:
     """Preserve supplied QASPER section indices, names and paragraph order."""
     if not blocks:
         return None
     if not paper.section_names:
         return None
-    if len(blocks) != len(paper.passages):
+    if block_to_passage is None and len(blocks) != len(paper.passages):
         raise ValueError("QASPER sections do not match stored passages")
+    passages = {passage.passage_id: passage for passage in paper.passages}
     groups: list[tuple[int, int, int]] = []
-    for ordinal, (passage, block) in enumerate(zip(paper.passages, blocks, strict=True), 1):
+    for ordinal, block in enumerate(blocks, 1):
+        passage = (
+            passages[block_to_passage[block.block_id]]
+            if block_to_passage is not None
+            else paper.passages[ordinal - 1]
+        )
         if (
             block.document_id != document.document_id
             or block.ordinal != ordinal
-            or block.text != passage.text
+            or (
+                block.text not in passage.text
+                if block_to_passage is not None
+                else block.text != passage.text
+            )
             or block.unit_index != 1
             or not 0 <= passage.section_index < len(paper.section_names)
         ):

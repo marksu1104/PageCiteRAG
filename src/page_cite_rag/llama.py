@@ -12,12 +12,11 @@ import secrets
 import signal
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal, Sequence, overload
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -36,11 +35,17 @@ from page_cite_rag.generation import (
     check_budget,
 )
 from page_cite_rag.gpu_processes import (
+    GPU_DISPATCH_HEADROOM_C,
+    MAX_GPU_MEMORY_MIB,
+    GpuDispatchCancelled,
+    GpuDispatchTimeout,
     gpu_process_lifecycle,
     register_owned_gpu_process,
     snapshot_gpu_processes,
     unregister_owned_gpu_process,
+    wait_for_gpu_dispatch,
 )
+from page_cite_rag.owned_process import launch_owned_llama_process
 
 LLAMA_COMMIT = "7fe450e19305b828c199d602c23a8337aaa1f03b"
 LLAMA_VERSION = "0.5.0"
@@ -56,6 +61,39 @@ DIAGNOSTIC_LOG_BYTES = 8192
 EXACT_BUDGET_VERSION = "llama-rendered-token-count-plus-template-reserve-12k/v3"
 MAX_EXACT_INPUT_TOKENS = 12_000
 PROMPT_VERSION = "qwen35/nonthinking/merged-first-system/v2"
+THINKING_PROMPT_VERSION = "qwen35/native-chat-reasoning/final-json/v1"
+
+
+def model_spec(model_size: Literal["9b", "4b", "27b"] = "9b") -> dict:
+    """Explicitly pinned candidates, never an identity supplied by a manifest."""
+    if model_size == "9b":
+        return dict(
+            repo=MODEL_REPO,
+            revision=MODEL_REVISION,
+            file=MODEL_FILE,
+            bytes=MODEL_BYTES,
+            sha256=MODEL_SHA256,
+            layers=32,
+        )
+    if model_size == "4b":
+        return {
+            "repo": "unsloth/Qwen3.5-4B-GGUF",
+            "revision": "e87f176479d0855a907a41277aca2f8ee7a09523",
+            "file": "Qwen3.5-4B-Q4_K_M.gguf",
+            "bytes": 2740937888,
+            "sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+            "layers": 32,
+        }
+    if model_size == "27b":
+        return {
+            "repo": "unsloth/Qwen3.5-27B-GGUF",
+            "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a",
+            "file": "Qwen3.5-27B-Q4_K_M.gguf",
+            "bytes": 16740812704,
+            "sha256": "84b5f7f112156d63836a01a69dc3f11a6ba63b10a23b8ca7a7efaf52d5a2d806",
+            "layers": 64,
+        }
+    raise ValueError("unsupported pinned model size")
 
 
 def sha256(path: Path) -> str:
@@ -63,8 +101,9 @@ def sha256(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def verify_bundle(directory: Path) -> dict:
+def verify_bundle(directory: Path, model_size: Literal["9b", "4b", "27b"] = "9b") -> dict:
     """Offline integrity check, not authentication of someone else's manifest."""
+    spec = model_spec(model_size)
     try:
         if directory.is_symlink() or not directory.is_dir():
             raise ValueError("missing bundle")
@@ -76,12 +115,12 @@ def verify_bundle(directory: Path) -> dict:
             value["format"] != 1
             or value["llama_commit"] != LLAMA_COMMIT
             or value["llama_version"] != LLAMA_VERSION
-            or value["model_revision"] != MODEL_REVISION
-            or value["model_sha256"] != MODEL_SHA256
+            or value["model_revision"] != spec["revision"]
+            or value["model_sha256"] != spec["sha256"]
         ):
             raise ValueError("identity mismatch")
         hashes = value["files"]
-        if not isinstance(hashes, dict) or not {MODEL_FILE, "bin/llama-server"} <= hashes.keys():
+        if not isinstance(hashes, dict) or not {spec["file"], "bin/llama-server"} <= hashes.keys():
             raise ValueError("missing required files")
         actual = {str(p.relative_to(directory)) for p in directory.rglob("*") if p.is_file()}
         if actual != set(hashes) | {"manifest.json"}:
@@ -96,8 +135,8 @@ def verify_bundle(directory: Path) -> dict:
                 or sha256(path) != expected
             ):
                 raise ValueError("checksum or path mismatch")
-        model = directory / MODEL_FILE
-        if model.stat().st_size != MODEL_BYTES or hashes[MODEL_FILE] != MODEL_SHA256:
+        model = directory / spec["file"]
+        if model.stat().st_size != spec["bytes"] or hashes[spec["file"]] != spec["sha256"]:
             raise ValueError("model changed")
         return value
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -108,20 +147,31 @@ class LlamaConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     bundle_dir: Path = DEFAULT_BUNDLE
+    model_size: Literal["9b", "4b", "27b"] = "9b"
+    thinking: bool = False
+    reasoning_budget_tokens: int | None = Field(default=None, ge=1, le=6144)
     device: Literal["cpu", "cuda"] = "cpu"  # Explicit opt-in; never auto fallback.
     gpu_uuid: str | None = Field(default=None, pattern=r"^GPU-[0-9a-fA-F-]{36}$")
     num_ctx: int = Field(default=16384, ge=2048, le=16384)
-    num_predict: int = Field(default=1024, ge=1, le=2048)
+    num_predict: int = Field(default=1024, ge=1, le=8192)
     template_reserve: int = Field(default=1024, ge=256, le=4096)
     num_thread: int = Field(default=2, ge=1, le=6)
-    timeout_seconds: float = Field(default=120.0, gt=0, le=120, allow_inf_nan=False)
+    timeout_seconds: float = Field(default=600.0, gt=0, le=600, allow_inf_nan=False)
     startup_seconds: float = Field(default=60.0, gt=0, le=90, allow_inf_nan=False)
-    max_gpu_memory_mib: int = Field(default=12000, ge=1024, le=12000)
+    max_gpu_memory_mib: int = Field(default=MAX_GPU_MEMORY_MIB, ge=1024, le=MAX_GPU_MEMORY_MIB)
     # Higher limits require explicit CUDA opt-in and verified driver thresholds.
     max_gpu_temperature_c: int = Field(default=80, ge=40, le=88)
 
     @model_validator(mode="after")
     def validate_controls(self) -> LlamaConfig:
+        if not self.thinking and (
+            self.num_predict > 3072 or self.reasoning_budget_tokens is not None
+        ):
+            raise ValueError("non-thinking output is limited to 3072 tokens")
+        if self.thinking and (
+            self.reasoning_budget_tokens is None or self.reasoning_budget_tokens >= self.num_predict
+        ):
+            raise ValueError("thinking requires a bounded reasoning budget below total output")
         if self.num_predict + self.template_reserve >= self.num_ctx:
             raise ValueError("context must reserve input space")
         if (self.device == "cuda") != (self.gpu_uuid is not None):
@@ -131,7 +181,12 @@ class LlamaConfig(BaseModel):
         return self
 
 
-def render_prompt(messages: Sequence[ChatMessage], schema: dict) -> str:
+def render_prompt(
+    messages: Sequence[ChatMessage],
+    schema: dict | None,
+    *,
+    include_schema_in_prompt: bool = True,
+) -> str:
     """Pinned Qwen text-only non-thinking format, checked against /apply-template.
 
     The model permits a system turn only at the beginning. Merge the schema
@@ -142,12 +197,16 @@ def render_prompt(messages: Sequence[ChatMessage], schema: dict) -> str:
         raise ModelError("reserved chat-token delimiters in input; no silent text rewriting")
     if any(message.role == "system" for message in messages[1:]):
         raise ModelError("system message must be first; no silent message reordering")
-    prompt = "<|im_start|>system\nReturn only JSON matching this schema:\n"
-    prompt += json.dumps(schema, ensure_ascii=False)
-    if messages and messages[0].role == "system":
-        prompt += "\n\n" + messages[0].content
-        messages = messages[1:]
-    prompt += "<|im_end|>\n"
+    if type(include_schema_in_prompt) is not bool:
+        raise ValueError("schema prompt inclusion must be boolean")
+    prompt = ""
+    if schema is not None and include_schema_in_prompt:
+        prompt = "<|im_start|>system\nReturn only JSON matching this schema:\n"
+        prompt += json.dumps(schema, ensure_ascii=False)
+        if messages and messages[0].role == "system":
+            prompt += "\n\n" + messages[0].content
+            messages = messages[1:]
+        prompt += "<|im_end|>\n"
     for message in messages:
         prompt += f"<|im_start|>{message.role}\n{message.content}<|im_end|>\n"
     return prompt + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -167,22 +226,25 @@ class LlamaModelClient:
         transport=None,
         budget_policy="conservative",
         recover_output_errors=False,
-        sampling_profile: Literal["greedy", "qwen-general"] = "greedy",
+        sampling_profile: Literal["greedy", "qwen-general", "longbench-official"] = "greedy",
         sampling_seed: int = 42,
     ) -> None:
         if budget_policy not in ("conservative", "exact"):
             raise ValueError("budget policy must be conservative or exact")
         if type(recover_output_errors) is not bool:
             raise ValueError("output recovery must be an explicit boolean")
-        if sampling_profile not in ("greedy", "qwen-general"):
+        if sampling_profile not in ("greedy", "qwen-general", "longbench-official"):
             raise ValueError("unsupported sampling profile")
         if type(sampling_seed) is not int or not 0 <= sampling_seed <= 2_147_483_647:
             raise ValueError("sampling seed must be a nonnegative 32-bit integer")
+        if config.thinking and budget_policy != "exact":
+            raise ValueError("thinking requires exact native chat-template accounting")
         self._sampling_profile = sampling_profile
         self._sampling_seed = sampling_seed
         self._recover_output_errors = recover_output_errors
         self._budget_policy = budget_policy
         self._token_cache = None  # One prompt hash + token sequence, never persisted.
+        self._completion_trace = None
         self.config = config
         self._closed = False
         self._process = None
@@ -213,9 +275,15 @@ class LlamaModelClient:
         self._guard_error = None
         self._monitor_samples = []
         self._generation_deadline = None
+        self._request_deadline: float | None = None
         self._gpu_temperature_limits = None
         try:
-            manifest = verify_bundle(config.bundle_dir)
+            self._model_spec = model_spec(config.model_size)
+            manifest = (
+                verify_bundle(config.bundle_dir)
+                if config.model_size == "9b"
+                else verify_bundle(config.bundle_dir, config.model_size)
+            )
             self._bundle = config.bundle_dir.resolve()
             self._fingerprints = self._file_state(manifest)
             self._start(transport=transport)
@@ -224,11 +292,11 @@ class LlamaModelClient:
                 "backend": "llama-cpp-owned-server",
                 "config": config.model_dump(mode="json"),
                 "llama_commit": LLAMA_COMMIT,
-                "model_sha256": MODEL_SHA256,
-                "model_revision": MODEL_REVISION,
+                "model_sha256": self._model_spec["sha256"],
+                "model_revision": self._model_spec["revision"],
                 "runtime_files": manifest["files"],
-                "prompt_version": PROMPT_VERSION,
-                "thinking": False,
+                "prompt_version": THINKING_PROMPT_VERSION if config.thinking else PROMPT_VERSION,
+                "thinking": config.thinking,
                 **(
                     {"sampling_profile": sampling_profile, "sampling_seed": sampling_seed}
                     if sampling_profile != "greedy" or sampling_seed != 42
@@ -242,8 +310,10 @@ class LlamaModelClient:
                     else {}
                 ),
             }
-        except BaseException:
+        except BaseException as error:
             self.close()
+            if isinstance(error, ModelError):
+                error.diagnostics = self.diagnostics(include_log=True)
             raise
 
     def _file_state(self, manifest: dict) -> dict:
@@ -436,7 +506,7 @@ class LlamaModelClient:
         argv = [
             str(binary),
             "-m",
-            str(self._bundle / MODEL_FILE),
+            str(self._bundle / self._model_spec["file"]),
             "--alias",
             "page-cite-rag-qwen35",
             "--host",
@@ -482,20 +552,11 @@ class LlamaModelClient:
         log_path.touch(mode=0o600)
         self._log = log_path.open("w+b")
         with gpu_process_lifecycle():
-            self._process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-I",
-                    "-m",
-                    "page_cite_rag.llama_process",
-                    str(os.getpid()),
-                    *argv,
-                ],
+            self._process = launch_owned_llama_process(
+                argv,
                 env=env,
                 cwd=temporary,
                 stdout=self._log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
             )
             register_owned_gpu_process(self._process)
         self._capture_process_status()
@@ -525,11 +586,16 @@ class LlamaModelClient:
         if self.config.device == "cuda":
             self._log.flush()
             log = (temporary / "server.log").read_text(errors="replace")
-            if "offloaded 33/33 layers to GPU" not in log:
-                raise ModelError("requested full GPU offload was not confirmed")
+            self._verify_gpu_offload(log)
         props = self._request("/props")
         if props.get("default_generation_settings", {}).get("n_ctx") != self.config.num_ctx:
             raise ModelError("resident server context differs from the explicit configuration")
+
+    def _verify_gpu_offload(self, log: str) -> None:
+        # llama.cpp counts the output layer in addition to the pinned transformer blocks.
+        expected = self._model_spec["layers"] + 1
+        if f"offloaded {expected}/{expected} layers to GPU" not in log:
+            raise ModelError("requested full GPU offload was not confirmed")
 
     def openai_compatible_credentials(self) -> tuple[str, str]:
         """Expose only this owned loopback server to an optional local agent adapter."""
@@ -569,6 +635,8 @@ class LlamaModelClient:
                     "/props",
                     "/tokenize",
                     "/completion",
+                    "/apply-template",
+                    "/v1/chat/completions",
                     "/v1/chat/completions/input_tokens",
                 }
                 else "other",
@@ -584,6 +652,8 @@ class LlamaModelClient:
         budget = (
             min(2.0, self.config.timeout_seconds) if allow_loading else self.config.timeout_seconds
         )
+        if self._request_deadline is not None:
+            budget = min(budget, self._request_deadline - start)
         if self._generation_deadline is not None:
             budget = min(budget, self._generation_deadline - start)
         if budget <= 0:
@@ -649,6 +719,10 @@ class LlamaModelClient:
             raise ModelTimeoutError("local llama generation exceeded its time budget")
         if path == "/completion" and isinstance(value, dict):
             self._record_completion(value)
+        elif path == "/v1/chat/completions" and isinstance(value, dict):
+            if isinstance(value.get("__verbose"), dict):
+                self._record_completion(value["__verbose"])
+            self._completion_trace = copy.deepcopy(value)
         if not isinstance(value, dict) or "error" in value:
             self._record_request_error("invalid_response")
             raise ModelError("local llama returned an invalid response")
@@ -658,6 +732,22 @@ class LlamaModelClient:
             self._record_request_error("gpu_guard" if self._guard_error else "server_exited")
             raise
         return value
+
+    def set_request_deadline(self, deadline: float) -> None:
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError("request deadline must be a finite monotonic timestamp")
+        self._request_deadline = float(deadline)
+
+    def clear_request_deadline(self) -> None:
+        self._request_deadline = None
+
+    def remaining_request_timeout_seconds(self) -> float:
+        if self._request_deadline is None:
+            return self.config.timeout_seconds
+        remaining = self._request_deadline - time.monotonic()
+        if remaining <= 0:
+            raise ModelTimeoutError("local request exceeded its total deadline")
+        return min(self.config.timeout_seconds, remaining)
 
     def _tokenized_prompt(self, prompt):
         self._ensure_running()
@@ -695,24 +785,145 @@ class LlamaModelClient:
         )
         return min(MAX_EXACT_INPUT_TOKENS, context_capacity)
 
-    def prepare_budget(self, messages, schema) -> PromptBudget:
+    def _chat_payload(self, messages, schema, *, include_schema_in_prompt=True) -> dict:
+        # Reuse the exact existing system/schema instruction. The native template
+        # and parser, not string splitting, handle thinking and the final schema.
+        render_prompt(
+            messages, schema, include_schema_in_prompt=include_schema_in_prompt
+        )  # Validate the same text-only contract.
+        turns = [message.model_dump() for message in messages]
+        if schema is not None and include_schema_in_prompt:
+            instruction = "Return only JSON matching this schema:\n" + json.dumps(
+                schema, ensure_ascii=False
+            )
+            if turns and turns[0]["role"] == "system":
+                instruction += "\n\n" + turns.pop(0)["content"]
+            turns.insert(0, {"role": "system", "content": instruction})
+        return {
+            "model": "page-cite-rag-qwen35",
+            "messages": turns,
+            "chat_template_kwargs": {"enable_thinking": True},
+            "reasoning_format": "deepseek",
+            "reasoning_budget_tokens": self.config.reasoning_budget_tokens,
+            "max_tokens": self.config.num_predict,
+            "stream": False,
+            "cache_prompt": True,
+            "n_keep": -1,
+            "verbose": True,
+            **(
+                {
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "answer", "strict": True, "schema": schema},
+                    }
+                }
+                if schema is not None
+                else {}
+            ),
+        }
+
+    def _render_input(self, messages, schema, *, include_schema_in_prompt=True) -> str:
+        if not self.config.thinking:
+            return render_prompt(
+                messages, schema, include_schema_in_prompt=include_schema_in_prompt
+            )
+        try:
+            payload = self._chat_payload(
+                messages, schema, include_schema_in_prompt=include_schema_in_prompt
+            )
+            prompt = self._request("/apply-template", payload).get("prompt")
+            if not isinstance(prompt, str) or not prompt.endswith("<think>\n"):
+                raise ModelError("native template did not enable the pinned Qwen reasoning prefix")
+            tokens = self._tokenized_prompt(prompt)
+            if self.count_chat_input_tokens(payload) != len(tokens):
+                raise ContextBudgetError("native chat and rendered input-token counts disagree")
+            return prompt
+        except BaseException:
+            self.close()
+            raise
+
+    def completion_trace(self) -> dict | None:
+        """Explicit local-only raw chat evidence, including reasoning and failed finals.
+
+        General diagnostics deliberately omit document/answer text. Callers must
+        store this separately in their private result directory, never public logs.
+        """
+        return copy.deepcopy(self._completion_trace)
+
+    def _normalize_chat_response(self, response: dict, schema: dict | None) -> dict:
+        """Check native metadata before feeding the shared completion validator."""
+        try:
+            native = response["__verbose"]
+            usage = response["usage"]
+            choices = response["choices"]
+            if not isinstance(native, dict) or not isinstance(usage, dict) or len(choices) != 1:
+                raise ValueError
+            choice = choices[0]
+            message = choice["message"]
+            if (
+                response["model"] != native["model"]
+                or choice.get("index") != 0
+                or message.get("role") != "assistant"
+                or message.get("tool_calls")
+                or type(message.get("reasoning_content", "")) is not str
+                or (
+                    choice["finish_reason"] == "stop"
+                    and not message.get("reasoning_content", "").strip()
+                )
+                or choice["finish_reason"] not in ("stop", "length")
+                or (choice["finish_reason"] == "length") != (native["stop_type"] == "limit")
+                or (choice["finish_reason"] == "stop" and native["stop_type"] != "eos")
+                or type(usage["prompt_tokens"]) is not int
+                or type(usage["completion_tokens"]) is not int
+                or usage["prompt_tokens"] != native["tokens_evaluated"]
+                or usage["completion_tokens"] != native["tokens_predicted"]
+                or type(usage["total_tokens"]) is not int
+                or usage["total_tokens"] != usage["prompt_tokens"] + usage["completion_tokens"]
+                or type(native["content"]) is not str
+                or native["generation_settings"].get("reasoning_format") != "deepseek"
+                or native["generation_settings"].get("reasoning_in_content") is not False
+                or not native["generation_settings"]
+                .get("generation_prompt", "")
+                .endswith("<think>\n")
+                or (schema is not None and not native["generation_settings"].get("grammar"))
+            ):
+                raise ValueError
+            content = message.get("content")
+            if content is None and choice["finish_reason"] == "length":
+                content = ""
+            if type(content) is not str:
+                raise ValueError
+            return {**native, "content": content}
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise StructuredOutputError("native chat response metadata is invalid") from None
+
+    def prepare_budget(
+        self, messages, schema, *, include_schema_in_prompt: bool = True
+    ) -> PromptBudget:
         """Count the actual pinned rendered prompt; no completion/model reload.
 
         The optional exact mode also retains the configured template margin as
         extra headroom. Tokenizer/identity failure never degrades to estimation.
         """
         self._ensure_running()
+        if type(include_schema_in_prompt) is not bool:
+            raise ValueError("schema prompt inclusion must be boolean")
         if self._budget_policy == "conservative":
-            return check_budget(messages, schema, self.config)
+            if not include_schema_in_prompt:
+                schema = None
+            return check_budget(messages, schema if schema is not None else {}, self.config)
         if not messages or any(not isinstance(m, ChatMessage) for m in messages):
             raise ValueError("nonempty validated ChatMessage sequence required")
-        prompt = render_prompt(messages, schema)
-        if len(prompt.encode("utf-8")) > 1_000_000:
-            raise ContextBudgetError("input exceeds the tokenizer request size limit")
         prior_deadline = self._generation_deadline
         self._generation_deadline = prior_deadline or time.monotonic() + self.config.timeout_seconds
         input_overflow = False
         try:
+            prompt = self._render_input(
+                messages, schema, include_schema_in_prompt=include_schema_in_prompt
+            )
+            if len(prompt.encode("utf-8")) > 1_000_000:
+                input_overflow = True
+                raise ContextBudgetError("input exceeds the tokenizer request size limit")
             tokens = self._tokenized_prompt(prompt)
             if len(tokens) > self._max_input_tokens():
                 input_overflow = True
@@ -739,22 +950,54 @@ class LlamaModelClient:
         finally:
             self._generation_deadline = prior_deadline
 
+    @overload
     def generate(
-        self, messages: Sequence[ChatMessage], response_model: type[T]
-    ) -> GenerationResult[T]:
+        self,
+        messages: Sequence[ChatMessage],
+        response_model: type[T],
+        *,
+        include_schema_in_prompt: bool = True,
+    ) -> GenerationResult[T]: ...
+
+    @overload
+    def generate(
+        self,
+        messages: Sequence[ChatMessage],
+        response_model: None,
+        *,
+        include_schema_in_prompt: bool = True,
+    ) -> GenerationResult[str]: ...
+
+    def generate(
+        self,
+        messages: Sequence[ChatMessage],
+        response_model: type[T] | None,
+        *,
+        include_schema_in_prompt: bool = True,
+    ) -> GenerationResult[T] | GenerationResult[str]:
+        """Generate structured output, or explicit plain text with the same safety checks."""
         with self._diagnostic_lock:
             self._diagnostic["last_completion"] = None
+        self._completion_trace = None
         self._ensure_running()
         messages = tuple(messages)
-        schema = response_model.model_json_schema()
-        budget = self.prepare_budget(messages, schema)
-        prompt = render_prompt(messages, schema)
+        schema = response_model.model_json_schema() if response_model is not None else None
+        budget = self.prepare_budget(
+            messages, schema, include_schema_in_prompt=include_schema_in_prompt
+        )
+        self.wait_for_gpu_headroom()
         recoverable_budget_rejection = False
-        self._generation_deadline = time.monotonic() + self.config.timeout_seconds
+        self._generation_deadline = min(
+            time.monotonic() + self.config.timeout_seconds,
+            self._request_deadline or float("inf"),
+        )
         # Metadata guards avoid rehashing 5.7 GB for every request. They are not
         # protection against deliberate same-size/timestamp tampering by the owner.
         try:
             start = time.perf_counter()
+            prompt = self._render_input(
+                messages, schema, include_schema_in_prompt=include_schema_in_prompt
+            )
             tokens = self._tokenized_prompt(prompt)
             if (
                 len(tokens) > self._max_input_tokens()
@@ -770,24 +1013,42 @@ class LlamaModelClient:
             }
             if self._sampling_profile == "qwen-general":
                 sampling.update(
-                    temperature=0.7,
-                    top_p=0.8,
+                    temperature=1.0 if self.config.thinking else 0.7,
+                    top_p=0.95 if self.config.thinking else 0.8,
                     top_k=20,
                     min_p=0.0,
                     presence_penalty=1.5,
                 )
-            response = self._request(
-                "/completion",
-                {
-                    "prompt": tokens,
-                    "json_schema": schema,
-                    "n_predict": self.config.num_predict,
-                    "stream": False,
-                    "cache_prompt": True,
-                    **sampling,
-                    "n_keep": -1,
-                },
-            )
+            elif self._sampling_profile == "longbench-official":
+                sampling["temperature"] = 0.1
+            if self.config.thinking:
+                chat = self._request(
+                    "/v1/chat/completions",
+                    {
+                        **self._chat_payload(
+                            messages,
+                            schema,
+                            include_schema_in_prompt=include_schema_in_prompt,
+                        ),
+                        **sampling,
+                    },
+                )
+                response = self._normalize_chat_response(chat, schema)
+                raw_model_output = chat["__verbose"]["content"]
+            else:
+                response = self._request(
+                    "/completion",
+                    {
+                        "prompt": tokens,
+                        **({"json_schema": schema} if schema is not None else {}),
+                        "n_predict": self.config.num_predict,
+                        "stream": False,
+                        "cache_prompt": True,
+                        **sampling,
+                        "n_keep": -1,
+                    },
+                )
+                raw_model_output = response.get("content")
             if response.get("truncated") is not False:
                 raise ContextBudgetError("server reported missing/true truncation status")
             if (
@@ -802,7 +1063,7 @@ class LlamaModelClient:
                 or settings.get("n_predict") != self.config.num_predict
             ):
                 raise ContextBudgetError("server generation limit differs from configuration")
-            if self._sampling_profile == "qwen-general":
+            if self._sampling_profile in ("qwen-general", "longbench-official"):
                 for key, expected in sampling.items():
                     observed = settings.get(key)
                     if (
@@ -847,6 +1108,8 @@ class LlamaModelClient:
                 if stats.eval_count != self.config.num_predict:
                     raise StructuredOutputError("llama output-limit accounting is inconsistent")
                 reason = "output_limit"
+            elif response_model is None:
+                value = response["content"]
             else:
                 try:
                     value = response_model.model_validate_json(response["content"], strict=True)
@@ -876,10 +1139,10 @@ class LlamaModelClient:
                         elapsed_ms=stats.elapsed_ms,
                         stop_type=response["stop_type"],
                     ),
-                    raw_model_output=response["content"],
+                    raw_model_output=raw_model_output,
                     validation_errors=validation_errors,
                 )
-            return GenerationResult(value, stats, budget)
+            return GenerationResult(value, stats, budget, response["content"])
         except ContextBudgetError:
             # Pre-generation budget failures are recoverable; truncated responses aren't.
             if not recoverable_budget_rejection:
@@ -919,8 +1182,10 @@ class LlamaModelClient:
     ) -> None:
         """Telemetry must not change the result of the existing GPU safeguard."""
         try:
+            sampled_monotonic = time.monotonic()
             recorded = {
-                "elapsed_seconds": max(0.0, time.monotonic() - self._diagnostic_started),
+                "elapsed_seconds": max(0.0, sampled_monotonic - self._diagnostic_started),
+                "sampled_monotonic": sampled_monotonic,
                 "phase": phase,
                 "memory_mib": self._diagnostic_number(sample.get("memory_mib")),
                 "temperature_c": self._diagnostic_number(sample.get("temperature_c")),
@@ -1074,6 +1339,54 @@ class LlamaModelClient:
                 self._server_log_tail = tail
         except Exception:
             pass
+
+    def wait_for_gpu_headroom(self, *, timeout_seconds: float = 120.0) -> float:
+        """Bound dispatch pacing, without weakening the continuously active hard guards.
+
+        Start with 15 C of headroom below the driver's target where available.
+        The previous 10 C margin still saw a software thermal slowdown at 87 C in a
+        sustained local run; this scheduling margin is empirical, not a vendor limit.
+        Waiting is separate from
+        inference time; an active thermal flag is a failure, never a retry signal.
+        Also used before Agent requests that bypass ``generate``.
+        """
+        if self.config.device != "cuda":
+            return 0.0
+
+        def check() -> dict:
+            self._ensure_running()
+            self._check_gpu()
+            with self._diagnostic_lock:
+                return dict(self._diagnostic["last_gpu_check"])
+
+        try:
+            record = wait_for_gpu_dispatch(
+                check,
+                self._stop.wait,
+                max_temperature_c=self.config.max_gpu_temperature_c,
+                timeout_seconds=timeout_seconds,
+                headroom_c=GPU_DISPATCH_HEADROOM_C,
+                recent_samples=self._dispatch_monitor_samples,
+            )
+            with self._diagnostic_lock:
+                self._diagnostic["last_dispatch_wait"] = record
+                self._diagnostic["dispatch_wait_seconds_total"] = (
+                    self._diagnostic.get("dispatch_wait_seconds_total", 0.0) + record["seconds"]
+                )
+            return record["seconds"]
+        except GpuDispatchTimeout as exc:
+            self.close()
+            raise ModelTimeoutError(str(exc)) from None
+        except GpuDispatchCancelled as exc:
+            self.close()
+            raise ModelError(str(exc)) from None
+        except BaseException:
+            self.close()
+            raise
+
+    def _dispatch_monitor_samples(self) -> list[dict]:
+        with self._diagnostic_lock:
+            return copy.deepcopy(self._monitor_samples)
 
     def diagnostics(self, *, include_log: bool = False) -> dict:
         """Detached bounded metadata, available after close without any model probe.

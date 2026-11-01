@@ -9,13 +9,16 @@ from importlib.metadata import version
 
 _HAN = r"[\u3400-\u4dbf\u4e00-\u9fff]"
 _WORD = rf"(?:(?!{_HAN})[^\W_])+"
-_TOKEN = re.compile(rf"{_HAN}+|-?\d+(?:[.,]\d+)*|{_WORD}(?:[.'-]{_WORD})*")
+_SCIENTIFIC = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)[eE][-+]?\d+"
+_NUMBER = r"[-+]?\d+(?:[.,]\d+)*"
+_TECHNICAL = r"(?:[A-Za-z][A-Za-z0-9]*(?:\+\+|#)[A-Za-z0-9]*|[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+)"
+_TOKEN = re.compile(rf"{_HAN}+|{_SCIENTIFIC}|{_NUMBER}|{_TECHNICAL}|{_WORD}(?:[.'-]{_WORD})*")
 _HAN_RUN = re.compile(rf"{_HAN}+")
 
 
 def tokenizer_version() -> str:
     return (
-        f"nfkc-casefold-mathminus-jieba-search-no-hmm-v1/jieba-{version('jieba')}"
+        f"nfkc-casefold-mathminus-tech-identifiers-jieba-search-no-hmm-v2/jieba-{version('jieba')}"
         f"/unicode-{unicodedata.unidata_version}"
     )
 

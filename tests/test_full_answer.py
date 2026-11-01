@@ -8,6 +8,8 @@ import pytest
 from pydantic import ValidationError
 
 from page_cite_rag.full_answer import (
+    PROMPT_VERSION,
+    TASK_ALIGNED_PROMPT_VERSION,
     EvidenceFirstRunFailure,
     EvidenceSelectionDraft,
     FullAnswerWorkflow,
@@ -21,9 +23,10 @@ from page_cite_rag.generation import (
     check_budget,
 )
 from page_cite_rag.ingest import prepare_source
+from page_cite_rag.reading_plan import ReadingPlan
 from page_cite_rag.retrieval import SearchContextGroup, SearchHit, SearchResult
 from page_cite_rag.store import SQLiteDocumentStore
-from page_cite_rag.workflows import WorkflowConfig
+from page_cite_rag.workflows import WorkflowConfig, WorkflowError
 
 
 class _Retriever:
@@ -165,13 +168,140 @@ def test_formal_answer_uses_short_ids_and_validates_multiple_source_paragraphs(t
     )
     result = workflow.ask("How much, and under what condition?")
     assert result.status == "answered"
-    assert result.prompt_version == "complete-cited-answer-v4"
+    assert result.prompt_version == PROMPT_VERSION
     assert len(result.answer_claims) == 1
     assert len(result.detail_claims) == 1
     assert result.answer == "The result rose by 42% only under condition A."
     assert [item["source_id"] for item in model.seen["evidence"]] == ["S1", "S2"]
+    assert all("span_chars_in_block" not in item for item in model.seen["evidence"])
     assert result.answer_claims[0].citations[0].quote.startswith("The result rose")
     assert result.answer_claims[0].citations[1].quote.startswith("Only under")
+    assert result.answer_claims[0].citations[0].char_start == 0
+    system_prompt = model.seen_request["messages"][0]["content"]
+    assert "A source-backed absence is still an answer" in system_prompt
+    assert "neither an answer nor a scoped absence" in system_prompt
+
+
+def test_agent_handoff_uses_context_budget_and_preserves_required_sources(tmp_path):
+    path = tmp_path / "paper.txt"
+    path.write_text("The result rose by 42%.\n", encoding="utf-8")
+    prepared = prepare_source(path)
+    store = SQLiteDocumentStore(tmp_path / "paper.sqlite3")
+    store.ingest(prepared.document, prepared.iter_units())
+    blocks = store.get_blocks(prepared.document.document_id)
+    config = GenerationConfig(num_ctx=32768, num_predict=1536)
+    model = _Model(config)
+    workflow = FullAnswerWorkflow(
+        SQLiteDocumentStore(store.database_path, read_only=True),
+        prepared.document.document_id,
+        _Retriever(prepared.document.document_id, blocks),
+        model,
+        config,
+    )
+
+    with pytest.raises(WorkflowError, match="agent navigation handoff is invalid"):
+        workflow.answer_from_agent_context(
+            "What changed?",
+            blocks,
+            navigation_handoff={"version": "navigation-handoff/v2", "status": "verified"},
+            language="en",
+        )
+    assert model.seen_requests == []
+    workflow.answer_from_agent_context(
+        "What changed?",
+        blocks,
+        navigation_handoff={
+            "version": "navigation-handoff/v2",
+            "status": "unverified",
+            "note": "x" * 9000,
+        },
+        language="en",
+        required_block_ids=[block.block_id for block in blocks],
+    )
+    assert model.seen["navigation_handoff"]["note"] == "x" * 9000
+    model.seen_requests.clear()
+    from copy import copy
+
+    probe = copy(workflow)
+    probe._navigation_handoff = {
+        "version": "navigation-handoff/v2",
+        "status": "unverified",
+        "note": "x" * 9000,
+    }
+    empty_budget = check_budget(
+        probe._messages("What changed?", "en", "local", (), None),
+        probe._response_model_for(()).model_json_schema(),
+        config,
+    )
+    # Fit the empty request, but leave no room for its required source.
+    workflow._budget_config = config.model_copy(
+        update={"num_ctx": empty_budget.input_upper_estimate + config.num_predict}
+    )
+    with pytest.raises(WorkflowError, match="omit required original evidence"):
+        workflow.answer_from_agent_context(
+            "What changed?",
+            blocks,
+            navigation_handoff={
+                "version": "navigation-handoff/v2",
+                "status": "unverified",
+                "note": "x" * 9000,
+            },
+            language="en",
+            required_block_ids=[block.block_id for block in blocks],
+        )
+    from page_cite_rag.generation import ContextBudgetError
+
+    with pytest.raises(ContextBudgetError):
+        workflow.answer_from_agent_context(
+            "What changed?",
+            blocks,
+            navigation_handoff={
+                "version": "navigation-handoff/v2",
+                "status": "unverified",
+                "note": "x" * 90000,
+            },
+            language="en",
+        )
+
+    assert model.seen_requests == []
+
+
+def test_reading_plan_is_passed_as_unverified_checklist_not_evidence(tmp_path):
+    path = tmp_path / "paper.txt"
+    path.write_text("The result rose by 42%.\n", encoding="utf-8")
+    prepared = prepare_source(path)
+    store = SQLiteDocumentStore(tmp_path / "paper.sqlite3")
+    store.ingest(prepared.document, prepared.iter_units())
+    blocks = store.get_blocks(prepared.document.document_id)
+    config = GenerationConfig(num_ctx=32768, num_predict=1536)
+    workflow = FullAnswerWorkflow(
+        SQLiteDocumentStore(store.database_path, read_only=True),
+        prepared.document.document_id,
+        _Retriever(prepared.document.document_id, blocks),
+        _Model(config),
+        config,
+    )
+    plan = ReadingPlan.model_validate(
+        {
+            "requirements": (
+                {"need": "State the direction and amount", "queries": ("increase amount",)},
+            )
+        }
+    )
+
+    planned = workflow.with_reading_plan(plan)
+    messages = planned._messages("How much did the result change?", "en", "local", blocks, None)
+    payload = json.loads(messages[1].content)
+
+    assert payload["reading_plan"] == [
+        {
+            "need_id": "need-01",
+            "need": "State the direction and amount",
+            "queries": ["increase amount"],
+        }
+    ]
+    assert "not evidence" in messages[0].content
+    assert workflow._reading_plan is None
 
 
 def test_request_schema_enforces_status_claim_and_source_id_contract(tmp_path):
@@ -289,8 +419,9 @@ def test_request_schema_enforces_status_claim_and_source_id_contract(tmp_path):
         ),
     ],
 )
+@pytest.mark.parametrize("prompt_revision", ["contract-consistent", "task-aligned-v5"])
 def test_benchmark_answer_formats_are_schema_constrained_and_normalized(
-    tmp_path, answer_format, payload, expected_answer
+    tmp_path, answer_format, payload, expected_answer, prompt_revision
 ):
     path = tmp_path / "paper.txt"
     path.write_text("The result rose by 42% under condition A.\n", encoding="utf-8")
@@ -344,13 +475,15 @@ def test_benchmark_answer_formats_are_schema_constrained_and_normalized(
                 budget,
             )
 
+    task_model = _TaskModel(config)
     workflow = FullAnswerWorkflow(
         SQLiteDocumentStore(store.database_path, read_only=True),
         prepared.document.document_id,
         _Retriever(prepared.document.document_id, blocks),
-        _TaskModel(config),
+        task_model,
         config,
         answer_format=answer_format,
+        prompt_revision=prompt_revision,
     )
 
     response_model = workflow._response_model_for(blocks)
@@ -363,10 +496,40 @@ def test_benchmark_answer_formats_are_schema_constrained_and_normalized(
         with pytest.raises(ValidationError):
             response_model.model_validate_json(json.dumps(invalid))
 
-    result = workflow.answer_from_context("What is the supported answer?", blocks)
+    result = workflow.answer_from_context("What is the supported answer?", blocks, language="en")
     assert result.status == "answered"
     assert result.answer == expected_answer
     assert result.answer_claims[0].citations[0].quote == blocks[0].text
+    if answer_format == "multiple_choice":
+        chinese_result = workflow.answer_from_context(
+            "哪個選項受到原文支持？", blocks, language="zh-Hant"
+        )
+        assert chinese_result.answer == "正確答案為 (C)。"
+        assert chinese_result.language == "zh-Hant"
+    system_prompt = task_model.seen_request["messages"][0]["content"]
+    expected_field = "short_answer" if answer_format == "short_answer" else "choice_citations"
+    assert expected_field in system_prompt
+    assert "answer_claims" not in system_prompt
+    if prompt_revision == "contract-consistent":
+        assert "details must support and not contradict" in system_prompt
+        assert "Preserve the source's original number and unit" in system_prompt
+        assert "Attribute claims to authors or cited sources" in system_prompt
+        assert "A source-backed absence is still an answer" in system_prompt
+        assert "neither an answer nor a scoped absence" in system_prompt
+    assert result.prompt_version == (
+        PROMPT_VERSION if prompt_revision == "contract-consistent" else TASK_ALIGNED_PROMPT_VERSION
+    )
+
+    with pytest.raises(ValueError, match="unsupported answer prompt revision"):
+        FullAnswerWorkflow(
+            SQLiteDocumentStore(store.database_path, read_only=True),
+            prepared.document.document_id,
+            _Retriever(prepared.document.document_id, blocks),
+            _TaskModel(config),
+            config,
+            answer_format=answer_format,
+            prompt_revision="previous-v4",
+        )
     assert result.detail_claims == ()
 
 
@@ -557,7 +720,7 @@ def test_docling_context_presents_each_exact_source_text_next_to_its_id(tmp_path
     assert first["source_id"] == "S1" and first["text"] == blocks[0].text
     assert first["table_row"] == [0, 1] and first["table_column"] == [0, 1]
     serialized = json.dumps(payload, ensure_ascii=False)
-    assert serialized.count(blocks[0].text.rstrip("\n")) == 1
+    assert serialized.count(blocks[0].text.rstrip("\n")) == 2
 
 
 def test_evidence_first_fails_closed_on_an_unknown_source_id(tmp_path):
@@ -666,3 +829,53 @@ def test_partial_answer_keeps_supported_direct_answer_and_states_the_gap(tmp_pat
     assert result.answer == "The result rose by 42%."
     assert "does not state the requested condition" in result.limitations[-1]
     assert result.answer_claims and not result.detail_claims
+
+
+@pytest.mark.parametrize("answer_format", ("general", "short_answer", "multiple_choice"))
+def test_generated_limitation_bounds_match_citation_materialization(answer_format):
+    from page_cite_rag.full_answer import FullAnswerDraft
+    from page_cite_rag.span_citations import SpanAnswerDraft
+
+    model = (
+        FullAnswerDraft
+        if answer_format == "general"
+        else FullAnswerWorkflow._short_answer_model_for(("S1",))
+        if answer_format == "short_answer"
+        else FullAnswerWorkflow._multiple_choice_model_for(("S1",))
+    )
+    schema = model.model_json_schema()
+    variants = [schema["$defs"][item["$ref"].rsplit("/", 1)[-1]] for item in schema["oneOf"]]
+    for variant in variants:
+        assert variant["properties"]["limitations"]["items"]["maxLength"] == 1000
+    payload = {"status": "insufficient_evidence", "limitations": ["x" * 1000]}
+    draft = model.model_validate_json(json.dumps(payload))
+    SpanAnswerDraft(status=draft.status, claims=(), limitations=draft.limitations)
+    payload["limitations"] = ["x" * 1086]
+    with pytest.raises(ValidationError, match="string_too_long"):
+        model.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize("answer_format", ["short_answer", "multiple_choice"])
+def test_completed_answer_can_include_a_scope_note_without_changing_status(answer_format):
+    from langchain.agents.structured_output import OutputToolBinding, ToolStrategy
+
+    workflow = object.__new__(FullAnswerWorkflow)
+    workflow.answer_format = answer_format
+    draft = {
+        "status": "answered",
+        "detail_claims": [],
+        "limitations": ["The source does not specify the room's dimensions."],
+    }
+    citation = {"source_id": "S1"}
+    if answer_format == "short_answer":
+        draft["short_answer"] = {"text": "The Table of the House", "citations": [citation]}
+    else:
+        draft.update(choice="B", choice_citations=[citation])
+    strategy = ToolStrategy(workflow.agent_tool_model(), handle_errors=False)
+    parsed = OutputToolBinding.from_schema_spec(strategy.schema_specs[0]).parse(draft)
+    assert parsed.status == "answered"
+    assert parsed.limitations == tuple(draft["limitations"])
+    # A genuinely partial answer still needs an explicit missing requested part.
+    draft.update(status="partial", limitations=[])
+    with pytest.raises(ValueError):
+        OutputToolBinding.from_schema_spec(strategy.schema_specs[0]).parse(draft)

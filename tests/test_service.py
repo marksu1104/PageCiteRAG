@@ -19,7 +19,6 @@ from page_cite_rag.generation import (
     check_budget,
 )
 from page_cite_rag.ingest import prepare_source
-from page_cite_rag.query import EnglishQuery
 from page_cite_rag.retrieval import BM25Retriever, RetrievalError, build_bm25_index
 from page_cite_rag.service import (
     DocumentService,
@@ -29,7 +28,24 @@ from page_cite_rag.service import (
     ServiceStoppedError,
 )
 from page_cite_rag.store import SQLiteDocumentStore
+from page_cite_rag.workflows import WorkflowConfig
 from test_answer_cli import FakeClient
+
+
+def test_service_and_base_workflow_keep_the_same_explanation_defaults(tmp_path):
+    config = ServiceConfig(
+        database_path=tmp_path / "documents.sqlite3",
+        document_id="0" * 64,
+    )
+
+    assert (config.top_k, config.neighbor_blocks) == (100, 1)
+    assert (WorkflowConfig().top_k, WorkflowConfig().neighbor_blocks) == (6, 1)
+
+
+def test_public_api_defaults_to_traditional_chinese():
+    from page_cite_rag.api import QuestionRequest
+
+    assert QuestionRequest(question="為什麼結果不顯著？").language == "zh-Hant"
 
 
 @pytest.fixture
@@ -40,7 +56,7 @@ def prepared(tmp_path):
         "The trial enrolled 120 adults.",
         encoding="utf-8",
     )
-    parsed = prepare_source(source, usage_scope="self-authored-test")
+    parsed = prepare_source(source, usage_scope="self-authored-test", language="en")
     store = SQLiteDocumentStore(tmp_path / "documents.sqlite3")
     store.ingest(parsed.document, parsed.iter_units())
     build_bm25_index(store, parsed.document.document_id)
@@ -91,6 +107,53 @@ def test_service_reuses_one_model_then_releases_owned_model_on_idle(prepared):
     assert clients[1].close_count == 1
     with pytest.raises(ServiceStoppedError):
         service.submit("ask", "result significant")
+
+
+def test_service_reading_uses_shared_navigation_and_returns_its_trace(prepared, monkeypatch):
+    from page_cite_rag import application
+    from page_cite_rag.dense import build_dense_index
+    from page_cite_rag.reading_plan import ReadingNeed, ReadingPlan
+    from test_dense import FakeEncoder
+
+    database, document_id, _ = prepared
+    store = SQLiteDocumentStore(database)
+    encoder = FakeEncoder()
+    build_dense_index(store, document_id, encoder)
+    calls = []
+
+    def shared_reading(workflow, question, **kwargs):
+        calls.append((workflow.document_id, question, kwargs))
+        return application.AgentAnswer(
+            workflow.ask(question, language=kwargs["language"]),
+            {"version": "source-navigation/v1", "agent": {"tool_calls_recorded": 1}},
+        )
+
+    monkeypatch.setattr(application, "ask_with_agent", shared_reading)
+    monkeypatch.setattr(
+        application,
+        "plan_document_question",
+        lambda *_args, **_kwargs: ReadingPlan(
+            requirements=(ReadingNeed(need="result", queries=("result",)),)
+        ),
+    )
+    config = GenerationConfig()
+    with DocumentService(
+        ServiceConfig(
+            database_path=database,
+            document_id=document_id,
+            method="hybrid",
+            reading_agent=True,
+        ),
+        config,
+        lambda: FakeClient(config),
+        encoder=encoder,
+    ) as service:
+        answer = service.submit("ask", "significant")[1].result(timeout=5)
+        assert answer.trace.reading_trace["version"] == "source-navigation/v1"
+        assert calls[0][2]["delegated"] is False
+        assert calls[0][2].get("max_model_calls") is None
+        with pytest.raises(ValueError, match="already uses planned query routes"):
+            service.submit("ask", "significant", rewrite_query=True)
 
 
 def test_queue_full_cancel_waiter_and_active_owned_model_only(prepared):
@@ -237,6 +300,125 @@ def test_serve_requires_environment_token_before_runtime_start(monkeypatch, caps
         create_app(None, api_token=" ")
 
 
+def test_serve_accepts_agent_with_native_reranker(prepared, monkeypatch):
+    import uvicorn
+
+    from page_cite_rag import api, cli, gpu_retrieval
+
+    database, document_id, _ = prepared
+    captured = {}
+
+    class FakeStage:
+        def __init__(self, *_args, reranker_model_path, **_kwargs):
+            self.reranker_model_path = reranker_model_path
+            captured["reranker"] = reranker_model_path
+
+        def search(self, question, *, top_k=5):
+            raise AssertionError("startup must not execute retrieval")
+
+    def run(service, **_kwargs):
+        captured["agent_enabled"] = service.config.reading_agent
+
+    monkeypatch.setenv("PAGE_CITE_RAG_API_TOKEN", "test-local-token")
+    monkeypatch.setattr(gpu_retrieval, "StagedGpuSearch", FakeStage)
+    monkeypatch.setattr(api, "create_app", lambda service, **_kwargs: service)
+    monkeypatch.setattr(uvicorn, "run", run)
+    result = cli.main(
+        [
+            "serve",
+            document_id,
+            "--db",
+            str(database),
+            "--method",
+            "hybrid",
+            "--embedding-backend",
+            "native-gpu",
+            "--device",
+            "cuda",
+            "--gpu-uuid",
+            "GPU-12345678-1234-1234-1234-123456789abc",
+            "--agent",
+            "--rerank",
+        ]
+    )
+    assert result == 0
+    assert captured["agent_enabled"] is True
+    assert captured["reranker"] is not None
+
+
+@pytest.mark.parametrize("temperature_limit", [None, 88])
+def test_serve_native_gpu_temperature_policy_reaches_both_backends(
+    prepared, monkeypatch, temperature_limit
+):
+    import uvicorn
+
+    from page_cite_rag import api, cli, gpu_retrieval, llama
+
+    database, document_id, blocks = prepared
+    lexical = BM25Retriever(SQLiteDocumentStore(database, read_only=True), document_id)
+    expected_limit = temperature_limit or 88
+    embedding_limits = []
+    clients = []
+
+    class FakeStage:
+        def __init__(self, *_args, gpu_temperature_limit_c, **_kwargs):
+            embedding_limits.append(gpu_temperature_limit_c)
+            self.last_trace = None
+            self.reranker_model_path = None
+
+        def search(self, question, *, top_k=5):
+            self.last_trace = {
+                "gpu_temperature_limit_c": embedding_limits[-1],
+                "last_gpu_sample": {"temperature_c": 65},
+                "query_count": 1,
+            }
+            return lexical.search(question, top_k=top_k).model_copy(update={"method": "dense"})
+
+    def open_client(config, *, budget_policy):
+        assert budget_policy == "exact"
+        clients.append(FakeClient(config))
+        return clients[-1]
+
+    def run(service, **_kwargs):
+        with service:
+            answer = service.submit("ask", "result significant")[1].result(timeout=5)
+            trace = json.loads(answer.model_dump_json())["trace"]["gpu_retrieval_trace"]
+            assert trace["gpu_temperature_limit_c"] == expected_limit
+            assert trace["last_gpu_sample"] == {"temperature_c": 65}
+            assert trace["query_count"] == 1
+            explanation = service.submit(
+                "explain", "Explain this source.", block_id=blocks[0].block_id
+            )[1].result(timeout=5)
+            assert explanation.trace.gpu_retrieval_trace is None
+
+    monkeypatch.setenv("PAGE_CITE_RAG_API_TOKEN", "test-local-token")
+    monkeypatch.setattr(gpu_retrieval, "StagedGpuSearch", FakeStage)
+    monkeypatch.setattr(llama, "LlamaModelClient", open_client)
+    monkeypatch.setattr(api, "create_app", lambda service, **_kwargs: service)
+    monkeypatch.setattr(uvicorn, "run", run)
+    arguments = [
+        "serve",
+        document_id,
+        "--db",
+        str(database),
+        "--method",
+        "dense",
+        "--embedding-backend",
+        "native-gpu",
+        "--device",
+        "cuda",
+        "--gpu-uuid",
+        "GPU-12345678-1234-1234-1234-123456789abc",
+    ]
+    if temperature_limit is not None:
+        arguments.extend(["--gpu-temperature-limit", str(temperature_limit)])
+    assert cli.main(arguments) == 0
+    assert embedding_limits == [expected_limit]
+    assert len(clients) == 1
+    assert clients[0].config.max_gpu_temperature_c == expected_limit
+    assert clients[0].close_count == 1
+
+
 def test_source_tamper_is_rejected_before_model_start(prepared):
     service, clients = make_service(prepared)
     _, _, blocks = prepared
@@ -252,32 +434,61 @@ def test_source_tamper_is_rejected_before_model_start(prepared):
 def test_formal_api_answer_is_not_replaced_by_tool_output(prepared):
     service, _ = make_service(prepared)
     with service:
-        result = service.submit("ask", "result significant")[1].result(timeout=5)
+        result = service.submit("ask", "result significant", language="en")[1].result(timeout=5)
         assert result.result.answer == "The result was not significant unless n > 64."
         source = result.result.claims[0].citations[0]
         assert source.quote in service.source(source.block_id).text
-        assert json.loads(result.model_dump_json())["trace"]["retrieval_mode"] == "resident"
+        trace = json.loads(result.model_dump_json())["trace"]
+        assert trace["retrieval_mode"] == "resident"
+        assert trace["gpu_retrieval_trace"] is None
 
 
-def test_resident_english_rewrite_option_uses_no_extra_model_call(prepared):
+def test_service_passes_and_clears_one_total_request_deadline(prepared):
+    class DeadlineClient(FakeClient):
+        def __init__(self, config):
+            super().__init__(config)
+            self.deadlines = []
+            self.cleared = 0
+
+        def set_request_deadline(self, deadline):
+            self.deadlines.append(deadline)
+
+        def clear_request_deadline(self):
+            self.cleared += 1
+
+    service, clients = make_service(prepared, factory=DeadlineClient)
+    with service:
+        _request_id, future = service.submit("ask", "result significant", language="en")
+        answer = future.result(timeout=5)
+
+    assert answer.result.status == "answered"
+    assert len(clients) == 1
+    assert len(clients[0].deadlines) == 1
+    assert clients[0].deadlines[0] > time.monotonic()
+    assert clients[0].cleared == 1
+
+
+def test_resident_english_rewrite_option_uses_one_bounded_query_call(prepared):
     service, clients = make_service(prepared)
     with service:
         answer = service.submit("ask", "result significant", rewrite_query=True)[1].result(
             timeout=5
         )
         assert answer.result.status == "answered"
-        assert answer.result.retrieval.query_plan["status"] == "not_needed"
-        assert answer.result.retrieval.query_plan["lexical_query"] == "result significant"
-        assert len(clients) == 1 and len(clients[0].calls) == 1
+        assert answer.result.retrieval.query_plan["status"] == "rewritten"
+        assert answer.result.retrieval.query_plan["lexical_query"] == (
+            "result significant document, evidence"
+        )
+        assert len(clients) == 1 and len(clients[0].calls) == 2
 
 
 def test_api_opt_in_chinese_rewrite_keeps_original_question_and_records_cost(prepared):
     class RewriteClient(FakeClient):
         def generate(self, messages, schema_class):
-            if schema_class is EnglishQuery:
+            if schema_class is None:
                 self.calls.append((messages, schema_class))
                 return GenerationResult(
-                    schema_class(query="Explain result"),
+                    "explain, result",
                     GenerationStats(
                         prompt_eval_count=50,
                         eval_count=10,
@@ -288,7 +499,7 @@ def test_api_opt_in_chinese_rewrite_keeps_original_question_and_records_cost(pre
                         done_reason="stop",
                         elapsed_ms=1.0,
                     ),
-                    check_budget(messages, schema_class.model_json_schema(), self.config),
+                    check_budget(messages, None, self.config),
                 )
             return super().generate(messages, schema_class)
 
@@ -312,14 +523,15 @@ def test_api_opt_in_chinese_rewrite_keeps_original_question_and_records_cost(pre
     response = asyncio.run(ask())
     retrieval = response["result"]["retrieval"]
     assert retrieval["query"] == "請說明 result"
-    assert retrieval["query_plan"]["lexical_query"] == "Explain result"
+    assert retrieval["query_plan"]["lexical_query"] == "請說明 result explain, result"
     assert retrieval["query_plan"]["status"] == "rewritten"
     assert retrieval["query_plan"]["stats"]["eval_count"] == 10
     assert len(clients) == 1 and len(clients[0].calls) == 2
     assert clients[0].close_count == 1
 
 
-def test_staged_rewrite_is_rejected_before_any_model_or_search(prepared):
+@pytest.mark.parametrize("docling_source", [False, True])
+def test_staged_rewrite_runs_once_before_native_search(prepared, docling_source):
     database, document_id, _ = prepared
     clients = []
     searches = []
@@ -328,25 +540,45 @@ def test_staged_rewrite_is_rejected_before_any_model_or_search(prepared):
         clients.append(FakeClient(GenerationConfig()))
         return clients[-1]
 
-    def staged_search(question, top_k):
-        searches.append((question, top_k))
-        raise AssertionError("unsupported route must not start GPU search")
+    class StagedSearch:
+        reranker_model_path = None
+        last_trace = None
+
+        def __init__(self):
+            self.lexical = BM25Retriever(SQLiteDocumentStore(database, read_only=True), document_id)
+
+        def search_with_lexical_query(self, question, lexical_query, *, top_k):
+            searches.append((question, lexical_query, top_k))
+            return self.lexical.search(lexical_query, top_k=top_k).model_copy(
+                update={"query": question, "method": "hybrid"}
+            )
+
+        def search(self, question, *, top_k=5):
+            searches.append((question, question, top_k))
+            return self.lexical.search(question, top_k=top_k).model_copy(
+                update={"method": "hybrid"}
+            )
 
     service = DocumentService(
         ServiceConfig(database_path=database, document_id=document_id, method="hybrid"),
         GenerationConfig(),
         model_factory,
-        staged_search=staged_search,
+        staged_search=StagedSearch(),
     )
+    # A Docling document with staged GPU retrieval has no resident CPU retriever.
+    service._docling_source = docling_source
     with service:
-        with pytest.raises(ValueError, match="resident BM25 or hybrid"):
-            service.submit("ask", "請說明 result", rewrite_query=True)
-        with pytest.raises(ValueError, match="resident BM25 or hybrid"):
+        answer = service.submit("ask", "請說明 result", rewrite_query=True)[1].result(timeout=5)
+        assert answer.result.status == "answered"
+        with pytest.raises(ValueError, match="BM25 or hybrid ask"):
             service.submit("explain", "result", rewrite_query=True)
-    assert clients == searches == []
+    assert len(clients) == 1
+    assert len(searches) == 1
+    assert searches[0][0] == "請說明 result"
+    assert searches[0][1].startswith("請說明 result ")
 
 
-def test_staged_retrieval_releases_prior_model_before_next_gpu_search(prepared):
+def test_staged_retrieval_coexists_with_the_resident_owned_generator(prepared):
     database, document_id, _ = prepared
     config = GenerationConfig()
     clients = []
@@ -354,9 +586,21 @@ def test_staged_retrieval_releases_prior_model_before_next_gpu_search(prepared):
     store = SQLiteDocumentStore(database, read_only=True)
     lexical = BM25Retriever(store, document_id)
 
-    def stage(question, top_k):
-        search_checks.append(not clients or clients[-1].close_count == 1)
-        return lexical.search(question, top_k=top_k).model_copy(update={"method": "dense"})
+    class Stage:
+        reranker_model_path = None
+
+        def __init__(self):
+            self.last_trace = {
+                "gpu_temperature_limit_c": 88,
+                "last_gpu_sample": {"temperature_c": 65},
+            }
+
+        def search(self, question, *, top_k=5):
+            search_checks.append(not clients or clients[-1].close_count == 0)
+            self.last_trace["last_gpu_sample"]["temperature_c"] += 1
+            return lexical.search(question, top_k=top_k).model_copy(update={"method": "dense"})
+
+    stage = Stage()
 
     def factory():
         client = FakeClient(config)
@@ -374,13 +618,15 @@ def test_staged_retrieval_releases_prior_model_before_next_gpu_search(prepared):
         second = service.submit("ask", "result significant")[1].result(timeout=5)
         assert first.result.status == second.result.status == "answered"
         assert first.trace.load_count == 1
-        assert second.trace.load_count == 2
+        assert second.trace.load_count == 1
         assert first.trace.retrieval_mode == second.trace.retrieval_mode == "staged"
+        assert first.trace.gpu_retrieval_trace["last_gpu_sample"]["temperature_c"] == 66
+        assert second.trace.gpu_retrieval_trace["last_gpu_sample"]["temperature_c"] == 67
         assert search_checks == [True, True]
     assert all(client.close_count == 1 for client in clients)
 
 
-def test_staged_retrieval_receives_deadline_cancel_before_model_load(prepared):
+def test_staged_retrieval_receives_deadline_cancel_with_generator_loaded(prepared):
     database, document_id, _ = prepared
     started = threading.Event()
     cancelled = threading.Event()
@@ -388,7 +634,10 @@ def test_staged_retrieval_receives_deadline_cancel_before_model_load(prepared):
     clients = []
 
     class BlockingStage:
-        def __call__(self, question, top_k):
+        reranker_model_path = None
+        last_trace = None
+
+        def search(self, question, *, top_k=5):
             started.set()
             assert cancelled.wait(timeout=3)
             raise RuntimeError("owned embedding stage stopped")
@@ -418,7 +667,7 @@ def test_staged_retrieval_receives_deadline_cancel_before_model_load(prepared):
         with pytest.raises(ServiceDeadlineError):
             future.result(timeout=3)
     assert cancelled.is_set()
-    assert clients == []
+    assert len(clients) == 1 and clients[0].close_count == 1
 
 
 def test_owned_native_server_checks_external_cancel_signal():

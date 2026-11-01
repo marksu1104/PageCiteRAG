@@ -8,7 +8,7 @@ import pytest
 from page_cite_rag.generation import GenerationResult, GenerationStats, ModelError, check_budget
 from page_cite_rag.hybrid import HybridRetriever
 from page_cite_rag.models import Block
-from page_cite_rag.query import QueryRewriter
+from page_cite_rag.query import QueryRewriteConfig, QueryRewriter
 from page_cite_rag.query_retrieval import RewritingRetriever
 from page_cite_rag.retrieval import RetrievalError, SearchHit, SearchResult
 
@@ -20,6 +20,10 @@ class Budget:
     num_ctx: int = 8192
     num_predict: int = 512
     template_reserve: int = 256
+
+
+def english_rewriter(model, budget):
+    return QueryRewriter(model, budget, QueryRewriteConfig(source_language="en"))
 
 
 def stats():
@@ -38,7 +42,7 @@ def stats():
 class Model:
     identity = {"backend": "self-authored-test", "revision": "1"}
 
-    def __init__(self, value="Explain BM25"):
+    def __init__(self, value="retrieval methods"):
         self.value = value
         self.calls = []
 
@@ -46,11 +50,7 @@ class Model:
         self.calls.append((messages, response_model))
         if isinstance(self.value, Exception):
             raise self.value
-        return GenerationResult(
-            response_model(query=self.value),
-            stats(),
-            check_budget(messages, response_model.model_json_schema(), Budget()),
-        )
+        return GenerationResult(self.value, stats(), check_budget(messages, None, Budget()))
 
     def close(self):
         raise AssertionError("the wrapper must not close caller-owned models")
@@ -99,12 +99,12 @@ class Branch:
         return result
 
 
-def setup(*, dense=True, model_value="Explain BM25", candidates=4):
+def setup(*, dense=True, model_value="retrieval methods", candidates=4):
     model = Model(model_value)
     lexical = Branch("bm25", (1, 2), scores=(100.0, 50.0))
     semantic = Branch("dense", (2, 1), scores=(0.9, -0.8)) if dense else None
     wrapper = RewritingRetriever(
-        lexical, QueryRewriter(model, Budget()), semantic, candidates=candidates
+        lexical, english_rewriter(model, Budget()), semantic, candidates=candidates
     )
     return wrapper, lexical, semantic, model
 
@@ -113,7 +113,7 @@ def test_dense_uses_original_lexical_uses_rewrite_and_public_result_retains_orig
     wrapper, lexical, dense, model = setup()
     question = "說明 BM25"
     result = wrapper.search(question, top_k=2)
-    assert lexical.calls == [("Explain BM25", 4)]
+    assert lexical.calls == [("說明 BM25 retrieval methods", 4)]
     assert dense.calls == [(question, 4)]
     assert result.query == question and result.document_id == DOCUMENT
     assert result.method == "hybrid"
@@ -121,7 +121,7 @@ def test_dense_uses_original_lexical_uses_rewrite_and_public_result_retains_orig
     assert result.hits[0].score == pytest.approx(1 / 61 + 1 / 62)
     assert len(model.calls) == 1
     # Returned branch records remain unmodified; query normalization is only a copy.
-    assert lexical.results[0].query == "Explain BM25"
+    assert lexical.results[0].query == "說明 BM25 retrieval methods"
     assert dense.results[0].query == question
 
 
@@ -130,7 +130,7 @@ def test_trace_records_both_branch_costs_rewrite_cost_and_actual_cache_behavior(
     wrapper.search("說明 BM25", top_k=2)
     first = wrapper.last_query_plan
     assert first["original_query"] == "說明 BM25"
-    assert first["lexical_query"] == "Explain BM25"
+    assert first["lexical_query"] == "說明 BM25 retrieval methods"
     assert first["dense_query"] == "說明 BM25"
     assert first["lexical_elapsed_ms"] == 2.0
     assert first["dense_elapsed_ms"] == 3.0
@@ -148,7 +148,7 @@ def test_trace_records_both_branch_costs_rewrite_cost_and_actual_cache_behavior(
 def test_index_identity_does_not_depend_on_query_or_cache_statistics():
     wrapper, _lexical, _dense, model = setup()
     first = wrapper.search("說明 BM25", top_k=2)
-    model.value = "Compare BM25"
+    model.value = "comparison"
     different = wrapper.search("比較 BM25", top_k=1)
     cached = wrapper.search("說明 BM25", top_k=2)
     assert first.index_id == different.index_id == cached.index_id
@@ -158,19 +158,20 @@ def test_index_identity_does_not_depend_on_query_or_cache_statistics():
 def test_lexical_only_keeps_bm25_scores_and_reports_no_dense_cost():
     wrapper, lexical, _dense, _model = setup(dense=False)
     result = wrapper.search("說明 BM25", top_k=1)
-    assert lexical.calls == [("Explain BM25", 1)]
+    assert lexical.calls == [("說明 BM25 retrieval methods", 1)]
     assert result.method == "bm25" and result.query == "說明 BM25"
     assert result.hits[0].score == 100.0
     assert wrapper.last_query_plan["dense_query"] is None
     assert wrapper.last_query_plan["dense_elapsed_ms"] is None
 
 
-def test_english_query_is_passed_through_without_model_call():
+def test_english_query_can_receive_same_language_expansion():
     wrapper, lexical, dense, model = setup()
     wrapper.search("Explain BM25", top_k=2)
-    assert lexical.calls == dense.calls == [("Explain BM25", 4)]
-    assert not model.calls
-    assert wrapper.last_query_plan["status"] == "not_needed"
+    assert lexical.calls == [("Explain BM25 retrieval methods", 4)]
+    assert dense.calls == [("Explain BM25", 4)]
+    assert len(model.calls) == 1
+    assert wrapper.last_query_plan["status"] == "rewritten"
 
 
 def test_scoped_rewrite_filters_branches_before_reciprocal_rank_fusion():
@@ -184,7 +185,7 @@ def test_scoped_rewrite_filters_branches_before_reciprocal_rank_fusion():
         top_k=1,
     )
 
-    assert lexical.calls == [("Explain BM25", 2)]
+    assert lexical.calls == [("說明 BM25 retrieval methods", 2)]
     assert dense.calls == [("說明 BM25", 2)]
     assert [hit.block.block_id for hit in result.hits] == [allowed]
     assert result.hits[0].score == pytest.approx(2 / 61)
@@ -193,14 +194,37 @@ def test_scoped_rewrite_filters_branches_before_reciprocal_rank_fusion():
     assert len(model.calls) == 1
 
 
-def test_degraded_translation_explicitly_falls_back_to_original_lexical_query():
+@pytest.mark.parametrize("dense", [False, True])
+def test_scoped_search_after_agent_disables_rewrite(dense):
+    wrapper, lexical, semantic, model = setup(dense=dense)
+    wrapper.disable_rewrites()
+    allowed = sha256(f"{DOCUMENT}-2".encode()).hexdigest()
+
+    result = wrapper.search_scoped(
+        "which paragraph explains it?",
+        allowed_block_ids={allowed},
+        candidate_k=2,
+        top_k=1,
+    )
+
+    assert [hit.block.block_id for hit in result.hits] == [allowed]
+    assert lexical.calls == [("which paragraph explains it?", 2)]
+    assert semantic is None or semantic.calls == [("which paragraph explains it?", 2)]
+    assert model.calls == []
+    assert wrapper.last_query_plan["status"] == "not_needed"
+    assert wrapper.last_query_plan["dense_query"] == (
+        "which paragraph explains it?" if dense else None
+    )
+
+
+def test_degraded_expansion_explicitly_falls_back_to_original_lexical_query():
     wrapper, lexical, dense, model = setup(model_value=ModelError("unavailable"))
     question = "說明 BM25"
     result = wrapper.search(question, top_k=2)
     assert lexical.calls == dense.calls == [(question, 4)]
     assert result.query == question
     assert wrapper.last_query_plan["status"] == "degraded"
-    assert wrapper.last_query_plan["reason"] == "generation_or_schema_failure"
+    assert wrapper.last_query_plan["reason"] == "generation_failure"
     assert wrapper.last_query_plan["stats"] is None
     assert len(model.calls) == 1
 
@@ -209,12 +233,60 @@ def test_existing_hybrid_baseline_queries_and_scores_are_unchanged():
     lexical, dense = Branch("bm25", (1, 2)), Branch("dense", (2, 1))
     baseline = HybridRetriever(lexical, dense, candidates=4)
     first = baseline.search("說明 BM25", top_k=2)
-    wrapper = RewritingRetriever(lexical, QueryRewriter(Model(), Budget()), dense, candidates=4)
+    wrapper = RewritingRetriever(lexical, english_rewriter(Model(), Budget()), dense, candidates=4)
     wrapper.search("說明 BM25", top_k=2)
     second = baseline.search("說明 BM25", top_k=2)
     assert first.hits == second.hits and first.index_id == second.index_id
-    assert lexical.calls == [("說明 BM25", 4), ("Explain BM25", 4), ("說明 BM25", 4)]
+    assert lexical.calls == [
+        ("說明 BM25", 4),
+        ("說明 BM25 retrieval methods", 4),
+        ("說明 BM25", 4),
+    ]
     assert dense.calls == [("說明 BM25", 4)] * 3
+
+
+def test_staged_backend_expands_only_the_initial_query_before_agent_followups():
+    class StagedBackend:
+        def __init__(self):
+            self.branch = Branch("hybrid")
+            self.calls = []
+
+        def search_with_lexical_query(self, query, lexical_query, *, top_k):
+            self.calls.append(("expanded", query, lexical_query, top_k))
+            return self.branch.search(query, top_k=top_k)
+
+        def search(self, query, *, top_k=5):
+            self.calls.append(("original", query, query, top_k))
+            return self.branch.search(query, top_k=top_k)
+
+        def search_scoped(self, query, *, allowed_block_ids, candidate_k, top_k=5):
+            self.calls.append(("scoped", query, query, top_k))
+            return self.branch.search(query, top_k=top_k)
+
+    model = Model("retrieval methods")
+    backend = StagedBackend()
+    wrapper = RewritingRetriever(
+        None,
+        english_rewriter(model, Budget()),
+        search_backend=backend,
+        candidates=4,
+    )
+    initial = wrapper.search("why retrieval fails", top_k=2)
+    wrapper.disable_rewrites()
+    followup = wrapper.search("why recall is low", top_k=2)
+    wrapper.search_scoped(
+        "which paragraph explains it?",
+        allowed_block_ids={initial.hits[0].block.block_id},
+        candidate_k=2,
+        top_k=1,
+    )
+    assert backend.calls == [
+        ("expanded", "why retrieval fails", "why retrieval fails retrieval methods", 2),
+        ("original", "why recall is low", "why recall is low", 2),
+        ("scoped", "which paragraph explains it?", "which paragraph explains it?", 1),
+    ]
+    assert followup.query == "why recall is low"
+    assert len(model.calls) == 1
 
 
 @pytest.mark.parametrize("question", ["", "  ", None, 42])
@@ -226,7 +298,7 @@ def test_invalid_query_fails_before_model_or_retrieval_calls(question):
     assert wrapper.last_query_plan is None
 
 
-@pytest.mark.parametrize("top_k", [0, 5, True, 1.5])
+@pytest.mark.parametrize("top_k", [0, 101, True, 1.5])
 def test_invalid_top_k_fails_before_model_or_retrieval_calls(top_k):
     wrapper, lexical, dense, model = setup()
     with pytest.raises(ValueError):
@@ -248,7 +320,7 @@ def test_invalid_top_k_fails_before_model_or_retrieval_calls(top_k):
 )
 def test_constructor_budgets_are_strict_and_bounded(kwargs):
     with pytest.raises(ValueError):
-        RewritingRetriever(Branch("bm25"), QueryRewriter(Model(), Budget()), **kwargs)
+        RewritingRetriever(Branch("bm25"), english_rewriter(Model(), Budget()), **kwargs)
 
 
 def duplicated(result):

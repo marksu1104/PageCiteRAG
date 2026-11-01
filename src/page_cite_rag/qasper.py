@@ -20,11 +20,12 @@ from typing import Iterator
 from page_cite_rag.models import Block, DocumentMetadata, ParsedUnit
 from page_cite_rag.source_outline import OUTLINE_KIND, outline_from_qasper
 from page_cite_rag.store import SQLiteDocumentStore
+from page_cite_rag.text import TokenBlockFactory
 
 DATASET = "allenai/qasper"
 REVISION = "16ac8fdf81e7e3ad213ead4b60fdcc9dc8ca40e9"
 ALIGNMENT_VERSION = "whitespace-only-unique-complete-annotation-union-v1"
-PARSER_VERSION = "qasper-original-paragraphs-v1"
+PARSER_VERSION = "qasper-original-paragraphs-v2-section-outline"
 SOURCES = {
     "train": {
         "filename": "qasper-train.parquet",
@@ -269,7 +270,9 @@ def align_question(paper: Paper, question: Question) -> Alignment:
     return Alignment(tuple(sorted(gold)), tuple(issues), reason)
 
 
-def ingest_paper(store: SQLiteDocumentStore, paper: Paper) -> tuple[str, dict[str, str]]:
+def ingest_paper(
+    store: SQLiteDocumentStore, paper: Paper, *, chunker: TokenBlockFactory | None = None
+) -> tuple[str, dict[str, str]]:
     """Use the core store/index while keeping each original QASPER paragraph intact."""
     payload = json.dumps(
         {"paper_id": paper.paper_id, "passages": [(p.passage_id, p.text) for p in paper.passages]},
@@ -289,6 +292,9 @@ def ingest_paper(store: SQLiteDocumentStore, paper: Paper) -> tuple[str, dict[st
         usage_scope="QASPER CC-BY-4.0 evaluation",
     )
     source_text = "\n\n".join(passage.text for passage in paper.passages)
+    if chunker is not None:
+        document = chunker.bind_document(document)
+        document_id = document.document_id
     unit = ParsedUnit(
         unit_index=1, text=source_text, status="ok" if source_text.strip() else "no_text"
     )
@@ -318,6 +324,21 @@ def ingest_paper(store: SQLiteDocumentStore, paper: Paper) -> tuple[str, dict[st
         block_to_passage[block_id] = passage.passage_id
         offset += len(passage.text) + 2
 
+    if chunker is not None:
+        parents = blocks
+        original_mapping = block_to_passage
+        blocks = list(chunker.split_blocks(document, unit, parents))
+        block_to_passage = {}
+        parent_index = 0
+        for block in blocks:
+            while (
+                parent_index < len(parents) and block.char_start >= parents[parent_index].char_end
+            ):
+                parent_index += 1
+            if parent_index >= len(parents) or block.char_end > parents[parent_index].char_end:
+                raise ValueError("QASPER text chunk crosses an original paragraph")
+            block_to_passage[block.block_id] = original_mapping[parents[parent_index].block_id]
+
     def paragraph_factory(metadata: DocumentMetadata, source_unit: ParsedUnit, first: int):
         yield from blocks
 
@@ -326,7 +347,12 @@ def ingest_paper(store: SQLiteDocumentStore, paper: Paper) -> tuple[str, dict[st
     # Old documents never committed section names. Do not retrofit them from a
     # duplicate payload whose document identity did not include those names.
     if not ingested.duplicate or existing_outline is not None:
-        outline = outline_from_qasper(paper, document, store.get_blocks(document_id))
+        outline = outline_from_qasper(
+            paper,
+            document,
+            store.get_blocks(document_id),
+            block_to_passage=block_to_passage if chunker is not None else None,
+        )
     else:
         outline = None
     if outline is not None:

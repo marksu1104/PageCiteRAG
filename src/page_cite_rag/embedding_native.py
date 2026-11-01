@@ -43,12 +43,16 @@ class NativeEmbeddingEncoder:
         tokenizer_directory: Path = DEFAULT_MODEL_DIR,
         *,
         max_tokens: int = 512,
+        query_max_tokens: int | None = None,
         overlap: int = 64,
         batch_size: int = 4,
     ) -> None:
+        query_max_tokens = max_tokens if query_max_tokens is None else query_max_tokens
         if (
             type(max_tokens) is not int
-            or not 32 <= max_tokens <= 1024
+            or not 32 <= max_tokens <= 8192
+            or type(query_max_tokens) is not int
+            or not 32 <= query_max_tokens <= 8192
             or type(overlap) is not int
             or not 0 <= overlap < max_tokens - 16
             or type(batch_size) is not int
@@ -63,6 +67,16 @@ class NativeEmbeddingEncoder:
         hashes = verify_model(directory)
         import json
 
+        largest_input = max(max_tokens, query_max_tokens)
+        if largest_input > 512:
+            capacity = json.loads((directory / "config.json").read_text()).get(
+                "max_position_embeddings"
+            )
+            if type(capacity) is not int or largest_input > capacity:
+                raise RetrievalError("requested embedding context exceeds verified model capacity")
+        context_size = getattr(transport, "_context_size", None)
+        if callable(context_size) and context_size() < largest_input:
+            raise RetrievalError("embedding server context is smaller than encoder allowance")
         prompt_info = json.loads((directory / "config_sentence_transformers.json").read_text())
         prompt = prompt_info["prompts"]["query"]
         if not prompt or prompt_info["prompts"].get("document") != "":
@@ -71,6 +85,7 @@ class NativeEmbeddingEncoder:
         self._transport = transport
         self._prompt = prompt
         self._max_tokens = max_tokens
+        self._query_max_tokens = query_max_tokens
         self._overlap = overlap
         self._batch_size = batch_size
         self.identity = {
@@ -84,6 +99,7 @@ class NativeEmbeddingEncoder:
             "query_prompt": prompt,
             "document_prompt": "",
             "max_tokens": max_tokens,
+            "query_max_tokens": query_max_tokens,
             "overlap": overlap,
             "batch_size": batch_size,
             "chunking": "fast-offset-suggestion/native-token-admission/v1",
@@ -137,8 +153,9 @@ class NativeEmbeddingEncoder:
         if not texts:
             return np.empty((0, self.dimension), dtype=np.float32)
         inputs = [(self._prompt if query else "") + text for text in texts]
+        token_limit = self._query_max_tokens if query else self._max_tokens
         for text in inputs:
-            if len(self._token_ids(text)) > self._max_tokens:
+            if len(self._token_ids(text)) > token_limit:
                 raise RetrievalError(
                     "embedding input exceeds the native token budget; not truncated"
                 )

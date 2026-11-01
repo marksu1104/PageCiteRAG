@@ -28,7 +28,7 @@ class QuestionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     question: str = Field(min_length=1, max_length=4000)
-    language: Literal["en", "zh-Hant", "auto"] = "en"
+    language: Literal["en", "zh-Hant", "auto"] = "zh-Hant"
 
 
 class AskRequest(QuestionRequest):

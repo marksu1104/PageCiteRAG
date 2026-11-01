@@ -2,7 +2,8 @@
 
 Local-first, bilingual document reading with answers linked to the original source text.
 Ingest a document, ask in English or Traditional Chinese, and read the passages behind each
-citation. The document workflow is implemented; answer-quality evaluation is in progress.
+citation. The core workflow is implemented; current evaluation has not established semantic
+answer quality. Agent reading remains experimental and opt-in.
 
 ## What it does
 
@@ -52,6 +53,14 @@ uv run --locked page-cite-rag ask DOCUMENT_ID \
   --backend llama --token-budget exact --language zh-Hant
 ```
 
+With the optional `agent` dependencies installed, add `--agent` to use one bounded
+source-navigation agent. The same core is available through `serve --agent`.
+The reader can search, inspect the document outline, and read consecutive source passages.
+The shared answer workflow then produces the answer and citations. JSON responses include a
+`reading_trace` with tool activity, model-call accounting, and the navigation stopping reason.
+This workflow remains experimental and opt-in; additional reading does not guarantee a
+correct or complete answer.
+
 ## Optional retrieval and parsing components
 
 Dense and hybrid indexes use the pinned Qwen embedding model. Installing the optional local
@@ -67,6 +76,28 @@ Docling is an optional PDF parser for structured text and native source location
 disabled in this integration; scans and image-only evidence are outside the supported path. Its parser
 dependencies and model assets are optional and larger than the core install. Start with the
 default text parser and inspect extracted text before indexing.
+
+For TXT or Markdown files, supply `--tokenizer-dir TOKENIZER_DIRECTORY` during ingestion to
+split long paragraphs into token-bounded source blocks. Each block retains its exact original
+character offsets. This configuration creates a distinct document identity; rebuild the index
+for the new document ID.
+
+With the pinned native GPU embedding and reranking assets already prepared, both `ask` and
+`serve` support optional reranking. For example:
+
+```bash
+uv run --locked page-cite-rag index DOCUMENT_ID --method hybrid --native-gpu \
+  --gpu-uuid GPU_UUID --model-dir TOKENIZER_DIRECTORY
+uv run --locked page-cite-rag ask DOCUMENT_ID "What are the important conditions?" \
+  --method hybrid --native-gpu --rerank --backend llama --token-budget exact \
+  --device cuda --gpu-uuid GPU_UUID --model-dir TOKENIZER_DIRECTORY
+```
+
+For the API, select the same index with `serve DOCUMENT_ID --method hybrid
+--embedding-backend native-gpu --rerank --device cuda --gpu-uuid GPU_UUID
+--model-dir TOKENIZER_DIRECTORY`. Embedding, reranking, and answer generation run sequentially.
+Reranking changes candidate order while retaining complete source chunks and the same final
+answer token budget. It remains opt-in; reranking does not guarantee better answers.
 
 ## Local API
 
@@ -111,11 +142,10 @@ prompts, code, and budgets match.
 
 ## Current limits
 
-- This is a development snapshot, not a security-cleared release. The locked Pillow 12.3.0
-  dependency has known vulnerabilities fixed in Pillow 13; the optional Docling stack currently
-  requires Pillow <13, constraining the shared lock. Security audits remain blocking checks.
-  Do not expose this application publicly or process untrusted files. See the
-  [Pillow security fixes](https://pillow.readthedocs.io/en/stable/releasenotes/13.0.0.html).
+- This is a development snapshot, not a security-cleared release. The dependency lock uses
+  Pillow 13 with a compatible optional Docling stack. Dependency audits remain blocking,
+  point-in-time checks, not proof that arbitrary hostile documents are safe to process.
+  Do not expose this local application as a public upload service.
 - The supported workflow is local, single-document reading. It is not an unlimited-context or
   general multi-document research system.
 - OCR, image/chart understanding, robust complex-table interpretation, and production
