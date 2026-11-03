@@ -175,7 +175,7 @@ def _numeric_pairs(
 
 def _metrics_for_dataset(dataset: str) -> tuple[str, ...]:
     if dataset == "product-functional":
-        return ("answer_available", "refused")
+        return ("answer_available", "refused", "item_coverage")
     if dataset == "qasper":
         return ("answer_f1", "evidence_f1", "correct_refusal", "false_refusal")
     if dataset == "longbench-v1-multifieldqa-zh":
@@ -240,6 +240,12 @@ def build_comparison(
             ("fixed-rag", "decomposition-agent"),
             ("fixed-rag", "decomposition-focus-agent"),
             ("decomposition-agent", "decomposition-focus-agent"),
+        )
+    elif arms == ("fixed-rag", "decomposition-fixed-rag", "decomposition-outline-agent"):
+        pairs = (
+            ("fixed-rag", "decomposition-fixed-rag"),
+            ("fixed-rag", "decomposition-outline-agent"),
+            ("decomposition-fixed-rag", "decomposition-outline-agent"),
         )
     else:
         raise ValueError("scored run does not match a supported frozen arm protocol")

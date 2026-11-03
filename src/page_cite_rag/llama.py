@@ -37,11 +37,13 @@ from page_cite_rag.generation import (
 from page_cite_rag.gpu_processes import (
     GPU_DISPATCH_HEADROOM_C,
     MAX_GPU_MEMORY_MIB,
+    SW_THERMAL_RECHECK_SECONDS,
     GpuDispatchCancelled,
     GpuDispatchTimeout,
     gpu_process_lifecycle,
     register_owned_gpu_process,
     snapshot_gpu_processes,
+    transient_sw_thermal_flag,
     unregister_owned_gpu_process,
     wait_for_gpu_dispatch,
 )
@@ -267,6 +269,7 @@ class LlamaModelClient:
             "guard_error": None,
             "last_gpu_check": None,
             "monitor_sample_count": 0,
+            "transient_sw_thermal_flags": 0,
             "observed_gpu_peak": {"memory_mib": None, "temperature_c": None},
         }
         self._exit_before_captured = False
@@ -423,18 +426,30 @@ class LlamaModelClient:
         return health
 
     def _check_gpu(self, *, before: bool = False) -> None:
-        try:
-            sample, process_state = snapshot_gpu_processes(
-                self._gpu_snapshot,
-                expected_process=self._process if not before else None,
-            )
-        except (ModelError, OSError, ValueError) as exc:
-            self._record_guard_error("gpu_status_unavailable")
-            if isinstance(exc, ModelError):
-                raise
-            raise ModelError("GPU status unavailable; stop rather than assume it is safe") from None
+        def snapshot():
+            try:
+                return snapshot_gpu_processes(
+                    self._gpu_snapshot,
+                    expected_process=self._process if not before else None,
+                )
+            except (ModelError, OSError, ValueError) as exc:
+                self._record_guard_error("gpu_status_unavailable")
+                if isinstance(exc, ModelError):
+                    raise
+                raise ModelError(
+                    "GPU status unavailable; stop rather than assume it is safe"
+                ) from None
+
+        sample, process_state = snapshot()
         phase = "startup" if before else "monitor"
         self._record_gpu_sample(sample, process_state=process_state, phase=phase)
+        if self.config.max_gpu_temperature_c > 80 and transient_sw_thermal_flag(sample):
+            time.sleep(SW_THERMAL_RECHECK_SECONDS)
+            sample, process_state = snapshot()
+            self._record_gpu_sample(sample, process_state=process_state, phase="recheck")
+            if not (sample["hw_thermal_slowdown"] or sample["sw_thermal_slowdown"]):
+                with self._diagnostic_lock:
+                    self._diagnostic["transient_sw_thermal_flags"] += 1
         if process_state["owned_service_exited"]:
             self._record_guard_error("owned_service_exited")
             raise ModelError("owned llama service exited during GPU monitoring")

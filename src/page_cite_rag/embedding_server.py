@@ -22,11 +22,13 @@ from page_cite_rag.embedding_native import GGUF_REVISION, GGUF_SHA256
 from page_cite_rag.gpu_processes import (
     GPU_DISPATCH_HEADROOM_C,
     MAX_GPU_MEMORY_MIB,
+    SW_THERMAL_RECHECK_SECONDS,
     GpuDispatchCancelled,
     GpuDispatchTimeout,
     gpu_process_lifecycle,
     register_owned_gpu_process,
     snapshot_gpu_processes,
+    transient_sw_thermal_flag,
     unregister_owned_gpu_process,
     wait_for_gpu_dispatch,
 )
@@ -111,6 +113,46 @@ def _temperature_limits(uuid: str, limit_c: int) -> dict:
         raise RetrievalError("GPU thermal thresholds unavailable for embedding") from None
 
 
+def _read_gpu(uuid: str, temperature_limits: dict | None) -> dict:
+    raw = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "-i",
+            uuid,
+            "--query-gpu=memory.used,temperature.gpu,"
+            "clocks_throttle_reasons.hw_thermal_slowdown,"
+            "clocks_throttle_reasons.sw_thermal_slowdown",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+        timeout=3,
+    ).strip()
+    memory, temperature, hardware, software = [value.strip() for value in raw.split(",")]
+    raw_pids = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "-i",
+            uuid,
+            "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+        timeout=3,
+    ).strip()
+    result = {
+        "memory_mib": int(memory),
+        "temperature_c": int(temperature),
+        "pids": {int(pid) for pid in raw_pids.splitlines() if pid},
+        "hw_thermal_slowdown": hardware == "Active",
+        "sw_thermal_slowdown": software == "Active",
+    }
+    if temperature_limits is not None:
+        result.update(temperature_limits)
+    if hardware not in ("Active", "Not Active") or software not in ("Active", "Not Active"):
+        raise RetrievalError("GPU thermal telemetry unavailable for embedding")
+    return result
+
+
 def _gpu_sample(
     uuid: str,
     *,
@@ -129,46 +171,14 @@ def _gpu_sample(
             or max_gpu_temperature_c > temperature_limits["max_operating_c"] - 5
         ):
             raise ValueError("GPU temperature guard lacks the required headroom")
-        raw = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "-i",
-                uuid,
-                "--query-gpu=memory.used,temperature.gpu,"
-                "clocks_throttle_reasons.hw_thermal_slowdown,"
-                "clocks_throttle_reasons.sw_thermal_slowdown",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=3,
-        ).strip()
-        memory, temperature, hardware, software = [value.strip() for value in raw.split(",")]
-        raw_pids = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "-i",
-                uuid,
-                "--query-compute-apps=pid",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=3,
-        ).strip()
-        result = {
-            "memory_mib": int(memory),
-            "temperature_c": int(temperature),
-            "pids": {int(pid) for pid in raw_pids.splitlines() if pid},
-            "hw_thermal_slowdown": hardware == "Active",
-            "sw_thermal_slowdown": software == "Active",
-        }
-        if temperature_limits is not None:
-            result.update(temperature_limits)
-        if hardware not in ("Active", "Not Active") or software not in (
-            "Active",
-            "Not Active",
-        ):
-            raise RetrievalError("GPU thermal telemetry unavailable for embedding")
-        if hardware == "Active" or software == "Active":
+        result = _read_gpu(uuid, temperature_limits)
+        if transient_sw_thermal_flag(result):
+            flagged_c = result["temperature_c"]
+            time.sleep(SW_THERMAL_RECHECK_SECONDS)
+            result = _read_gpu(uuid, temperature_limits)
+            if not (result["hw_thermal_slowdown"] or result["sw_thermal_slowdown"]):
+                result["transient_sw_thermal_flag_c"] = flagged_c
+        if result["hw_thermal_slowdown"] or result["sw_thermal_slowdown"]:
             raise _GpuGuardTriggered("gpu_thermal_slowdown", result)
         if result["memory_mib"] > MAX_GPU_MEMORY_MIB:
             raise _GpuGuardTriggered("gpu_memory_limit", result)
@@ -409,6 +419,9 @@ class NativeEmbeddingServer:
             },
             "hw_thermal_slowdown": any(sample["hw_thermal_slowdown"] for sample in samples),
             "sw_thermal_slowdown": any(sample["sw_thermal_slowdown"] for sample in samples),
+            "transient_sw_thermal_flags": sum(
+                "transient_sw_thermal_flag_c" in sample for sample in samples
+            ),
             "guard_error": self._guard_error,
             "server_exit_code": self._exit_code,
             "server_termination_requested": self._termination_requested,

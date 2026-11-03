@@ -2466,6 +2466,24 @@ def test_product_score_reports_availability_without_fabricating_correctness(tmp_
     assert row["review_required"] is True
 
 
+def test_item_coverage_counts_only_anchors_inside_cited_source_text():
+    items = [
+        {"item_id": "cited", "anchors": ["數字鴻溝"]},
+        {"item_id": "only-in-answer", "anchors": ["学术诚信是一个关键问题"]},
+        {"item_id": "alternative", "anchors": ["missing anchor", "cross-entropy loss"]},
+    ]
+    result = {
+        "answer": "学术诚信是一个关键问题",
+        "answer_claims": [{"citations": [{"quote": "教育中的数字\n鸿沟"}]}],
+        "detail_claims": [{"citations": [{"quote": "We optimize Cross-Entropy  loss."}]}],
+    }
+
+    coverage = run_reading_eval._item_coverage(result, items)
+
+    assert coverage == {"item_coverage": 2 / 3, "covered_item_ids": ["cited", "alternative"]}
+    assert run_reading_eval._item_coverage(None, items)["item_coverage"] == 0
+
+
 def test_score_run_uses_qasper_unanswerable_gold_for_refusal_metrics(tmp_path):
     case_id = "qasper-no-answer"
     arm = "fixed-rag"

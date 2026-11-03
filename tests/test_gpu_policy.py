@@ -12,6 +12,7 @@ from page_cite_rag.generation import ModelError
 from page_cite_rag.gpu_processes import (
     MAX_GPU_MEMORY_MIB,
     stable_gpu_headroom_window,
+    transient_sw_thermal_flag,
     wait_for_gpu_dispatch,
 )
 from test_llama import make_client
@@ -307,3 +308,85 @@ def test_cli_rejects_override_without_cuda(backend, device, capsys):
         == 1
     )
     assert "invalid configuration or local resource" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("change", "transient"),
+    [
+        ({"temperature_c": 53, "sw_thermal_slowdown": True}, True),
+        ({"temperature_c": 80, "sw_thermal_slowdown": True}, True),
+        ({"temperature_c": 81, "sw_thermal_slowdown": True}, False),
+        ({"temperature_c": 53, "sw_thermal_slowdown": True, "hw_thermal_slowdown": True}, False),
+        ({"temperature_c": 53, "sw_thermal_slowdown": False}, False),
+    ],
+)
+def test_only_a_software_flag_at_or_below_80_c_is_a_recheck_candidate(change, transient):
+    assert transient_sw_thermal_flag(health_sample(**change)) is transient
+
+
+@pytest.mark.parametrize(("second", "stops"), [({}, False), ({"sw_thermal_slowdown": True}, True)])
+def test_llama_rereads_a_brief_software_flag_and_stops_if_it_persists(
+    tmp_path, monkeypatch, second, stops
+):
+    client = higher_client(tmp_path, monkeypatch)
+    samples = iter(
+        (
+            health_sample(temperature_c=53, sw_thermal_slowdown=True),
+            health_sample(temperature_c=52, **second),
+        )
+    )
+    monkeypatch.setattr(client, "_gpu_snapshot", lambda: next(samples))
+    monkeypatch.setattr(llama.time, "sleep", lambda _seconds: None)
+    with client:
+        if stops:
+            with pytest.raises(ModelError, match="thermal slowdown"):
+                client._check_gpu(before=True)
+        else:
+            client._check_gpu(before=True)
+            diagnostics = client.diagnostics()
+            assert diagnostics["transient_sw_thermal_flags"] == 1
+            assert [s["phase"] for s in diagnostics["monitor_samples"][-2:]] == [
+                "startup",
+                "recheck",
+            ]
+
+
+@pytest.mark.parametrize(
+    ("second", "category"),
+    [
+        ("6000,52,Not Active,Not Active", None),
+        ("6000,52,Not Active,Active", "gpu_thermal_slowdown"),
+    ],
+)
+def test_embedding_guard_rereads_a_brief_software_flag(monkeypatch, second, category):
+    responses = iter(("6000,53,Not Active,Active", "12345\n", second, "12345\n"))
+    monkeypatch.setattr(
+        embedding_server.subprocess, "check_output", lambda *_args, **_kwargs: next(responses)
+    )
+    monkeypatch.setattr(embedding_server.time, "sleep", lambda _seconds: None)
+    limits = {"max_operating_c": 93, "target_temperature_c": 84}
+
+    if category is None:
+        sample = embedding_server._gpu_sample(
+            UUID, max_gpu_temperature_c=88, temperature_limits=limits
+        )
+        assert sample["transient_sw_thermal_flag_c"] == 53
+        assert sample["sw_thermal_slowdown"] is False
+    else:
+        with pytest.raises(embedding_server._GpuGuardTriggered) as raised:
+            embedding_server._gpu_sample(UUID, max_gpu_temperature_c=88, temperature_limits=limits)
+        assert raised.value.category == category
+
+
+def test_embedding_guard_still_stops_at_once_on_a_software_flag_above_80_c(monkeypatch):
+    responses = iter(("6000,84,Not Active,Active", "12345\n"))
+    monkeypatch.setattr(
+        embedding_server.subprocess, "check_output", lambda *_args, **_kwargs: next(responses)
+    )
+    with pytest.raises(embedding_server._GpuGuardTriggered) as raised:
+        embedding_server._gpu_sample(
+            UUID,
+            max_gpu_temperature_c=88,
+            temperature_limits={"max_operating_c": 93, "target_temperature_c": 84},
+        )
+    assert raised.value.category == "gpu_thermal_slowdown"

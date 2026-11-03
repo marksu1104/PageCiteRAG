@@ -7,6 +7,7 @@ from tests.test_agent_workflow import _Retriever, _setup
 from page_cite_rag.agent import _spans
 from page_cite_rag.application import ask_with_agent
 from page_cite_rag.generation import (
+    ContextBudgetError,
     GenerationResult,
     GenerationStats,
     PromptBudget,
@@ -39,6 +40,7 @@ class _ScriptedModel:
         self.cite_source_id = cite_source_id
         self.gap_payloads: list[dict] = []
         self.writer_payloads: list[dict] = []
+        self.evidence_limit: int | None = None
 
     def count_chat_input_tokens(self, payload):
         return 100
@@ -52,12 +54,21 @@ class _ScriptedModel:
             exact_input_tokens=100,
         )
 
-    def prepare_budget(self, _messages, _schema):
+    def prepare_budget(self, messages, _schema):
+        evidence = json.loads(messages[1].content).get("evidence", ())
+        if self.evidence_limit is not None and len(evidence) > self.evidence_limit:
+            raise ContextBudgetError("scripted writer context is full")
         return self._budget()
 
     def generate(self, messages, response_model):
         payload = json.loads(messages[1].content)
-        if response_model.__name__ in ("GapCheck", "FocusSelection"):
+        if response_model.__name__ in (
+            "GapCheck",
+            "FocusSelection",
+            "OutlineSelection",
+            "SectionSources",
+            "FollowUpSelection",
+        ):
             self.gap_payloads.append(payload)
             reply = self.gap_replies.pop(0)
             if isinstance(reply, Exception):
@@ -270,4 +281,259 @@ def test_focus_handoff_lists_only_sources_that_survive_the_total_cap(tmp_path, m
     handoff = model.writer_payloads[0]["navigation_handoff"]["reading_report"]
     assert handoff["requirements"][0]["source_ids"] == ids[:2]
     assert len(model.writer_payloads[0]["evidence"]) == 2
+    assert answer.result.status == "answered"
+
+
+def test_quote_verification_tolerates_whitespace_and_script_but_not_invention():
+    from page_cite_rag.gap_agent import quote_is_verbatim
+
+    source = "教育领域的人工智能\n必须遵守人权标准。"
+    assert quote_is_verbatim("教育領域的人工智能 必須遵守人權標準", source)
+    assert not quote_is_verbatim("人工智能可以取代教師", source)
+    assert not quote_is_verbatim("教育", source)  # too short to verify anything
+
+
+def test_outline_reading_hands_writer_the_sources_marked_in_chosen_sections(tmp_path):
+    workflow, result, blocks, target = _prepare(tmp_path)
+    initial = (blocks[1],)
+    target_source = next(iter(_spans((target,))))
+
+    def choose(payload):
+        ids = [e["section_id"] for e in payload["outline"] if "Result" in e["title"]]
+        return {"section_ids": ids}
+
+    def read(payload):
+        assert payload["chosen_sections"] == ["Results"]
+        source = next(
+            item["source_id"]
+            for part in payload["sections"]
+            for item in part["sources"]
+            if "Result paragraph" in item["text"]
+        )
+        return {"source_ids": [source, source]}
+
+    def follow_up(payload):
+        assert [(p["section"], p["text"].strip()) for p in payload["marked_passages"]] == [
+            ("Results", "Result paragraph.")
+        ]
+        assert "Results" not in [e["title"] for e in payload["unread_outline"]]
+        return {"section_ids": []}
+
+    model = _ScriptedModel(workflow, [choose, read, follow_up], target_source)
+    workflow._model = model
+    answer = ask_with_agent(
+        workflow,
+        result.query,
+        language="en",
+        initial_search=result,
+        initial_blocks=initial,
+        strategy="outline",
+    )
+
+    trace = answer.trace["agent"]
+    assert trace["strategy"] == "outline"
+    read_event = next(e for e in trace["tool_trace"] if e.get("mode") == "section")
+    assert read_event["sources_marked"] == 1
+    evidence_ids = [item["source_id"] for item in model.writer_payloads[0]["evidence"]]
+    assert target_source in evidence_ids
+    assert blocks[1].block_id not in trace["initial_answer_block_ids"]
+    assert trace["follow_up_section_ids"] == []
+    # select + one section read + follow-up check + writer
+    assert answer.result.agent_usage.model_calls == 4
+
+
+def _markdown_reading(tmp_path, text: str, question: str, hit_prefix: str):
+    """Workflow over a self-authored Markdown file whose outline comes from its headings."""
+    from page_cite_rag.full_answer import FullAnswerWorkflow
+    from page_cite_rag.generation import GenerationConfig
+    from page_cite_rag.ingest import prepare_source
+    from page_cite_rag.store import SQLiteDocumentStore
+
+    source = tmp_path / "report.md"
+    source.write_text(text, encoding="utf-8")
+    prepared = prepare_source(source, usage_scope="self-authored-test")
+    store = SQLiteDocumentStore(tmp_path / "documents.sqlite3")
+    store.ingest(prepared.document, prepared.iter_units())
+    blocks = store.get_blocks(prepared.document.document_id)
+    hit = next(block for block in blocks if block.text.startswith(hit_prefix))
+    result = SearchResult(
+        document_id=prepared.document.document_id,
+        index_id="synthetic-index",
+        method="bm25",
+        query=question,
+        hits=(SearchHit(rank=1, score=1.0, block=hit),),
+        elapsed_ms=0.1,
+    )
+    workflow = FullAnswerWorkflow(
+        SQLiteDocumentStore(store.database_path, read_only=True),
+        prepared.document.document_id,
+        _Retriever(result),
+        None,
+        GenerationConfig(num_predict=3072),
+    )
+    return workflow, result, blocks, hit
+
+
+def _mark(prefix: str):
+    """Scripted reader that marks the sources whose text starts with ``prefix``."""
+
+    def read(payload):
+        return {
+            "source_ids": [
+                item["source_id"]
+                for part in payload["sections"]
+                for item in part["sources"]
+                if item["text"].startswith(prefix)
+            ]
+        }
+
+    return read
+
+
+def _section_ids(payload, *titles: str) -> dict:
+    entries = payload.get("outline") or payload["unread_outline"]
+    return {"section_ids": [e["section_id"] for e in entries if e["title"] in titles]}
+
+
+def _ask(workflow, question, result, initial):
+    return ask_with_agent(
+        workflow,
+        question,
+        language="en",
+        initial_search=result,
+        initial_blocks=(initial,),
+        strategy="outline",
+    )
+
+
+def test_outline_reading_keeps_paragraphs_the_question_names(tmp_path):
+    question = "Which strategies does paragraph 12 refer to?"
+    workflow, result, blocks, strategy = _markdown_reading(
+        tmp_path,
+        "# Summary\n\n12. States should apply the strategies set out above.\n\n"
+        "## Strategies\n\nStrategy text.\n\n## Other\n\nOther text.\n",
+        question,
+        "Strategy text",
+    )
+    named = next(block for block in blocks if block.text.startswith("12."))
+    model = _ScriptedModel(
+        workflow,
+        [lambda p: _section_ids(p, "Strategies"), _mark("Strategy"), {"section_ids": []}],
+        next(iter(_spans((strategy,)))),
+    )
+    workflow._model = model
+    answer = _ask(workflow, question, result, strategy)
+
+    trace = answer.trace["agent"]
+    assert trace["pinned_block_ids"] == [named.block_id]
+    assert named.block_id in trace["initial_answer_block_ids"]
+    assert strategy.block_id in trace["initial_answer_block_ids"]
+
+
+def test_long_outline_is_judged_in_parts_and_small_sections_share_one_read(tmp_path):
+    question = "List every finding."
+    parts = "".join(f"## Part {n}\n\nText of part {n}.\n\n" for n in range(1, 60))
+    workflow, result, blocks, first = _markdown_reading(
+        tmp_path, "# Report\n\nIntro.\n\n" + parts, question, "Intro"
+    )
+    late = next(block for block in blocks if block.text.startswith("Text of part 51."))
+    payloads = []
+
+    def choose(payload):
+        payloads.append(payload)
+        return _section_ids(payload, "Part 50", "Part 51")
+
+    def read(payload):
+        assert [part["title"] for part in payload["sections"]] == ["Part 50", "Part 51"]
+        return _mark("Text of part 51")(payload)
+
+    model = _ScriptedModel(
+        workflow, [choose, choose, read, {"section_ids": []}], next(iter(_spans((late,))))
+    )
+    workflow._model = model
+    answer = _ask(workflow, question, result, first)
+
+    # 60 sections: two near-equal parts, each judged on its own (the first chose nothing).
+    assert [(p["outline_part"], len(p["outline"])) for p in payloads] == [
+        ("1 of 2", 30),
+        ("2 of 2", 30),
+    ]
+    trace = answer.trace["agent"]
+    assert trace["outline_pages"] == 2
+    assert len(trace["selected_section_ids"]) == 2
+    reads = [e for e in trace["tool_trace"] if e.get("mode") == "section"]
+    assert [len(e["section_ids"]) for e in reads] == [2]
+    assert late.block_id in trace["initial_answer_block_ids"]
+    assert first.block_id not in trace["initial_answer_block_ids"]
+
+
+def test_outline_reading_follows_up_where_a_marked_passage_points_back(tmp_path):
+    question = "Trace what the discussion says about widgets back to their definition."
+    workflow, result, blocks, discussion = _markdown_reading(
+        tmp_path,
+        "# Paper\n\n## Definitions\n\nA widget is a small gear.\n\n"
+        "## Methods\n\nWe built things.\n\n"
+        "## Discussion\n\nAs defined earlier, widgets failed under load.\n",
+        question,
+        "As defined",
+    )
+    definition = next(block for block in blocks if block.text.startswith("A widget"))
+
+    def follow_up(payload):
+        assert payload["sections_read"] == ["Discussion"]
+        assert payload["marked_passages"][0]["text"].startswith("As defined earlier")
+        return _section_ids(payload, "Definitions")
+
+    def read_back(payload):
+        assert payload["chosen_sections"] == ["Definitions"]
+        return _mark("A widget")(payload)
+
+    model = _ScriptedModel(
+        workflow,
+        [lambda p: _section_ids(p, "Discussion"), _mark("As defined"), follow_up, read_back],
+        next(iter(_spans((discussion,)))),
+    )
+    workflow._model = model
+    answer = _ask(workflow, question, result, discussion)
+
+    trace = answer.trace["agent"]
+    assert len(trace["follow_up_section_ids"]) == 1
+    assert [e["chosen_by"] for e in trace["tool_trace"] if e.get("mode") == "section"] == [
+        "model_section_selection",
+        "model_follow_up",
+    ]
+    assert definition.block_id in trace["initial_answer_block_ids"]
+    assert discussion.block_id in trace["initial_answer_block_ids"]
+
+
+def test_outline_reading_keeps_one_source_per_section_before_seconds_when_writer_is_full(
+    tmp_path,
+):
+    question = "List the finding of every part."
+    text = "# Report\n\nIntro.\n\n" + "".join(
+        f"## Part {n}\n\nFinding {n} first.\n\nFinding {n} second.\n\n" for n in (1, 2, 3)
+    )
+    workflow, result, blocks, first = _markdown_reading(tmp_path, text, question, "Finding 1 first")
+    firsts = [b for b in blocks if b.text.startswith("Finding") and "first" in b.text]
+    model = _ScriptedModel(
+        workflow,
+        [lambda p: _section_ids(p, "Part 1", "Part 2", "Part 3"), _mark("Finding"), {}],
+        next(iter(_spans((first,)))),
+    )
+    model.evidence_limit = 3
+    workflow._model = model
+    answer = _ask(workflow, question, result, first)
+
+    trace = answer.trace["agent"]
+    assert trace["marked_block_count"] == 6
+    assert trace["initial_answer_block_ids"] == [b.block_id for b in firsts]
+    assert len(trace["writer_omitted_marked_block_ids"]) == 3
+    # The shared handoff treats returned blocks as writer-eligible, so reads return only
+    # what fits and record the rest separately.
+    reads = [e for e in trace["tool_trace"] if e.get("mode") == "section"]
+    assert {id for e in reads for id in e["returned_block_ids"]} == {b.block_id for b in firsts}
+    assert {id for e in reads for id in e["writer_omitted_block_ids"]} == set(
+        trace["writer_omitted_marked_block_ids"]
+    )
+    assert len(model.writer_payloads[0]["evidence"]) == 3
     assert answer.result.status == "answered"

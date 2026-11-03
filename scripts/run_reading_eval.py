@@ -36,6 +36,7 @@ from page_cite_rag.dense import DenseRetriever, build_dense_index, dense_index_k
 from page_cite_rag.embedding import DEFAULT_MODEL_DIR
 from page_cite_rag.embedding_native import NativeEmbeddingEncoder
 from page_cite_rag.embedding_server import DEFAULT_GGUF_PATH, NativeEmbeddingServer
+from page_cite_rag.gap_agent import quote_is_verbatim
 from page_cite_rag.generation import ContextBudgetError, ModelError, OutputValidationError
 from page_cite_rag.gpu_processes import MAX_GPU_MEMORY_MIB
 from page_cite_rag.gpu_retrieval import StagedGpuSearch
@@ -103,7 +104,9 @@ AGENT_FOCUS_ARMS = (
     "decomposition-agent",
     "decomposition-focus-agent",
 )
-READING_PLAN_ARM_SETS = (QUALITY_V1_ARMS, AGENT_FOCUS_ARMS)
+# Agent-specific structured whole-document tasks against both fixed controls.
+AGENT_OUTLINE_ARMS = ("fixed-rag", "decomposition-fixed-rag", "decomposition-outline-agent")
+READING_PLAN_ARM_SETS = (QUALITY_V1_ARMS, AGENT_FOCUS_ARMS, AGENT_OUTLINE_ARMS)
 READING_PLAN_CASE_CEILING = 160
 REVIEW_ARMS = {
     "repair-once": "once",
@@ -120,6 +123,7 @@ ARMS = (
     "decomposition-fixed-rag",
     "decomposition-agent",
     "decomposition-focus-agent",
+    "decomposition-outline-agent",
     *PROMPT_COMPARISON_ARMS,
     "fixed-rag-reranked",
     *REVIEW_ARMS,
@@ -137,6 +141,9 @@ ARM_ARCHITECTURES = {
     ),
     "decomposition-focus-agent": (
         "question_plan_multi_query_hybrid_rrf_then_focused_source_selection_and_shared_writer"
+    ),
+    "decomposition-outline-agent": (
+        "question_plan_then_outline_section_reading_with_verified_quotes_and_shared_writer"
     ),
     "single-agent-no-tools": "single_agent_structured_answer_over_frozen_initial_evidence",
     "delegated-agent": "legacy_bounded_navigation_then_separate_writer",
@@ -234,6 +241,7 @@ def _is_agent_arm(arm: str) -> bool:
         "single-agent",
         "decomposition-agent",
         "decomposition-focus-agent",
+        "decomposition-outline-agent",
         "single-agent-no-tools",
         "delegated-agent",
         "reading-agent",
@@ -933,6 +941,7 @@ def static_configuration(
         "decomposition-fixed-rag": 1,
         "decomposition-agent": None,
         "decomposition-focus-agent": None,
+        "decomposition-outline-agent": None,
     }
     reading_plan_comparison = tuple(arms) in READING_PLAN_ARM_SETS
     if shared_initial_reranker and not reading_plan_comparison:
@@ -1202,6 +1211,20 @@ def static_configuration(
                     "budget_scope": "navigation_and_shared_writer; one shared planner call",
                 },
                 "decomposition-focus-agent": {
+                    "model_call_limit_per_case": None,
+                    "common_writer_calls_per_case": 1,
+                    "planner_is_shared_and_reported_separately": True,
+                    "data_tool_event_limit_per_case": None,
+                    "call_input_tokens_max": MAX_INTEGRATED_AGENT_CALL_INPUT_TOKENS,
+                    "total_input_tokens_per_case_limit": None,
+                    "call_output_tokens_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
+                    "total_output_tokens_per_case_limit": None,
+                    "final_input_tokens_max": AGENT_FINAL_INPUT_LIMIT,
+                    "final_output_tokens_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
+                    "case_deadline_seconds": MAX_CASE_WALL_SECONDS,
+                    "budget_scope": "navigation_and_shared_writer; one shared planner call",
+                },
+                "decomposition-outline-agent": {
                     "model_call_limit_per_case": None,
                     "common_writer_calls_per_case": 1,
                     "planner_is_shared_and_reported_separately": True,
@@ -7318,6 +7341,7 @@ def _remaining_quality_writer_reservation(
                 "decomposition-fixed-rag": 1,
                 "decomposition-agent": 2,
                 "decomposition-focus-agent": 2,
+                "decomposition-outline-agent": 2,
             }[arm]
     return total
 
@@ -7474,7 +7498,13 @@ def _run_arm(
                         arm == "fixed-rag-followup-once"
                         and counted_model.generate_calls == counted_model._case_start_calls
                     )
-                    or arm in ("decomposition-agent", "decomposition-focus-agent", "single-agent")
+                    or arm
+                    in (
+                        "decomposition-agent",
+                        "decomposition-focus-agent",
+                        "decomposition-outline-agent",
+                        "single-agent",
+                    )
                 )
                 return _remaining_quality_writer_reservation(
                     run_root,
@@ -7931,6 +7961,7 @@ def _run_arm(
                                     strategy={
                                         "decomposition-agent": "gap",
                                         "decomposition-focus-agent": "focus",
+                                        "decomposition-outline-agent": "outline",
                                     }.get(arm, "react"),
                                     max_model_calls=1 if arm == "single-agent-no-tools" else None,
                                     on_model_call=record_agent_model_call,
@@ -8534,6 +8565,22 @@ def _qasper_cited_passage_ids(
     return tuple(passage_ids)
 
 
+def _item_coverage(prediction_result: dict | None, items: list[dict]) -> dict:
+    """Plan 5.5: an item counts when an answer claim cites source text containing its anchor."""
+    cited = [
+        citation.get("quote", "")
+        for field in ("answer_claims", "detail_claims")
+        for claim in (prediction_result or {}).get(field, [])
+        for citation in claim.get("citations", [])
+    ]
+    covered = [
+        entry["item_id"]
+        for entry in items
+        if any(quote_is_verbatim(anchor, text) for anchor in entry["anchors"] for text in cited)
+    ]
+    return {"item_coverage": len(covered) / len(items), "covered_item_ids": covered}
+
+
 def _score_dataset_group(case: dict, input_row: dict) -> str:
     """Keep translated-query diagnostics out of native benchmark aggregates."""
     dataset = case["dataset"]
@@ -8832,6 +8879,12 @@ def score_run(
                     "answer_language": inputs_by_id[case_id]["language"],
                     "review_required": True,
                 }
+                if "items" in gold_row:
+                    question_score.update(
+                        task_type=gold_row["task_type"],
+                        item_count=len(gold_row["items"]),
+                        **_item_coverage(prediction_result, gold_row["items"]),
+                    )
             elif case["dataset"] == "xrag-zh-mono-crosslingual":
                 support_levels = gold_row["article_support_levels"]
                 block_to_article = raw.get("block_to_article_id", {})
@@ -8944,6 +8997,7 @@ def score_run(
             for key in (
                 "answer_f1",
                 _ZH_T2S_F1_AUXILIARY,
+                "item_coverage",
                 "accuracy",
                 "rouge_l",
                 "answer_char_f1_nonofficial",
@@ -8990,6 +9044,10 @@ def score_run(
                     if values:
                         metrics[f"{name}_mean"] = sum(values) / len(values)
                         metrics[f"{name}_n"] = len(values)
+            for task_type in sorted({row["task_type"] for row in rows if "task_type" in row}):
+                values = [row["item_coverage"] for row in rows if row.get("task_type") == task_type]
+                metrics[f"item_coverage_{task_type}"] = sum(values) / len(values)
+                metrics[f"item_coverage_{task_type}_n"] = len(values)
             refusal_rows = [row for row in rows if "correct_refusal" in row]
             if refusal_rows:
                 metrics["correct_refusals"] = sum(row["correct_refusal"] for row in refusal_rows)

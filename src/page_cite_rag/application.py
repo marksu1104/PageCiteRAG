@@ -563,13 +563,15 @@ def ask_with_agent(
     initial_blocks: Sequence[Block] | None = None,
     on_model_call: Callable[[dict], bool | None] | None = None,
     on_wire_request: Callable[[dict], None] | None = None,
-    strategy: Literal["gap", "focus", "react"] = "react",
+    strategy: Literal["gap", "focus", "outline", "react"] = "react",
 ) -> AgentAnswer:
     """Navigate with one request-scoped agent, then use the shared cited-answer writer.
 
     ``gap`` asks the model only which question parts are missing and lets the program
     search and read; ``focus`` narrows the writer to the few sources that state each
-    need; ``react`` is the tool-calling loop kept for comparison.
+    need; ``outline`` reads the sections chosen from the document outline, follows up once
+    on what they refer back to and hands the writer only the sources the reader marked;
+    ``react`` is the tool-calling loop.
     """
     from page_cite_rag.agent import (
         AGENT_WRITER_RESERVE_SECONDS,
@@ -626,16 +628,22 @@ def ask_with_agent(
             total_output_limit=None,
             tool_call_limit=None,
         )
-    if strategy not in ("gap", "focus", "react"):
+    if strategy not in ("gap", "focus", "outline", "react"):
         raise ValueError("unknown reading strategy")
-    use_gap = strategy in ("gap", "focus") and not delegated and not legacy_integrated
+    use_gap = strategy in ("gap", "focus", "outline") and not delegated and not legacy_integrated
     try:
         if use_gap:
-            from page_cite_rag.gap_agent import run_focus_reading, run_gap_reading
-
-            reading = (run_gap_reading if strategy == "gap" else run_focus_reading)(
-                workflow, question, language, search, blocks, cooldown=navigation_cooldown
+            from page_cite_rag.gap_agent import (
+                run_focus_reading,
+                run_gap_reading,
+                run_outline_reading,
             )
+
+            reading = {
+                "gap": run_gap_reading,
+                "focus": run_focus_reading,
+                "outline": run_outline_reading,
+            }[strategy](workflow, question, language, search, blocks, cooldown=navigation_cooldown)
             for call in reading.trace["gap_model_calls"]:
                 ledger.admit(call["input_tokens"], workflow._budget_config.num_ctx)
                 ledger.complete(call["output_tokens"])

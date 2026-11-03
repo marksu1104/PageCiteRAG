@@ -15,6 +15,25 @@ _processes: dict[int, subprocess.Popen] = {}
 
 MAX_GPU_MEMORY_MIB = 24_000
 GPU_DISPATCH_HEADROOM_C = 15
+# Approved 2026-11-04: a software-only thermal flag at or below this temperature is re-read
+# once after SW_THERMAL_RECHECK_SECONDS and tolerated (and recorded) only if it has cleared.
+TRANSIENT_SW_THERMAL_MAX_C = 80
+SW_THERMAL_RECHECK_SECONDS = 1.0
+
+
+def transient_sw_thermal_flag(sample: dict) -> bool:
+    """Whether a slowdown flag may be a brief boost-limit report that deserves one re-read.
+
+    Driver 470 on the RTX A6000 briefly reports SW thermal slowdown together with SW power
+    cap while clocks are rising (observed at 53 C and 188 of 300 W, cleared within 0.3 s).
+    This never excuses HW slowdown, any slowdown above 80 C or a flag that persists.
+    """
+    return (
+        sample.get("sw_thermal_slowdown") is True
+        and sample.get("hw_thermal_slowdown") is False
+        and type(sample.get("temperature_c")) is int
+        and sample["temperature_c"] <= TRANSIENT_SW_THERMAL_MAX_C
+    )
 
 
 class GpuDispatchTimeout(TimeoutError):

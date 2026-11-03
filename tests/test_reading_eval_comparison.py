@@ -89,10 +89,12 @@ def test_derived_longbench_does_not_claim_an_unavailable_metric() -> None:
     )
 
 
-def test_product_functional_reports_operational_metrics_only() -> None:
+def test_product_functional_reports_operational_metrics_and_item_coverage() -> None:
+    # item_coverage is present only for rubric rows with anchored items (plan 5.5).
     assert comparison._metrics_for_dataset("product-functional") == (
         "answer_available",
         "refused",
+        "item_coverage",
     )
 
 
