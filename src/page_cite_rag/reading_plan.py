@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from page_cite_rag.generation import ChatMessage
 from page_cite_rag.hybrid import reciprocal_rank_fusion
-from page_cite_rag.retrieval import RetrievalError, SearchContextGroup, SearchResult
+from page_cite_rag.retrieval import RetrievalError, SearchContextGroup, SearchHit, SearchResult
 
 MAX_READING_REQUIREMENTS = 12
 MAX_QUERIES_PER_REQUIREMENT = 2
@@ -140,7 +140,7 @@ def fuse_planned_searches(
         or top_k < 1
         or any(result.method != "hybrid" for result in results)
         or len({result.document_id for result in results}) != 1
-        or results[0].query != original_query
+        or results[0].query.strip() != original_query.strip()
     ):
         raise RetrievalError("planned retrieval results have invalid method or document scope")
     normalized = tuple(result.model_copy(update={"query": original_query}) for result in results)
@@ -171,6 +171,18 @@ def fuse_planned_searches(
     groups = tuple(
         group for group in groups if any(bid in ranked_ids for bid in group.source_block_ids)
     )
+    if groups:
+        # A kept chunk must keep every source block, even those ranked below the cut.
+        blocks = {hit.block.block_id: hit.block for result in normalized for hit in result.hits}
+        completed = list(hits)
+        floor = hits[-1].score
+        for group in groups:
+            for block_id in group.source_block_ids:
+                if block_id not in ranked_ids:
+                    rank = len(completed) + 1
+                    ranked_ids[block_id] = rank
+                    completed.append(SearchHit(rank=rank, score=floor, block=blocks[block_id]))
+        hits = tuple(completed)
     digest = hashlib.sha256(
         json.dumps([result.index_id for result in normalized], separators=(",", ":")).encode(
             "ascii"

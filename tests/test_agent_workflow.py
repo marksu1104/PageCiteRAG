@@ -453,7 +453,7 @@ def test_shared_agent_recovers_navigation_without_report_from_verified_originals
     assert len(writer.calls) == 1
     user_payload = json.loads(writer.calls[0][1].content)
     assert user_payload["navigation_handoff"]["reading_report"]["requirements"] == []
-    assert user_payload["navigation_handoff"]["reading_report"]["unresolved"] == [result.query]
+    assert user_payload["navigation_handoff"]["reading_report"]["unresolved"] == []
     assert "failure_evidence" not in user_payload["navigation_handoff"]
     assert invalid_text not in writer.calls[0][1].content
     assert navigator.call_count == 1
@@ -463,8 +463,9 @@ def test_shared_agent_recovers_navigation_without_report_from_verified_originals
     assert answer.trace["agent"]["navigation_recovery"] == (
         "verified_originals_after_incomplete_structured_report"
     )
-    assert answer.result.status == "partial"
-    assert answer.result.stop_reason == "partial"
+    assert answer.result.status == "answered"  # degradation never rewrites the writer status
+    assert answer.trace["agent"]["navigation_degraded"] is True
+    assert answer.result.limitations[-1].startswith(("Agent", "The Agent"))
     assert answer.result.included_block_ids == (initial[0].block_id,)
 
 
@@ -1092,7 +1093,7 @@ def test_single_agent_uses_shared_writer_and_one_budget_ledger(
     findings = writer_payload["navigation_handoff"]["reading_report"]["requirements"]
     if not repair_success:
         assert findings == []
-        assert answer.result.status == "partial"
+        assert answer.result.status == "answered"  # the writer's own status is kept
         assert answer.trace["agent"]["navigation_report_partial"] is True
         assert (
             answer.trace["agent"]["navigation_handoff_note_status"] == "partial_source_validation"
@@ -1101,7 +1102,7 @@ def test_single_agent_uses_shared_writer_and_one_budget_ledger(
         assert answer.result.limitations
     else:
         assert findings
-        assert findings[0]["observation"] == "The source supplies this fact."
+        assert "observation" not in findings[0]  # index-only handoff
         assert answer.trace["agent"]["navigation_handoff_note_status"] == "present"
         assert len(findings[0]["source_ids"]) == (2 if read_new_source and report_new_source else 1)
     if cite_unread:

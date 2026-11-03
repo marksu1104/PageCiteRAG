@@ -58,6 +58,18 @@ class FrozenSearchRetriever:
         return self.result
 
 
+def _with_reference_pinning(store: SQLiteDocumentStore, document_id: str, retriever):
+    """Share explicit "paragraph N" address lookup across every retrieval entry point."""
+    from page_cite_rag.references import ReferencePinningRetriever, numbered_paragraph_blocks
+
+    markers = numbered_paragraph_blocks(
+        store, document_id, native_source=getattr(retriever, "store", None)
+    )
+    if not markers:
+        return retriever
+    return ReferencePinningRetriever(retriever, store, document_id, markers)
+
+
 def document_retriever(
     store: SQLiteDocumentStore,
     document_id: str,
@@ -83,27 +95,35 @@ def document_retriever(
             raise ValueError("Docling source requires its explicit hybrid encoder and index")
         from page_cite_rag.docling_retrieval import load_retriever
 
-        return load_retriever(
+        return _with_reference_pinning(
             store,
             document_id,
-            encoder,
-            candidates=candidate_count,
-            constant=FORMAL_RETRIEVAL.rrf_constant,
+            load_retriever(
+                store,
+                document_id,
+                encoder,
+                candidates=candidate_count,
+                constant=FORMAL_RETRIEVAL.rrf_constant,
+            ),
         )
     lexical, dense = document_retriever_parts(
         store, document_id, method, encoder=encoder, versioned_dense=versioned_dense
     )
     if method == "bm25":
-        return lexical
+        return _with_reference_pinning(store, document_id, lexical)
     if method == "dense":
-        return dense
+        return _with_reference_pinning(store, document_id, dense)
     from page_cite_rag.hybrid import HybridRetriever
 
-    return HybridRetriever(
-        lexical,
-        dense,
-        candidates=candidate_count,
-        constant=FORMAL_RETRIEVAL.rrf_constant,
+    return _with_reference_pinning(
+        store,
+        document_id,
+        HybridRetriever(
+            lexical,
+            dense,
+            candidates=candidate_count,
+            constant=FORMAL_RETRIEVAL.rrf_constant,
+        ),
     )
 
 
@@ -513,7 +533,8 @@ def _recover_original_context(
         navigation_handoff_note=None,
         navigation_handoff_note_status="recovered_without_structured_report",
     )
-    report = ReadingReport(requirements=[], unresolved=[question[:240] or "requested question"])
+    # Degradation is recorded in the trace; the writer is not told the whole question is open.
+    report = ReadingReport(requirements=[], unresolved=[])
     return AgentRun(
         context=AgentContext(
             tuple(initial_by_id[block_id] for block_id in initial_ids),
@@ -542,8 +563,14 @@ def ask_with_agent(
     initial_blocks: Sequence[Block] | None = None,
     on_model_call: Callable[[dict], bool | None] | None = None,
     on_wire_request: Callable[[dict], None] | None = None,
+    strategy: Literal["gap", "focus", "react"] = "react",
 ) -> AgentAnswer:
-    """Navigate with one request-scoped agent, then use the shared cited-answer writer."""
+    """Navigate with one request-scoped agent, then use the shared cited-answer writer.
+
+    ``gap`` asks the model only which question parts are missing and lets the program
+    search and read; ``focus`` narrows the writer to the few sources that state each
+    need; ``react`` is the tool-calling loop kept for comparison.
+    """
     from page_cite_rag.agent import (
         AGENT_WRITER_RESERVE_SECONDS,
         MAX_INTEGRATED_AGENT_CALL_INPUT_TOKENS,
@@ -599,37 +626,50 @@ def ask_with_agent(
             total_output_limit=None,
             tool_call_limit=None,
         )
+    if strategy not in ("gap", "focus", "react"):
+        raise ValueError("unknown reading strategy")
+    use_gap = strategy in ("gap", "focus") and not delegated and not legacy_integrated
     try:
-        chat_model_context = (
-            local_chat_model(model, on_request=on_wire_request)
-            if on_wire_request is not None
-            else local_chat_model(model)
-        )
-        with chat_model_context as chat_model:
-            reading = run_bounded_reading_agent(
-                workflow,
-                question,
-                language,
-                search,
-                blocks,
-                chat_model,
-                count_chat_input_tokens=model.count_chat_input_tokens,
-                delegated=delegated,
-                cooldown=navigation_cooldown,
-                max_model_calls=(
-                    max_model_calls
-                    if max_model_calls is not None
-                    else 7
-                    if delegated
-                    else 1
-                    if legacy_integrated
-                    else navigation_calls
-                ),
-                final_answer=legacy_integrated,
-                shared_ledger=ledger,
-                data_tools_enabled=data_tools_enabled,
-                on_model_call=on_model_call,
+        if use_gap:
+            from page_cite_rag.gap_agent import run_focus_reading, run_gap_reading
+
+            reading = (run_gap_reading if strategy == "gap" else run_focus_reading)(
+                workflow, question, language, search, blocks, cooldown=navigation_cooldown
             )
+            for call in reading.trace["gap_model_calls"]:
+                ledger.admit(call["input_tokens"], workflow._budget_config.num_ctx)
+                ledger.complete(call["output_tokens"])
+        else:
+            chat_model_context = (
+                local_chat_model(model, on_request=on_wire_request)
+                if on_wire_request is not None
+                else local_chat_model(model)
+            )
+            with chat_model_context as chat_model:
+                reading = run_bounded_reading_agent(
+                    workflow,
+                    question,
+                    language,
+                    search,
+                    blocks,
+                    chat_model,
+                    count_chat_input_tokens=model.count_chat_input_tokens,
+                    delegated=delegated,
+                    cooldown=navigation_cooldown,
+                    max_model_calls=(
+                        max_model_calls
+                        if max_model_calls is not None
+                        else 7
+                        if delegated
+                        else 1
+                        if legacy_integrated
+                        else navigation_calls
+                    ),
+                    final_answer=legacy_integrated,
+                    shared_ledger=ledger,
+                    data_tools_enabled=data_tools_enabled,
+                    on_model_call=on_model_call,
+                )
     except AgentRunFailure as exc:
         if delegated or legacy_integrated:
             raise
@@ -933,17 +973,8 @@ def ask_with_agent(
                     "uses verified originals and may be incomplete."
                 )
             )
-            result = result.model_copy(
-                update={
-                    "status": "partial"
-                    if result.status != "insufficient_evidence"
-                    else result.status,
-                    "stop_reason": "partial"
-                    if result.status != "insufficient_evidence"
-                    else result.stop_reason,
-                    "limitations": (*result.limitations, limitation),
-                }
-            )
+            # Keep the writer's own status; degradation is a separate trace field.
+            result = result.model_copy(update={"limitations": (*result.limitations, limitation)})
         result = result.model_copy(
             update={
                 "retrieval": retrieval_trace,

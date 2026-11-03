@@ -841,7 +841,7 @@ def test_static_configuration_pins_integrated_agent_limits_and_primary_arms(tmp_
     )
 
     assert static["run_selection"]["arms"] == ["fixed-rag-reranked", "single-agent"]
-    assert static["runner_version"] == "frozen-reading-eval-v30-agent-control-followup-v1"
+    assert static["runner_version"] == "frozen-reading-eval-v31-batch-declared"
     assert static["agent"]["architecture_by_arm"] == {
         "fixed-rag-reranked": "fixed_hybrid_retrieval_then_one_structured_answer",
         "single-agent": "single_agent_navigation_then_shared_answer_writer",
@@ -945,11 +945,13 @@ def test_quality_v1_static_budget_accounts_for_the_shared_planner(tmp_path):
     assert static["answer_call_budget"]["phase_generation_dispatch_limit"] == 720
     assert static["reading_plan"]["planned_query_input_tokens_max"] == 25_000
 
-    with pytest.raises(ValueError, match="72-case ceiling"):
+    with pytest.raises(ValueError, match="frozen case ceiling"):
         run_reading_eval.static_configuration(
             tmp_path,
             manifest,
-            selected_case_ids=[f"case-{index}" for index in range(73)],
+            selected_case_ids=[
+                f"case-{index}" for index in range(run_reading_eval.READING_PLAN_CASE_CEILING + 1)
+            ],
             selected_arms=list(run_reading_eval.QUALITY_V1_ARMS),
         )
 
@@ -1201,182 +1203,6 @@ def test_quality_v1_global_call_ledger_excludes_audited_pre_dispatch_voids(tmp_p
         wrapper._reserve_global_call(Schema)
 
 
-def test_v2_generation_budget_covers_non_planner_phases_and_tracks_usage(tmp_path):
-    class Schema(BaseModel):
-        value: str
-
-    batch_root = tmp_path / "quality-repair-closure-v2"
-    batch_root.mkdir()
-    progress = {
-        "revision": "quality-repair-closure-v2",
-        "state": "in_progress",
-        "scope": {"maximum_new_generation_dispatches": 696},
-        "counters": {
-            "generation_dispatches": 0,
-            "generation_input_tokens": 0,
-            "generation_output_tokens": 0,
-            "unknown_generation_usage": 0,
-        },
-    }
-    (batch_root / "progress.json").write_text(json.dumps(progress), encoding="utf-8")
-    answer_run = batch_root / "runs" / "answer"
-    ledger, limit = run_reading_eval._global_generation_budget(answer_run, {"reading_plan": None})
-
-    assert ledger == batch_root / "global-model-calls.jsonl"
-    assert limit == 696
-    wrapper = run_reading_eval._CountingModelClient(
-        object(), global_call_ledger=ledger, global_call_limit=limit
-    )
-    wrapper.begin_case(call_context={"phase": "answer", "arm": "fixed-rag", "case_id": "c1"})
-    assert wrapper._reserve_global_call(Schema) == 1
-
-    after_reservation = json.loads((batch_root / "progress.json").read_text(encoding="utf-8"))
-    assert after_reservation["counters"]["generation_dispatches"] == 1
-    assert after_reservation["counters"]["unknown_generation_usage"] == 1
-
-    wrapper._record_global_usage(1, {"stats": {"prompt_eval_count": 321, "eval_count": 23}})
-    after_usage = json.loads((batch_root / "progress.json").read_text(encoding="utf-8"))
-    assert after_usage["counters"]["generation_input_tokens"] == 321
-    assert after_usage["counters"]["generation_output_tokens"] == 23
-    assert after_usage["counters"]["unknown_generation_usage"] == 0
-
-
-def test_v2_generation_budget_rejects_progress_with_changed_scope(tmp_path):
-    batch_root = tmp_path / "quality-repair-closure-v2"
-    batch_root.mkdir()
-    (batch_root / "progress.json").write_text(
-        json.dumps(
-            {
-                "revision": "quality-repair-closure-v2",
-                "state": "in_progress",
-                "scope": {"maximum_new_generation_dispatches": 697},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="approved frozen limit"):
-        run_reading_eval._global_generation_budget(
-            batch_root / "runs" / "answer", {"reading_plan": None}
-        )
-
-
-def test_v3_generation_budget_enforces_total_and_phase_limits(tmp_path):
-    from page_cite_rag.generation import ModelError
-
-    class Schema(BaseModel):
-        value: str
-
-    batch_root = tmp_path / "agent-quality-closure-v3"
-    batch_root.mkdir()
-    progress = {
-        "revision": "agent-quality-closure-v3",
-        "state": "in_progress",
-        "scope": {
-            "maximum_new_generation_dispatches": 1134,
-            "phase_generation_dispatch_limits": {
-                "protocol": 1,
-                "development": 42,
-                "regression_answers": 720,
-                "regression_planners": 72,
-                "new_holdout_planners_and_two_flows": 288,
-            },
-        },
-        "counters": {},
-    }
-    (batch_root / "progress.json").write_text(json.dumps(progress), encoding="utf-8")
-    protocol_run = batch_root / "phase1-protocol" / "run"
-    ledger, total_limit = run_reading_eval._global_generation_budget(
-        protocol_run, {"reading_plan": None}
-    )
-    phase = run_reading_eval._global_generation_phase(protocol_run, "run")
-    wrapper = run_reading_eval._CountingModelClient(
-        object(),
-        global_call_ledger=ledger,
-        global_call_limit=total_limit,
-        global_call_phase=phase,
-    )
-    wrapper.begin_case(call_context={"phase": "answer", "case_id": "case-1"})
-
-    assert total_limit == 1134
-    assert phase == "protocol"
-    assert wrapper._reserve_global_call(Schema) == 1
-    with pytest.raises(ModelError, match="phase generation ceiling"):
-        wrapper._reserve_global_call(Schema)
-
-    row = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
-    updated = json.loads((batch_root / "progress.json").read_text(encoding="utf-8"))
-    assert row["budget_phase"] == "protocol"
-    assert row["phase"] == "answer"
-    assert updated["counters"]["generation_dispatches_by_phase"]["protocol"] == 1
-
-
-def test_v3_ledger_corrects_duplicate_writer_observer_reservation(tmp_path):
-    class Schema(BaseModel):
-        value: str
-
-    batch_root = tmp_path / "agent-quality-closure-v3"
-    batch_root.mkdir()
-    progress = {
-        "revision": "agent-quality-closure-v3",
-        "state": "in_progress",
-        "scope": {
-            "maximum_new_generation_dispatches": 1134,
-            "phase_generation_dispatch_limits": {
-                "protocol": 3,
-                "development": 42,
-                "regression_answers": 720,
-                "regression_planners": 72,
-                "new_holdout_planners_and_two_flows": 288,
-            },
-        },
-        "counters": {},
-    }
-    (batch_root / "progress.json").write_text(json.dumps(progress), encoding="utf-8")
-    ledger = batch_root / "global-model-calls.jsonl"
-    rows = []
-    for index in (1, 2, 3):
-        rows.append(
-            {
-                "call_index": index,
-                "state": "reserved_before_dispatch",
-                "budget_phase": "protocol",
-                "arm": "single-agent",
-                "case_id": "case-1",
-            }
-        )
-        rows.append(
-            {
-                "call_index": index,
-                "state": "usage_recorded",
-                "input_tokens": 100 if index == 1 else 200,
-                "output_tokens": 10 if index == 1 else 20,
-                "usage_unknown": False,
-            }
-        )
-    rows.append(
-        {
-            "state": "duplicate_observer_correction",
-            "duplicate_call_index": 2,
-            "actual_call_index": 3,
-        }
-    )
-    run_reading_eval.atomic_jsonl_once(ledger, rows)
-    wrapper = run_reading_eval._CountingModelClient(
-        object(),
-        global_call_ledger=ledger,
-        global_call_limit=1134,
-        global_call_phase="protocol",
-    )
-
-    assert wrapper._reserve_global_call(Schema) == 4
-    updated = json.loads((batch_root / "progress.json").read_text(encoding="utf-8"))
-    assert updated["counters"]["generation_dispatches"] == 3
-    assert updated["counters"]["generation_input_tokens"] == 300
-    assert updated["counters"]["generation_output_tokens"] == 30
-    assert updated["counters"]["generation_dispatches_by_phase"]["protocol"] == 3
-
-
 def test_v4_progress_total_dispatches_match_global_ledger(tmp_path):
     class Schema(BaseModel):
         value: str
@@ -1419,12 +1245,11 @@ def test_v4_progress_total_dispatches_match_global_ledger(tmp_path):
     }
 
 
-def test_agent_followup_generation_budget_uses_its_own_approved_phase_ledger(tmp_path):
+def test_declared_batch_budget_uses_its_own_approved_phase_ledger(tmp_path):
     class Schema(BaseModel):
         value: str
 
-    parent = tmp_path / "agent-production-alignment-v4"
-    batch_root = parent / "agent-control-followup-v1"
+    batch_root = tmp_path / "gap-batch"
     batch_root.mkdir(parents=True)
     limits = {
         "development": 123,
@@ -1433,13 +1258,7 @@ def test_agent_followup_generation_budget_uses_its_own_approved_phase_ledger(tmp
         "new_diagnostics": 240,
         "total": 1299,
     }
-    progress = {
-        "revision": "agent-control-followup-v1",
-        "state": "in_progress",
-        "generation_dispatch_limits": limits,
-        "counters": {},
-    }
-    (batch_root / "progress.json").write_text(json.dumps(progress), encoding="utf-8")
+    _open_batch(batch_root, "gap-batch", limits)
     development_run = batch_root / "development" / "agent-six"
     ledger, total_limit = run_reading_eval._global_generation_budget(
         development_run, {"reading_plan": None}
@@ -1488,6 +1307,54 @@ def test_agent_followup_generation_budget_uses_its_own_approved_phase_ledger(tmp
         )
         == 2
     )
+
+
+def _open_batch(batch_root, revision, limits):
+    batch_root.mkdir(parents=True, exist_ok=True)
+    (batch_root / "batch.json").write_text(
+        json.dumps({"revision": revision, "generation_dispatch_limits": limits}), encoding="utf-8"
+    )
+    (batch_root / "progress.json").write_text(
+        json.dumps(
+            {
+                "revision": revision,
+                "state": "in_progress",
+                "generation_dispatch_limits": limits,
+                "counters": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_batch_budget_refuses_missing_changed_or_inconsistent_declarations(tmp_path):
+    limits = {"development": 5, "total": 5}
+    missing = tmp_path / "missing"
+    (missing / "development").mkdir(parents=True)
+    (missing / "progress.json").write_text("{}", encoding="utf-8")
+    assert run_reading_eval._generation_batch_root(missing / "development") is None
+    assert run_reading_eval._global_generation_budget(missing / "development", {}) == (None, None)
+
+    changed = tmp_path / "changed"
+    _open_batch(changed, "changed", limits)
+    progress = json.loads((changed / "progress.json").read_text(encoding="utf-8"))
+    progress["generation_dispatch_limits"] = {"development": 6, "total": 6}
+    (changed / "progress.json").write_text(json.dumps(progress), encoding="utf-8")
+    with pytest.raises(ValueError, match="approved frozen limit"):
+        run_reading_eval._global_generation_budget(changed / "development", {})
+
+    inconsistent = tmp_path / "inconsistent"
+    _open_batch(inconsistent, "inconsistent", {"development": 5, "total": 9})
+    with pytest.raises(ValueError, match="invalid revision or phase limits"):
+        run_reading_eval._global_generation_budget(inconsistent / "development", {})
+
+    stopped = tmp_path / "stopped"
+    _open_batch(stopped, "stopped", limits)
+    progress = json.loads((stopped / "progress.json").read_text(encoding="utf-8"))
+    progress["state"] = "completed"
+    (stopped / "progress.json").write_text(json.dumps(progress), encoding="utf-8")
+    with pytest.raises(ValueError, match="not approved for dispatch"):
+        run_reading_eval._global_generation_budget(stopped / "development", {})
 
 
 def test_static_configuration_freezes_four_way_retrieval_grid(tmp_path):

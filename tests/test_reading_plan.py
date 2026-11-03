@@ -13,7 +13,7 @@ from page_cite_rag.reading_plan import (
     reading_plan_messages,
     stable_need_id,
 )
-from page_cite_rag.retrieval import SearchHit, SearchResult
+from page_cite_rag.retrieval import SearchContextGroup, SearchHit, SearchResult
 
 
 def test_reading_plan_is_bounded_and_contains_no_answer_fields():
@@ -231,3 +231,73 @@ def test_product_planned_hybrid_uses_original_and_deduplicated_need_routes():
         "comparison outcome": ["need-02"],
     }
     assert trace["retrieved_block_ids"] == [hit.block.block_id for hit in result.hits]
+
+
+def test_fusion_cut_never_leaves_a_context_group_with_missing_source_blocks():
+    document_id = "a" * 64
+
+    def block(ordinal: int) -> Block:
+        text = f"source {ordinal}"
+        return Block(
+            document_id=document_id,
+            block_id=f"{ordinal:064x}",
+            ordinal=ordinal,
+            unit_index=1,
+            line_start=ordinal,
+            line_end=ordinal,
+            char_start=ordinal * 10,
+            char_end=ordinal * 10 + len(text),
+            text=text,
+        )
+
+    blocks = [block(n) for n in range(1, 5)]
+    group = SearchContextGroup(
+        chunk_index=0,
+        text="chunk text",
+        source_refs=("#/texts/0",),
+        source_block_ids=tuple(item.block_id for item in blocks),
+    )
+    result = SearchResult(
+        document_id=document_id,
+        index_id="chunked-index",
+        method="hybrid",
+        query="Question",
+        hits=tuple(
+            SearchHit(rank=rank, score=1 / rank, block=item) for rank, item in enumerate(blocks, 1)
+        ),
+        elapsed_ms=1,
+        context_groups=(group,),
+    )
+
+    fused = fuse_planned_searches("Question", (result,), top_k=2)
+
+    assert {hit.block.block_id for hit in fused.hits} == set(group.source_block_ids)
+    assert [hit.rank for hit in fused.hits] == [1, 2, 3, 4]
+    assert fused.context_groups == (group,)
+
+
+def test_fusion_accepts_an_original_question_with_surrounding_whitespace():
+    document_id = "a" * 64
+    block = Block(
+        document_id=document_id,
+        block_id=f"{1:064x}",
+        ordinal=1,
+        unit_index=1,
+        line_start=1,
+        line_end=1,
+        char_start=0,
+        char_end=8,
+        text="source 1",
+    )
+    result = SearchResult(
+        document_id=document_id,
+        index_id="index",
+        method="hybrid",
+        query="Question?",
+        hits=(SearchHit(rank=1, score=1.0, block=block),),
+        elapsed_ms=1,
+    )
+
+    fused = fuse_planned_searches("Question?  ", (result,), top_k=1)
+
+    assert fused.query == "Question?  "

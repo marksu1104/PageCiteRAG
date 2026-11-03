@@ -166,7 +166,7 @@ _HANDOFF_INSTRUCTIONS = (
     "or established conclusions. Check each requested part against its original sources. "
     "Follow the actual question if a reader overstates it. Explain intermediate operations "
     "and relationships, preserving conditions and attribution. Distinguish this study from "
-    "related work. State remaining gaps; do not infer document-wide absence."
+    "related work. State remaining gaps."
 )
 _READING_EXAMPLES = (
     "Worked examples below use fictional documents. They illustrate faithful "
@@ -403,9 +403,9 @@ class FullAnswerWorkflow(AnswerWorkflow):
         self._revision_feedback: dict | None = None
         self._navigation_handoff: dict | None = None
         self._reading_plan: list[dict[str, object]] | None = None
-        # Short, source-anchored reader notes are included only after the full
-        # originals have been selected; the notes never replace source evidence.
-        self._reader_observations = True
+        # Index-only handoff by default: the navigator's free-text notes were
+        # copied by the writer even when wrong. Enable only for an explicit ablation.
+        self._reader_observations = False
         self.prompt_revision = prompt_revision
         self.prompt_version = {
             "contract-consistent": PROMPT_VERSION,

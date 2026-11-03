@@ -68,6 +68,7 @@ from page_cite_rag.store import SQLiteDocumentStore
 
 ROOT = Path(__file__).resolve().parents[1]
 FROZEN_ROOT = ROOT / "outputs/reading-eval-20261020-v3"
+DOCLING_ARTIFACTS = ROOT / "models/docling-pinned"
 DEFAULT_RUN_ROOT = FROZEN_ROOT / "executions/unified-reading-v1"
 GPU_UUID = os.environ.get("PAGE_CITE_RAG_GPU_UUID", "")
 GPU_TEMPERATURE_LIMIT_C = 88
@@ -95,6 +96,15 @@ QUALITY_V1_ARMS = (
     "decomposition-fixed-rag",
     "decomposition-agent",
 )
+# Agent comparison: both Agent strategies against the same planned fixed control.
+AGENT_FOCUS_ARMS = (
+    "fixed-rag",
+    "decomposition-fixed-rag",
+    "decomposition-agent",
+    "decomposition-focus-agent",
+)
+READING_PLAN_ARM_SETS = (QUALITY_V1_ARMS, AGENT_FOCUS_ARMS)
+READING_PLAN_CASE_CEILING = 160
 REVIEW_ARMS = {
     "repair-once": "once",
     "reading-agent": "agent",
@@ -109,6 +119,7 @@ ARMS = (
     "single-agent-no-tools",
     "decomposition-fixed-rag",
     "decomposition-agent",
+    "decomposition-focus-agent",
     *PROMPT_COMPARISON_ARMS,
     "fixed-rag-reranked",
     *REVIEW_ARMS,
@@ -124,6 +135,9 @@ ARM_ARCHITECTURES = {
     "decomposition-agent": (
         "question_plan_multi_query_hybrid_rrf_then_bounded_agent_and_shared_writer"
     ),
+    "decomposition-focus-agent": (
+        "question_plan_multi_query_hybrid_rrf_then_focused_source_selection_and_shared_writer"
+    ),
     "single-agent-no-tools": "single_agent_structured_answer_over_frozen_initial_evidence",
     "delegated-agent": "legacy_bounded_navigation_then_separate_writer",
     "fixed-rag-prompt-task-aligned": "fixed_hybrid_retrieval_then_one_structured_answer",
@@ -133,7 +147,7 @@ ARM_ARCHITECTURES = {
     "delegated-reading-agent": "bounded_delegated_reader_review_then_shared_answer_workflow",
     LONG_BENCH_OFFICIAL_ARM: "official_longbench_prompt_over_fixed_retrieval_context",
 }
-RUNNER_VERSION = "frozen-reading-eval-v30-agent-control-followup-v1"
+RUNNER_VERSION = "frozen-reading-eval-v31-batch-declared"
 MAX_RERANKER_PAIR_TOKENS = 200_000_000
 QUALITY_RERANKER_PAIR_LIMIT = 7_200
 QUALITY_RERANKER_PAIR_TOKEN_LIMIT = 30_000_000
@@ -219,6 +233,7 @@ def _is_agent_arm(arm: str) -> bool:
     return arm in (
         "single-agent",
         "decomposition-agent",
+        "decomposition-focus-agent",
         "single-agent-no-tools",
         "delegated-agent",
         "reading-agent",
@@ -570,6 +585,23 @@ def _case_document(
             raise ValueError("frozen PDF source is missing or not a regular project file")
         if sha256(path) != source.get("sha256"):
             raise ValueError("frozen PDF source checksum differs")
+        if path.suffix.lower() == ".pdf":
+            from page_cite_rag.docling_document import convert_pdf
+
+            bundle = convert_pdf(
+                path,
+                artifacts=DOCLING_ARTIFACTS,
+                tokenizer_dir=DEFAULT_MODEL_DIR,
+                language=case.get("source_language"),
+                usage_scope="private public-document evaluation",
+            )
+            store.ingest(
+                bundle.metadata,
+                bundle.units(),
+                block_factory=bundle.block_factory,
+                source_manifests=bundle.source_manifests(),
+            )
+            return bundle.metadata.document_id, {}
         prepared = prepare_source(
             path,
             language=case.get("source_language"),
@@ -900,21 +932,20 @@ def static_configuration(
         "single-agent": None,
         "decomposition-fixed-rag": 1,
         "decomposition-agent": None,
+        "decomposition-focus-agent": None,
     }
-    reading_plan_comparison = tuple(arms) == QUALITY_V1_ARMS
+    reading_plan_comparison = tuple(arms) in READING_PLAN_ARM_SETS
     if shared_initial_reranker and not reading_plan_comparison:
         raise ValueError("shared initial reranking is reserved for the four reading-plan arms")
     selected_workflow_arms = {arm for arm in arms if arm in workflow_call_limits}
     answer_call_budget = None
     reading_plan_budget = None
     if reading_plan_comparison:
-        if len(case_ids) > 72:
-            raise ValueError("reading-plan comparison exceeds its frozen 72-case ceiling")
+        if len(case_ids) > READING_PLAN_CASE_CEILING:
+            raise ValueError("reading-plan comparison exceeds its frozen case ceiling")
         answer_call_budget = {
             "cases": len(case_ids),
-            "per_case_model_call_limit_by_arm": {
-                arm: workflow_call_limits[arm] for arm in QUALITY_V1_ARMS
-            },
+            "per_case_model_call_limit_by_arm": {arm: workflow_call_limits[arm] for arm in arms},
             "single_agent_per_case_call_limit": None,
             "phase_generation_dispatch_limit": 720,
             "case_deadline_seconds": MAX_CASE_WALL_SECONDS,
@@ -1053,6 +1084,7 @@ def static_configuration(
             # side effect of choosing the optional reranker arm.
             "token_chunking": True,
             "text_chunking": TokenBlockFactory(DEFAULT_MODEL_DIR).identity,
+            "pdf_parser": "docling-native-document-v1",
         },
         "answer": {
             "default_contract": PROMPT_VERSION,
@@ -1169,6 +1201,20 @@ def static_configuration(
                     "case_deadline_seconds": MAX_CASE_WALL_SECONDS,
                     "budget_scope": "navigation_and_shared_writer; one shared planner call",
                 },
+                "decomposition-focus-agent": {
+                    "model_call_limit_per_case": None,
+                    "common_writer_calls_per_case": 1,
+                    "planner_is_shared_and_reported_separately": True,
+                    "data_tool_event_limit_per_case": None,
+                    "call_input_tokens_max": MAX_INTEGRATED_AGENT_CALL_INPUT_TOKENS,
+                    "total_input_tokens_per_case_limit": None,
+                    "call_output_tokens_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
+                    "total_output_tokens_per_case_limit": None,
+                    "final_input_tokens_max": AGENT_FINAL_INPUT_LIMIT,
+                    "final_output_tokens_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
+                    "case_deadline_seconds": MAX_CASE_WALL_SECONDS,
+                    "budget_scope": "navigation_and_shared_writer; one shared planner call",
+                },
                 "single-agent-no-tools": {
                     "model_calls_per_case_max": 1,
                     "data_tool_events_per_case_max": 0,
@@ -1259,6 +1305,20 @@ def _ensure_run_config(run_root: Path, static: dict) -> None:
         return
     run_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     atomic_json_once(path, {"static": static, "state": "configuration_frozen"})
+
+
+def _is_docling_document(store: SQLiteDocumentStore, document_id: str) -> bool:
+    record = store.get_document(document_id)
+    return record is not None and record.parser_name == "docling"
+
+
+def _document_embedding_texts(store: SQLiteDocumentStore, document_id: str) -> list[str]:
+    """Texts the active index will embed: Docling search chunks, else source blocks."""
+    if _is_docling_document(store, document_id):
+        from page_cite_rag.docling_document import load_bundle
+
+        return [entry["search_text"] for entry in load_bundle(store, document_id).chunks]
+    return [block.text for block in store.get_blocks(document_id)]
 
 
 def _unique_document_passages(
@@ -1558,9 +1618,9 @@ def _prepare(
         for document_id in unique_documents:
             expected_document_tokens = 0
             expected_document_inputs = 0
-            for block in store.get_blocks(document_id):
-                for start, end in encoder.split_document(block.text):
-                    expected_document_tokens += len(server.token_ids(block.text[start:end]))
+            for text in _document_embedding_texts(store, document_id):
+                for start, end in encoder.split_document(text):
+                    expected_document_tokens += len(server.token_ids(text[start:end]))
                     expected_document_inputs += 1
             document_tokens_by_id[document_id] = expected_document_tokens
             document_inputs_by_id[document_id] = expected_document_inputs
@@ -1568,6 +1628,12 @@ def _prepare(
         expected_document_inputs = sum(document_inputs_by_id.values())
         reused_document_ids = []
         for document_id in unique_documents:
+            if _is_docling_document(store, document_id):
+                from page_cite_rag.docling_retrieval import _kind as docling_index_kind
+
+                if store.get_retrieval_manifest(document_id, docling_index_kind(encoder)):
+                    reused_document_ids.append(document_id)
+                continue
             if store.get_retrieval_manifest(document_id, "bm25") is not None:
                 BM25Retriever(store, document_id)
             if store.get_retrieval_manifest(document_id, dense_index_kind(encoder)) is not None:
@@ -1637,6 +1703,11 @@ def _prepare(
         progress["stage"] = "building_document_indexes"
         for ordinal, document_id in enumerate(unique_documents, start=1):
             progress["document_ordinal"] = ordinal
+            if _is_docling_document(store, document_id):
+                from page_cite_rag.docling_retrieval import build_index as build_docling_index
+
+                build_docling_index(store, document_id, encoder)
+                continue
             if store.get_retrieval_manifest(document_id, "bm25") is None:
                 build_bm25_index(store, document_id)
             if store.get_retrieval_manifest(document_id, dense_index_kind(encoder)) is None:
@@ -1840,47 +1911,46 @@ def _load_reading_plans(run_root: Path, static: dict, inputs: list[dict]) -> dic
     return rows
 
 
+def _batch_declaration(batch_root: Path) -> dict:
+    """Read the immutable approval record (batch.json) written once when a batch is opened."""
+    path = batch_root / "batch.json"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("generation batch declaration is missing or unsafe; no model dispatch")
+    declaration = json.loads(path.read_text(encoding="utf-8"))
+    limits = declaration.get("generation_dispatch_limits")
+    if (
+        not isinstance(declaration.get("revision"), str)
+        or not isinstance(limits, dict)
+        or not limits
+        or any(type(value) is not int or value < 0 for value in limits.values())
+        or limits.get("total") != sum(v for k, v in limits.items() if k != "total")
+    ):
+        raise ValueError("generation batch declaration has invalid revision or phase limits")
+    return declaration
+
+
 def _global_generation_budget(run_root: Path, static: dict) -> tuple[Path | None, int | None]:
     """Use the frozen batch ledger for every model-backed evaluation phase."""
     resolved = run_root.resolve()
     batch_root = _generation_batch_root(resolved)
     if batch_root is not None:
+        declaration = _batch_declaration(batch_root)
         progress_path = batch_root / "progress.json"
         if progress_path.is_symlink() or not progress_path.is_file():
             raise ValueError("quality batch progress is missing or unsafe; no model dispatch")
         progress = json.loads(progress_path.read_text(encoding="utf-8"))
-        scope = progress.get("scope")
-        revision = progress.get("revision", progress.get("plan_revision"))
-        if revision in {"agent-production-alignment-v4", "agent-control-followup-v1"}:
-            limits = progress.get("generation_dispatch_limits")
-            limit = limits.get("total") if isinstance(limits, dict) else None
-            expected_limit = {
-                "agent-production-alignment-v4": 1440,
-                "agent-control-followup-v1": 1299,
-            }[revision]
-            if revision == "agent-control-followup-v1" and limits != {
-                "development": 123,
-                "regression_planners": 72,
-                "regression_answers": 864,
-                "new_diagnostics": 240,
-                "total": 1299,
-            }:
-                raise ValueError("follow-up phase dispatch ceilings differ from the approved plan")
-        else:
-            limit = (
-                scope.get("maximum_new_generation_dispatches") if isinstance(scope, dict) else None
-            )
-            expected_limit = {
-                "quality-repair-closure-v2": 696,
-                "agent-quality-closure-v3": 1134,
-            }.get(revision)
-        if expected_limit is None or progress.get("state") != "in_progress":
+        if (
+            progress.get("revision") != declaration["revision"]
+            or progress.get("state") != "in_progress"
+        ):
             raise ValueError("quality batch revision or state is not approved for dispatch")
-        if type(limit) is not int or limit != expected_limit:
+        if progress.get("generation_dispatch_limits") != declaration["generation_dispatch_limits"]:
             raise ValueError(
                 "quality batch dispatch ceiling differs from its approved frozen limit"
             )
-        return batch_root / "global-model-calls.jsonl", limit
+        return batch_root / "global-model-calls.jsonl", declaration["generation_dispatch_limits"][
+            "total"
+        ]
 
     reading_plan = static.get("reading_plan")
     if isinstance(reading_plan, dict):
@@ -1896,13 +1966,7 @@ def _generation_batch_root(path: Path) -> Path | None:
         (
             parent
             for parent in (path.resolve(), *path.resolve().parents)
-            if parent.name
-            in {
-                "quality-repair-closure-v2",
-                "agent-quality-closure-v3",
-                "agent-production-alignment-v4",
-                "agent-control-followup-v1",
-            }
+            if (parent / "batch.json").exists()
         ),
         None,
     )
@@ -1916,28 +1980,16 @@ def _global_generation_phase(run_root: Path, operation: str) -> str | None:
     relative_parts = run_root.resolve().relative_to(batch_root).parts
     if operation not in {"plan", "run"}:
         raise ValueError("unexpected generation operation")
-    if batch_root.name in {"agent-production-alignment-v4", "agent-control-followup-v1"}:
-        joined = "/".join(part.casefold().replace("_", "-") for part in relative_parts)
-        if "protocol" in joined:
-            return "protocol"
-        if "development" in joined:
-            return "development"
-        if "regression" in joined:
-            return "regression_planners" if operation == "plan" else "regression_answers"
-        if "new-diagnostic" in joined:
-            return "new_diagnostics"
-        raise ValueError("quality generation run root must name its frozen phase")
-    if batch_root.name != "agent-quality-closure-v3":
-        return None
-    if any("protocol" in part for part in relative_parts):
+    joined = "/".join(part.casefold().replace("_", "-") for part in relative_parts)
+    if "protocol" in joined:
         return "protocol"
-    if any("development" in part for part in relative_parts):
+    if "development" in joined:
         return "development"
-    if any("regression" in part for part in relative_parts):
+    if "regression" in joined:
         return "regression_planners" if operation == "plan" else "regression_answers"
-    if any("holdout" in part for part in relative_parts):
-        return "new_holdout_planners_and_two_flows"
-    raise ValueError("v3 generation run root must name its frozen phase")
+    if "new-diagnostic" in joined:
+        return "new_diagnostics"
+    raise ValueError("quality generation run root must name its frozen phase")
 
 
 def _run_reading_plans(run_root: Path, static: dict, inputs: list[dict]) -> dict:
@@ -2130,6 +2182,7 @@ def _load_planned_retrieval(run_root: Path, static: dict, inputs: list[dict]) ->
             if row.get("degraded_reason") not in {
                 "original_query_fallback",
                 "planned_query_token_limit_original_query_fallback",
+                "planner_failed_original_query_fallback",
             }:
                 raise ValueError("planned retrieval has an unknown degraded path")
         elif row.get("status") != "failed":
@@ -2205,6 +2258,12 @@ def _run_planned_retrieval(run_root: Path, static: dict, inputs: list[dict]) -> 
             )
             transport.query_prefix = encoder.identity["query_prompt"]
             for case_id, query_set in query_sets.items():
+                if query_set["planner_degraded"]:
+                    # No plan: use the frozen original-query retrieval, embed nothing new.
+                    query_tokens_by_case[case_id] = []
+                    embedding_queries_by_case[case_id] = ()
+                    query_fallback_reasons[case_id] = "planner_failed_original_query_fallback"
+                    continue
                 case_tokens = []
                 overlong = False
                 for query in query_set["queries"]:
@@ -2333,9 +2392,10 @@ def _run_planned_retrieval(run_root: Path, static: dict, inputs: list[dict]) -> 
                         versioned_dense=True,
                         candidates=static["reading_plan"]["retrieval_candidates_per_branch"],
                     )
+                    # The shared path strips whitespace; keep the frozen question text on results.
                     candidate, query_results, shared_search_trace = search_planned_hybrid(
                         retriever,
-                        case["question"],
+                        case["question"].strip(),
                         ReadingPlan.model_validate_json(
                             json.dumps(plans[case_id]["plan"], ensure_ascii=False), strict=True
                         ),
@@ -2348,6 +2408,11 @@ def _run_planned_retrieval(run_root: Path, static: dict, inputs: list[dict]) -> 
                             query: tuple(query_set["query_to_needs"].get(query, ()))
                             for query in queries_to_run
                         },
+                    )
+                    candidate = candidate.model_copy(update={"query": case["question"]})
+                    query_results = (
+                        query_results[0].model_copy(update={"query": case["question"]}),
+                        *query_results[1:],
                     )
                     query_trace = [
                         {
@@ -2451,7 +2516,13 @@ def _run_planned_retrieval(run_root: Path, static: dict, inputs: list[dict]) -> 
         if case["case_id"] not in completed:
             continue
         planned_retrieval_rows[case["case_id"]] = completed[case["case_id"]]
-    complete_slots = list(planned_retrieval_rows) == expected_ids
+    # Fallback rows are recorded mid-loop; completeness is about the set, not insertion order.
+    complete_slots = set(planned_retrieval_rows) == set(expected_ids)
+    planned_retrieval_rows = {
+        case_id: planned_retrieval_rows[case_id]
+        for case_id in expected_ids
+        if case_id in planned_retrieval_rows
+    }
     ready = {
         "state": (
             "stopped_unresolved"
@@ -6080,6 +6151,11 @@ def _preflight_reading_plan(run_root: Path, static: dict, inputs: list[dict]) ->
 
     report = {}
     started = time.monotonic()
+    unsupported_documents = {
+        document_id
+        for document_id in {row["document_id"] for row in planned.values()}
+        if any("<|" in block.text or "|>" in block.text for block in store.get_blocks(document_id))
+    }
     with LlamaModelClient(
         _llama_config(static), budget_policy="exact", recover_output_errors=False
     ) as model:
@@ -6094,7 +6170,12 @@ def _preflight_reading_plan(run_root: Path, static: dict, inputs: list[dict]) ->
                 if plans[case_id]["status"] == "complete"
                 else None
             )
-            for arm in QUALITY_V1_ARMS:
+            for arm in static["run_selection"]["arms"]:
+                if planned[case_id]["document_id"] in unsupported_documents:
+                    # The model client refuses chat-template delimiters in any input and
+                    # never rewrites source text; the whole case is unsupported in every arm.
+                    by_arm[arm] = {"status": "unsupported_input_reserved_chat_delimiters"}
+                    continue
                 if arm != "fixed-rag" and planned[case_id]["status"] not in (
                     "complete",
                     "degraded",
@@ -6153,26 +6234,10 @@ def _preflight_reading_plan(run_root: Path, static: dict, inputs: list[dict]) ->
                     "search_sha256": canonical_hash(result_value),
                     "initial_reranker_pool": pool_name if shared_reranks is not None else None,
                 }
+            planned_arms = [a for a in static["run_selection"]["arms"] if a != "fixed-rag"]
             if (
-                all(
-                    by_arm[arm].get("status") == "ready"
-                    for arm in (
-                        "fixed-rag-followup-once",
-                        "decomposition-fixed-rag",
-                        "decomposition-agent",
-                    )
-                )
-                and len(
-                    {
-                        tuple(by_arm[arm]["admitted_block_ids"])
-                        for arm in (
-                            "fixed-rag-followup-once",
-                            "decomposition-fixed-rag",
-                            "decomposition-agent",
-                        )
-                    }
-                )
-                != 1
+                all(by_arm[arm].get("status") == "ready" for arm in planned_arms)
+                and len({tuple(by_arm[arm]["admitted_block_ids"]) for arm in planned_arms}) != 1
             ):
                 raise ValueError("decomposition/follow-up arms do not share initial evidence")
             report[case_id] = {"by_arm": by_arm}
@@ -7007,18 +7072,8 @@ class _CountingModelClient:
             progress_path = path.parent / "progress.json"
             if progress_path.is_file() and not progress_path.is_symlink():
                 progress = json.loads(progress_path.read_text(encoding="utf-8"))
-                revision = progress.get("revision", progress.get("plan_revision"))
-                if revision in {
-                    "agent-quality-closure-v3",
-                    "agent-production-alignment-v4",
-                    "agent-control-followup-v1",
-                }:
-                    limits = (
-                        progress.get("generation_dispatch_limits")
-                        if revision
-                        in {"agent-production-alignment-v4", "agent-control-followup-v1"}
-                        else progress.get("scope", {}).get("phase_generation_dispatch_limits")
-                    )
+                if "generation_dispatch_limits" in progress:
+                    limits = progress.get("generation_dispatch_limits")
                     if (
                         not isinstance(limits, dict)
                         or self._global_call_phase not in limits
@@ -7063,13 +7118,7 @@ class _CountingModelClient:
         if not progress_path.is_file() or progress_path.is_symlink():
             return
         progress = json.loads(progress_path.read_text(encoding="utf-8"))
-        revision = progress.get("revision", progress.get("plan_revision"))
-        if revision not in {
-            "quality-repair-closure-v2",
-            "agent-quality-closure-v3",
-            "agent-production-alignment-v4",
-            "agent-control-followup-v1",
-        }:
+        if "generation_dispatch_limits" not in progress:
             return
         rows = read_jsonl(path)
         reservations = {
@@ -7100,11 +7149,7 @@ class _CountingModelClient:
         counters = progress.setdefault("counters", {})
         dispatches = len(active_indices)
         counters["generation_dispatches"] = dispatches
-        input_key, output_key, unknown_key = (
-            ("input_tokens", "output_tokens", "unknown_usage")
-            if revision in {"agent-production-alignment-v4", "agent-control-followup-v1"}
-            else ("generation_input_tokens", "generation_output_tokens", "unknown_generation_usage")
-        )
+        input_key, output_key, unknown_key = ("input_tokens", "output_tokens", "unknown_usage")
         counters[input_key] = input_tokens
         counters[output_key] = output_tokens
         counters[unknown_key] = sum(
@@ -7112,27 +7157,18 @@ class _CountingModelClient:
             for index in active_indices
             if index not in usage_by_index or usage_by_index[index].get("usage_unknown") is True
         )
-        if revision in {
-            "agent-quality-closure-v3",
-            "agent-production-alignment-v4",
-            "agent-control-followup-v1",
-        }:
-            reservations_by_index = {index: row for index, row in reservations.items()}
-            phase_limits = (
-                progress["generation_dispatch_limits"]
-                if revision in {"agent-production-alignment-v4", "agent-control-followup-v1"}
-                else progress["scope"]["phase_generation_dispatch_limits"]
+        reservations_by_index = {index: row for index, row in reservations.items()}
+        phase_limits = progress["generation_dispatch_limits"]
+        counters["generation_dispatches_by_phase"] = {
+            phase: sum(
+                reservations_by_index[index].get("budget_phase") == phase
+                for index in active_indices
             )
-            counters["generation_dispatches_by_phase"] = {
-                phase: sum(
-                    reservations_by_index[index].get("budget_phase") == phase
-                    for index in active_indices
-                )
-                for phase in phase_limits
-                if phase != "total"
-            }
-            if "total" in phase_limits:
-                counters["generation_dispatches_by_phase"]["total"] = dispatches
+            for phase in phase_limits
+            if phase != "total"
+        }
+        if "total" in phase_limits:
+            counters["generation_dispatches_by_phase"]["total"] = dispatches
         progress["new_model_calls"] = dispatches
         write_state_json(progress_path, progress)
 
@@ -7265,9 +7301,9 @@ def _remaining_quality_writer_reservation(
                 continue
             total += 1
         return total
-    if selected_arms != QUALITY_V1_ARMS:
+    if selected_arms not in READING_PLAN_ARM_SETS:
         raise ModelError("writer reservation requires a supported single-agent or four-arm run")
-    for arm in QUALITY_V1_ARMS:
+    for arm in selected_arms:
         directory = run_root / arm
         for case_id in static["run_selection"]["case_ids"]:
             if arm == current_arm and case_id == current_case_id:
@@ -7281,6 +7317,7 @@ def _remaining_quality_writer_reservation(
                 "fixed-rag-followup-once": 2,
                 "decomposition-fixed-rag": 1,
                 "decomposition-agent": 2,
+                "decomposition-focus-agent": 2,
             }[arm]
     return total
 
@@ -7427,15 +7464,17 @@ def _run_arm(
                 if (
                     global_call_phase not in {"development", "answer", "regression_answers"}
                     or tuple(static.get("run_selection", {}).get("arms", ()))
-                    not in {QUALITY_V1_ARMS, ("single-agent",)}
-                    or (batch_root := _generation_batch_root(run_root)) is None
-                    or batch_root.name
-                    not in {"agent-production-alignment-v4", "agent-control-followup-v1"}
+                    not in {*READING_PLAN_ARM_SETS, ("single-agent",)}
+                    or _generation_batch_root(run_root) is None
                 ):
                     return 0
+                # Gap navigation calls go through this wrapper, so each protects its own writer.
                 current_case_remaining = int(
-                    arm == "fixed-rag-followup-once"
-                    and counted_model.generate_calls == counted_model._case_start_calls
+                    (
+                        arm == "fixed-rag-followup-once"
+                        and counted_model.generate_calls == counted_model._case_start_calls
+                    )
+                    or arm in ("decomposition-agent", "decomposition-focus-agent", "single-agent")
                 )
                 return _remaining_quality_writer_reservation(
                     run_root,
@@ -7482,9 +7521,17 @@ def _run_arm(
             elif static.get("reading_plan") is not None and arm != "fixed-rag":
                 plan_row = plan_rows[case["case_id"]]
                 retrieved_row = planned_rows[case["case_id"]]
-                if plan_row["status"] not in ("complete", "degraded") or retrieved_row[
-                    "status"
-                ] not in ("complete", "degraded"):
+                # A failed planner is answered from the original-query fallback, without a plan.
+                planner_fallback = (
+                    plan_row["status"] == "failed"
+                    and retrieved_row["status"] == "degraded"
+                    and retrieved_row.get("degraded_reason")
+                    == "planner_failed_original_query_fallback"
+                )
+                if not planner_fallback and (
+                    plan_row["status"] not in ("complete", "degraded")
+                    or retrieved_row["status"] not in ("complete", "degraded")
+                ):
                     raise ValueError("preflight admitted a failed reading plan or retrieval")
                 reading_plan_status = plan_row["status"]
                 if plan_row["status"] == "complete":
@@ -7641,8 +7688,6 @@ def _run_arm(
                             current_case_remaining_calls=0,
                         )
                         if batch_root is not None
-                        and batch_root.name
-                        in {"agent-production-alignment-v4", "agent-control-followup-v1"}
                         and global_call_phase in {"development", "answer", "regression_answers"}
                         else 0
                     )
@@ -7674,8 +7719,6 @@ def _run_arm(
                             current_case_remaining_calls=1,
                         )
                         if batch_root is not None
-                        and batch_root.name
-                        in {"agent-production-alignment-v4", "agent-control-followup-v1"}
                         and global_call_phase in {"development", "answer", "regression_answers"}
                         else 0
                     )
@@ -7885,6 +7928,10 @@ def _run_arm(
                                     initial_blocks=blocks,
                                     delegated=arm == "delegated-agent",
                                     data_tools_enabled=arm != "single-agent-no-tools",
+                                    strategy={
+                                        "decomposition-agent": "gap",
+                                        "decomposition-focus-agent": "focus",
+                                    }.get(arm, "react"),
                                     max_model_calls=1 if arm == "single-agent-no-tools" else None,
                                     on_model_call=record_agent_model_call,
                                     on_wire_request=(
@@ -9208,7 +9255,7 @@ def main() -> int:
             required=LONG_BENCH_OFFICIAL_ARM in args.compare_arms,
         )
         if (
-            tuple(selected_arms) == QUALITY_V1_ARMS
+            tuple(selected_arms) in READING_PLAN_ARM_SETS
             and args.phase in ("prepare", "plan", "planned-retrieval", "preflight", "run", "score")
             and (run_root / "configuration.json").is_file()
         ):

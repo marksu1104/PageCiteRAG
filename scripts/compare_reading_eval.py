@@ -20,6 +20,12 @@ QUALITY_V2_ARMS = (
     "decomposition-fixed-rag",
     "decomposition-agent",
 )
+AGENT_FOCUS_ARMS = (
+    "fixed-rag",
+    "decomposition-fixed-rag",
+    "decomposition-agent",
+    "decomposition-focus-agent",
+)
 SEED = 20261027
 REPLICATES = 5_000
 
@@ -225,6 +231,15 @@ def build_comparison(
             ("decomposition-fixed-rag", "fixed-rag-followup-once"),
             ("decomposition-fixed-rag", "decomposition-agent"),
             ("fixed-rag-followup-once", "decomposition-agent"),
+        )
+    elif arms == AGENT_FOCUS_ARMS:
+        pairs = (
+            ("fixed-rag", "decomposition-fixed-rag"),
+            ("decomposition-fixed-rag", "decomposition-agent"),
+            ("decomposition-fixed-rag", "decomposition-focus-agent"),
+            ("fixed-rag", "decomposition-agent"),
+            ("fixed-rag", "decomposition-focus-agent"),
+            ("decomposition-agent", "decomposition-focus-agent"),
         )
     else:
         raise ValueError("scored run does not match a supported frozen arm protocol")

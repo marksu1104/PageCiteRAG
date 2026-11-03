@@ -432,10 +432,13 @@ def _qasper_cases(
     no_answer: int = 2,
     count: int | None = None,
     seed: str = SEED,
+    excluded: frozenset[str] = frozenset(),
 ) -> tuple[list[dict], list[dict]]:
     papers = list(read_snapshot(data_dir, "validation"))
     candidates = []
     for paper in papers:
+        if paper.paper_id in excluded:
+            continue
         for question in paper.questions:
             if not question.annotations or not paper.passages:
                 continue
@@ -529,10 +532,17 @@ def _qasper_cases(
 
 
 def _longbench_v2_cases(
-    rows: list[dict], exposed: set[str], *, count: int = 8, seed: str = SEED
+    rows: list[dict],
+    exposed: set[str],
+    *,
+    count: int = 8,
+    seed: str = SEED,
+    excluded: frozenset[str] = frozenset(),
 ) -> tuple[list[dict], list[dict], dict]:
     candidates = []
     for row in rows:
+        if row["_id"] in excluded:
+            continue
         words = len(row["context"].split())
         if row["domain"] == "Single-Document QA" and 8_000 <= words <= 32_000:
             choices = {letter: row[f"choice_{letter}"] for letter in "ABCD"}
@@ -783,7 +793,12 @@ def freeze_longbench_v2_full(args: argparse.Namespace) -> dict:
 
 
 def _multifieldqa_zh_cases(
-    zip_path: Path, exposed: set[str], *, count: int = 8, seed: str = SEED
+    zip_path: Path,
+    exposed: set[str],
+    *,
+    count: int = 8,
+    seed: str = SEED,
+    excluded: frozenset[str] = frozenset(),
 ) -> tuple[list[dict], list[dict], dict]:
     with zipfile.ZipFile(zip_path) as archive:
         member = "data/multifieldqa_zh.jsonl"
@@ -793,6 +808,8 @@ def _multifieldqa_zh_cases(
             raise ValueError("pinned LongBench archive has no MultiFieldQA-zh data") from error
     candidates = []
     for row in rows:
+        if row["_id"] in excluded:
+            continue
         source_hash = _sha256(row["context"].encode("utf-8"))
         candidates.append(
             (
@@ -889,7 +906,8 @@ def freeze_product_combination(
     def read_rows(path: Path) -> list[dict]:
         if path.is_symlink() or not path.is_file():
             raise ValueError("product case and gold files must be regular local files")
-        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+        # JSON strings may contain U+2028 and similar characters; split records on \n only.
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").split("\n") if line]
 
     benchmark_inputs = read_rows(base_inputs_path)
     benchmark_gold = read_rows(base_gold_path)
@@ -1044,6 +1062,20 @@ def freeze_product_combination(
     return manifest
 
 
+def _reserved_ids(manifests) -> frozenset[str]:
+    """IDs held back for a later, untouched check: QASPER by paper, LongBench by row."""
+    reserved: set[str] = set()
+    for path in manifests:
+        for case in json.loads(Path(path).read_text(encoding="utf-8"))["cases"]:
+            if case["dataset"] == "qasper":
+                reserved.add(case["source_id"])
+            else:
+                for prefix in ("multifieldqa-zh-", "longbench-v2-"):
+                    if case["case_id"].startswith(prefix):
+                        reserved.add(case["case_id"].removeprefix(prefix))
+    return frozenset(reserved)
+
+
 def freeze(args: argparse.Namespace) -> dict:
     output = args.output_dir.expanduser().resolve()
     if output.exists() or output.is_symlink():
@@ -1074,6 +1106,7 @@ def freeze(args: argparse.Namespace) -> dict:
         if any(question.question_id in exposed_qasper for question in paper.questions)
     }
 
+    excluded = _reserved_ids(getattr(args, "exclude_manifest", None) or ())
     selection_seed = f"pagecite-v1-quality-{getattr(args, 'selection_seed', 42)}"
     qasper_count = getattr(args, "qasper_count", None)
     qasper_answerable = getattr(args, "qasper_answerable_count", 6)
@@ -1092,12 +1125,13 @@ def freeze(args: argparse.Namespace) -> dict:
         no_answer=qasper_no_answer,
         count=qasper_count,
         seed=selection_seed,
+        excluded=excluded,
     )
     v2_inputs, v2_gold, v2_meta = _longbench_v2_cases(
-        v2_rows, exposed_v2, count=longbench_v2_count, seed=selection_seed
+        v2_rows, exposed_v2, count=longbench_v2_count, seed=selection_seed, excluded=excluded
     )
     v1_inputs, v1_gold, v1_meta = _multifieldqa_zh_cases(
-        v1_path, exposed_v1, count=multifieldqa_zh_count, seed=selection_seed
+        v1_path, exposed_v1, count=multifieldqa_zh_count, seed=selection_seed, excluded=excluded
     )
     inputs = q_inputs + v2_inputs + v1_inputs
     gold = q_gold + v2_gold + v1_gold
@@ -1139,6 +1173,7 @@ def freeze(args: argparse.Namespace) -> dict:
         "format": "pagecite-reading-eval/v5",
         "created_date_utc": "2026-10-31",
         "seed": selection_seed,
+        "reserved_ids_excluded": sorted(excluded),
         "state": "frozen_inputs_not_run",
         "handling": (
             "Redistribute benchmark inputs, gold, and outputs only as permitted by source terms."
@@ -1287,6 +1322,12 @@ def main() -> int:
     parser.add_argument("--xrag-jsonl", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--selection-seed", type=int, default=42)
+    parser.add_argument(
+        "--exclude-manifest",
+        type=Path,
+        action="append",
+        help="frozen manifest whose cases are reserved and must not be sampled",
+    )
     parser.add_argument("--qasper-count", type=int)
     parser.add_argument("--qasper-answerable-count", type=int, default=6)
     parser.add_argument("--qasper-no-answer-count", type=int, default=2)
