@@ -110,6 +110,17 @@ def test_table_cells_and_caption_remain_separate_native_sources():
     assert caption["span_alignment"] == "within_saved_text_bounds_unverified"
 
 
+def test_table_region_without_structure_is_unsupported_not_fatal():
+    document = _document()
+    document["tables"][0]["data"] = {"num_rows": 0, "num_cols": 0, "table_cells": []}
+    table = read_native_item(document, "#/tables/0", page_count=2)
+    assert table["table"] is None and table["saved_item_text"] is None
+    # Inconsistent structure is still rejected.
+    document["tables"][0]["data"] = {"num_rows": 0, "num_cols": 2, "table_cells": []}
+    with pytest.raises(DoclingSourceError, match="dimensions"):
+        read_native_item(document, "#/tables/0", page_count=2)
+
+
 def test_empty_formula_is_not_presented_as_quoteable_text():
     source = read_native_item(_document(), "#/texts/2", page_count=2)
     assert source["saved_item_text"] is None

@@ -289,7 +289,7 @@ def test_cli_rejects_override_without_cuda(backend, device, capsys):
             "88",
         ]
     )
-    with pytest.raises(ValueError, match="requires explicit llama CUDA"):
+    with pytest.raises(ValueError, match="requires an owned backend on CUDA"):
         cli._generation_config(args)
     assert (
         cli.main(

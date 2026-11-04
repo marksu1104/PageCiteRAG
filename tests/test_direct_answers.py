@@ -21,6 +21,10 @@ def test_cli_uses_unified_cited_answer_contract(setup, monkeypatch, capsys):
                 "Were children included?",
                 "--db",
                 str(setup[0].database_path),
+                "--route",
+                "fixed",
+                "--backend",
+                "ollama",
                 "--format",
                 "json",
             ]

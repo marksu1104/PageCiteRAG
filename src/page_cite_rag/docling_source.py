@@ -131,11 +131,20 @@ def _span_alignment(item: dict) -> str:
     return "within_saved_text_bounds_unverified"
 
 
-def _table_cells(item: dict) -> dict:
+def _table_cells(item: dict) -> dict | None:
+    """Saved cells with coordinates, or ``None`` for a region with no recognised structure.
+
+    Docling can mark a table region (for example a chart or a scanned box) without finding
+    any rows, columns or cells. Such an item has nothing quotable, so it is reported as an
+    unsupported native item like a picture instead of failing the whole document. Partial
+    or inconsistent structure is still rejected.
+    """
     data = item.get("data")
     if not isinstance(data, dict):
         raise DoclingSourceError("native table data is missing")
     rows, cols, cells = data.get("num_rows"), data.get("num_cols"), data.get("table_cells")
+    if rows == 0 and cols == 0 and cells == []:
+        return None
     if not isinstance(rows, int) or not isinstance(cols, int) or rows < 1 or cols < 1:
         raise DoclingSourceError("native table dimensions are invalid")
     if not isinstance(cells, list):

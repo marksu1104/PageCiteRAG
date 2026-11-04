@@ -340,6 +340,116 @@ class AgentAnswer:
     trace: dict
 
 
+Route = Literal["auto", "fixed", "whole-document"]
+ROUTES: tuple[str, ...] = ("auto", "fixed", "whole-document")
+
+
+def answer_question(
+    workflow: FullAnswerWorkflow,
+    question: str,
+    *,
+    language: Language = "zh-Hant",
+    source_language: str = "unknown",
+    route: Route = "auto",
+) -> AgentAnswer:
+    """The single product entry, routed as in the plan 5.13 evaluation.
+
+    ``auto`` asks the scoped planner whether the question needs the whole document: a
+    lookup goes to fixed retrieval with the original question, a whole-document task to
+    section-note reading with the planned retrieval. A failed planner falls back to the
+    fixed path and says so in the trace, as in the evaluation. ``fixed`` skips the planner;
+    ``whole-document`` always reads by sections.
+    """
+    from page_cite_rag.generation import ModelError
+
+    if route not in ROUTES:
+        raise ValueError("route must be auto, fixed or whole-document")
+    language = resolve_answer_language(question, language)
+    started = perf_counter()
+    trace: dict = {"version": "routed-answer/v1", "requested_route": route}
+    if route == "fixed":
+        result = ask_document(workflow, question, language=language)
+        trace.update(route="fixed", reason="requested")
+        return AgentAnswer(result, trace)
+    if not _is_hybrid_retriever(workflow._retriever):
+        from page_cite_rag.retrieval import RetrievalError
+
+        raise RetrievalError(
+            "routing and whole-document reading need the hybrid BM25+dense index; "
+            "build it or ask with route fixed"
+        )
+    outline = workflow.source_outline()
+    if outline is None or len(outline.sections) < 2:
+        # Section reading was validated on documents with an outline (Docling PDFs, Markdown
+        # headings); without one, never substitute another reader under its name.
+        if route == "whole-document":
+            from page_cite_rag.retrieval import RetrievalError
+
+            raise RetrievalError(
+                "whole-document reading needs the document's section outline; ingest PDFs "
+                "with Docling or ask with route fixed"
+            )
+        result = ask_document(workflow, question, language=language)
+        trace.update(route="fixed", reason="no_outline")
+        return AgentAnswer(result, trace)
+    try:
+        plan = plan_document_question(
+            workflow,
+            question,
+            language=language,
+            source_language=source_language
+            if source_language in {"en", "zh-Hant", "zh-Hans"}
+            else "unknown",
+            scoped=True,
+        )
+    except ModelError as error:
+        if route == "whole-document":
+            raise
+        result = ask_document(workflow, question, language=language)
+        trace.update(route="fixed", reason="planner_failed", planner_error=type(error).__name__)
+        return AgentAnswer(result, trace)
+    trace["plan"] = plan.model_dump(mode="json")
+    if route == "auto" and plan.scope == "lookup":
+        result = ask_document(workflow, question, language=language)
+        trace.update(route="fixed", reason="planner_scope_lookup")
+        return AgentAnswer(result, trace)
+    planned = workflow.with_reading_plan(plan)
+    search, blocks, retrieval_trace = search_with_reading_plan(planned, question, plan)
+    reading = ask_with_agent(
+        planned,
+        question,
+        language=language,
+        initial_search=search,
+        initial_blocks=blocks,
+        strategy="outline",
+    )
+    agent = reading.trace["agent"]
+    titles = {s.section_id: s.title or "(untitled)" for s in outline.sections}
+
+    def named(key: str) -> list[str]:
+        return [titles.get(section_id, section_id) for section_id in agent.get(key, ())]
+
+    coverage = agent.get("point_coverage") or {}
+    trace.update(
+        route="whole_document",
+        reason="planner_scope_whole_document" if route == "auto" else "requested",
+        planned_retrieval=retrieval_trace,
+        reading_summary={
+            "sections_chosen": named("selected_section_ids"),
+            "sections_from_search": named("seed_section_ids"),
+            "sections_followed_up": named("follow_up_section_ids"),
+            "notes": agent.get("reading_point_count", 0),
+            "notes_not_in_answer": coverage.get("uncovered", 0),
+            # The scoped planner call plus every reading and writer call.
+            "model_calls": 1 + (agent.get("model_calls_attempted") or 0),
+            "navigation_degraded": agent.get("navigation_degraded", False),
+            "elapsed_seconds": round(perf_counter() - started, 1),
+        },
+        reading=reading.trace,
+    )
+    return AgentAnswer(reading.result, trace)
+
+
 _FATAL_AGENT_TOOL_STATUSES = {
     "scope_unavailable",
     "invalid_source_or_cursor",

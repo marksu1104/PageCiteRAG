@@ -232,6 +232,7 @@ def tokenizer_directory(tmp_path):
 
 
 def ask_arguments(document, *options):
+    """The fixed path on your own (faked) Ollama; later options override these."""
     store, document_id, _ = document
     return [
         "ask",
@@ -241,6 +242,10 @@ def ask_arguments(document, *options):
         "en",
         "--db",
         str(store.database_path),
+        "--route",
+        "fixed",
+        "--backend",
+        "ollama",
         *options,
     ]
 
@@ -466,7 +471,7 @@ def test_missing_or_invalid_resources_never_start_model(
     else:
         arguments = ask_arguments(document)
         if missing == "database":
-            arguments[-1] = str(tmp_path / "PRIVATE_CANARY.sqlite3")
+            arguments[arguments.index("--db") + 1] = str(tmp_path / "PRIVATE_CANARY.sqlite3")
         elif missing == "document":
             arguments[1] = "f" * 64
     assert cli.main(arguments) == 1
@@ -601,7 +606,7 @@ main([sys.argv[2], '--help'])
     assert result.returncode == 0, result.stderr
     assert "--backend" in result.stdout and "--language" in result.stdout
     if command == "ask":
-        assert "--agent" in result.stdout
+        assert "--route" in result.stdout and "--agent" not in result.stdout
         assert "--native-gpu" in result.stdout
 
 
@@ -612,10 +617,41 @@ def test_public_cli_defaults_to_traditional_chinese():
     assert args.request_timeout_seconds == 600
 
 
-def test_agent_cli_runs_navigation_then_the_shared_writer(document, clients, monkeypatch, capsys):
-    from page_cite_rag import agent, application
+def _fake_routed_answer(events=None):
+    """Stand-in for application.answer_question: the fixed writer plus a reading trace."""
+    from page_cite_rag import application
+
+    def answer(workflow, question, *, language, source_language, route):
+        if events is not None:
+            followup, _blocks = workflow.search_sources("independent follow-up query")
+            assert followup.query == "independent follow-up query"
+        result = application.ask_document(workflow, question, language=language)
+        trace = {
+            "version": "routed-answer/v1",
+            "requested_route": route,
+            "route": "whole_document",
+            "reason": "planner_scope_whole_document",
+            "reading_summary": {
+                "sections_chosen": ["Results"],
+                "sections_from_search": ["Discussion"],
+                "sections_followed_up": [],
+                "notes": 3,
+                "notes_not_in_answer": 1,
+                "model_calls": 5,
+                "navigation_degraded": False,
+                "elapsed_seconds": 1.0,
+            },
+        }
+        return application.AgentAnswer(result, trace)
+
+    return answer
+
+
+def test_auto_route_cli_answers_through_the_shared_entry_and_reports_it(
+    document, clients, monkeypatch, capsys
+):
+    from page_cite_rag import application
     from page_cite_rag.dense import build_dense_index
-    from page_cite_rag.reading_plan import ReadingNeed, ReadingPlan
     from test_dense import FakeEncoder
 
     store, document_id, _ = document
@@ -623,54 +659,47 @@ def test_agent_cli_runs_navigation_then_the_shared_writer(document, clients, mon
     encoder = FakeEncoder()
     build_dense_index(store, document_id, encoder)
     monkeypatch.setattr(cli, "_load_encoder", lambda _args: encoder)
-    monkeypatch.setattr(
-        application,
-        "plan_document_question",
-        lambda *_args, **_kwargs: ReadingPlan(
-            requirements=(ReadingNeed(need="result", queries=("result",)),)
-        ),
-    )
+    seen = {}
+    fake = _fake_routed_answer()
 
-    @contextmanager
-    def local_model(_client):
-        yield object()
+    def answer(workflow, question, **kwargs):
+        seen.update(kwargs)
+        return fake(workflow, question, **kwargs)
 
-    def run_agent(workflow, question, language, result, blocks, _model, **kwargs):
-        assert callable(kwargs["count_chat_input_tokens"])
-        assert kwargs["delegated"] is False
-        _enable_exact_writer_budget(workflow)
-        context = agent._admit(workflow, question, language, blocks, result.context_groups)
-        return _fake_navigation_agent_run(
-            workflow,
-            context,
-            model_calls=1,
-            tool_calls=1,
-            ledger=kwargs["shared_ledger"],
-        )
-
-    monkeypatch.setattr(agent, "local_chat_model", local_model)
-    monkeypatch.setattr(agent, "run_bounded_reading_agent", run_agent)
-    arguments = ask_arguments(
-        document,
-        "--backend",
-        "llama",
-        "--token-budget",
-        "exact",
-        "--agent",
-        "--format",
-        "json",
-    )
-
-    assert cli.main(arguments) == 0
-
+    monkeypatch.setattr(application, "answer_question", answer)
+    assert cli.main(ask_arguments(document, "--route", "auto", "--format", "json")) == 0
     output = json.loads(capsys.readouterr().out)
-    assert output["answer"]["status"] == "answered"
+    assert seen["route"] == "auto" and seen["language"] == "en"
     assert output["answer"]["retrieval"]["method"] == "hybrid"
-    assert output["agent_trace"]["model_calls_completed"] == 2
-    assert output["agent_trace"]["tool_calls_recorded"] == 1
-    assert len(clients) == 1 and len(clients[0][2].calls) == 1
-    assert output["reading_trace"]["version"] == "agentic-reading-v2"
-    assert clients[0][2].close_count == 1
+    assert output["routing"]["route"] == "whole_document"
+
+    assert cli.main(ask_arguments(document, "--route", "auto")) == 0
+    text = capsys.readouterr().out
+    assert "Route: whole-document reading (the question needs reading across the document)." in text
+    assert "Sections read (2): Results; Discussion" in text
+    assert "Reading notes: 3, of which 1 are not cited in the answer" in text
+    assert all(client.close_count == 1 for _args, _config, client in clients)
+
+
+def test_routing_without_a_hybrid_index_says_how_to_proceed(document, clients, capsys):
+    store, document_id, _ = document
+    build_bm25_index(store, document_id)
+    assert cli.main(ask_arguments(document, "--route", "auto", "--method", "bm25")) == 1
+    assert "use --method hybrid or --route fixed" in capsys.readouterr().err
+    assert clients == []
+
+
+def test_default_backend_is_the_validated_pinned_ollama_with_exact_budget():
+    args = cli.build_parser().parse_args(["ask", "0" * 64, "question"])
+    assert args.backend == "pinned-ollama" and args.route == "auto"
+    assert args.output_tokens == 3072 and args.context_window == 16384
+    config = cli._generation_config(args)
+    assert args.token_budget == "exact"
+    assert config.num_predict == 3072 and config.num_ctx == 16384
+    own = cli.build_parser().parse_args(
+        ["ask", "0" * 64, "question", "--backend", "ollama", "--llm-model", "mine:latest"]
+    )
+    assert cli._generation_config(own).model == "mine:latest" and own.token_budget == "conservative"
 
 
 def test_native_gpu_ask_searches_before_opening_the_generation_model(
@@ -758,24 +787,14 @@ def test_native_gpu_ask_searches_before_opening_the_generation_model(
     assert len(clients) == 1 and clients[0][2].close_count == 1
 
 
-def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
+def test_native_gpu_routed_reading_keeps_one_gpu_search_session(
     document, clients, tokenizer_directory, monkeypatch, capsys
 ):
-    from contextlib import contextmanager
-
-    from page_cite_rag import agent, application, gpu_retrieval
-    from page_cite_rag.reading_plan import ReadingNeed, ReadingPlan
+    from page_cite_rag import application, gpu_retrieval
     from page_cite_rag.retrieval import BM25Retriever
 
     store, document_id, _ = document
     build_bm25_index(store, document_id)
-    monkeypatch.setattr(
-        application,
-        "plan_document_question",
-        lambda *_args, **_kwargs: ReadingPlan(
-            requirements=(ReadingNeed(need="result", queries=("result",)),)
-        ),
-    )
     monkeypatch.setattr(
         cli,
         "_load_encoder",
@@ -822,27 +841,8 @@ def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
             finally:
                 events.append("GPU session cleanup")
 
-    @contextmanager
-    def local_model(_client):
-        yield object()
-
-    def run_agent(workflow, question, language, result, blocks, _model, **kwargs):
-        assert kwargs["delegated"] is False
-        _enable_exact_writer_budget(workflow)
-        followup, _followup_blocks = workflow.search_sources("independent follow-up query")
-        assert followup.query == "independent follow-up query"
-        current = agent._admit(workflow, question, language, blocks, result.context_groups)
-        return _fake_navigation_agent_run(
-            workflow,
-            current,
-            model_calls=2,
-            tool_calls=1,
-            ledger=kwargs["shared_ledger"],
-        )
-
     monkeypatch.setattr(gpu_retrieval, "StagedGpuSearch", FakeStagedGpuSearch)
-    monkeypatch.setattr(agent, "local_chat_model", local_model)
-    monkeypatch.setattr(agent, "run_bounded_reading_agent", run_agent)
+    monkeypatch.setattr(application, "answer_question", _fake_routed_answer(events))
     open_client = cli._open_generation_client
 
     def record_generation_start(args, config):
@@ -867,7 +867,8 @@ def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
         str(tokenizer_directory),
         "--gpu-temperature-limit",
         "88",
-        "--agent",
+        "--route",
+        "auto",
         "--format",
         "json",
     )
@@ -875,14 +876,13 @@ def test_native_gpu_agent_uses_owned_gpu_for_followup_search(
     assert cli.main(arguments) == 0
     output = json.loads(capsys.readouterr().out)
     assert output["answer"]["status"] == "answered"
-    assert output["agent_trace"]["model_calls_completed"] == 3
+    assert output["routing"]["route"] == "whole_document"
     assert events == [
         "GPU search setup",
         "GPU session start",
         "generation startup",
-        "GPU query: significant",
-        "GPU query: result",
         "GPU query: independent follow-up query",
+        "GPU query: significant",
         "GPU session cleanup",
     ]
     assert len(clients) == 1 and clients[0][2].close_count == 1

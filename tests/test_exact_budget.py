@@ -154,6 +154,15 @@ def test_workflow_uses_same_budget_for_question_admission_and_generation(setup):
 
 def test_exact_cli_is_explicit_and_unsupported_backend_does_not_start(monkeypatch):
     parser = cli.build_parser()
-    assert parser.parse_args(["ask", "a" * 64, "Question?"]).token_budget == "conservative"
+    # Owned backends default to exact counting; your own Ollama to the conservative estimate.
+    owned = parser.parse_args(["ask", "a" * 64, "Question?"])
+    cli._generation_config(owned)
+    assert owned.token_budget == "exact"
+    own = parser.parse_args(["ask", "a" * 64, "Question?", "--backend", "ollama"])
+    cli._generation_config(own)
+    assert own.token_budget == "conservative"
     monkeypatch.setattr(cli, "_open_generation_client", lambda *a: pytest.fail("model started"))
-    assert cli.main(["ask", "a" * 64, "Question?", "--token-budget", "exact"]) == 1
+    assert (
+        cli.main(["ask", "a" * 64, "Question?", "--backend", "ollama", "--token-budget", "exact"])
+        == 1
+    )

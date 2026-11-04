@@ -109,10 +109,9 @@ def test_service_reuses_one_model_then_releases_owned_model_on_idle(prepared):
         service.submit("ask", "result significant")
 
 
-def test_service_reading_uses_shared_navigation_and_returns_its_trace(prepared, monkeypatch):
+def test_service_routes_asks_through_the_shared_entry(prepared, monkeypatch):
     from page_cite_rag import application
     from page_cite_rag.dense import build_dense_index
-    from page_cite_rag.reading_plan import ReadingNeed, ReadingPlan
     from test_dense import FakeEncoder
 
     database, document_id, _ = prepared
@@ -121,39 +120,34 @@ def test_service_reading_uses_shared_navigation_and_returns_its_trace(prepared, 
     build_dense_index(store, document_id, encoder)
     calls = []
 
-    def shared_reading(workflow, question, **kwargs):
-        calls.append((workflow.document_id, question, kwargs))
+    def routed(workflow, question, **kwargs):
+        calls.append(kwargs)
         return application.AgentAnswer(
             workflow.ask(question, language=kwargs["language"]),
-            {"version": "source-navigation/v1", "agent": {"tool_calls_recorded": 1}},
+            {"version": "routed-answer/v1", "route": "fixed", "reason": "planner_scope_lookup"},
         )
 
-    monkeypatch.setattr(application, "ask_with_agent", shared_reading)
-    monkeypatch.setattr(
-        application,
-        "plan_document_question",
-        lambda *_args, **_kwargs: ReadingPlan(
-            requirements=(ReadingNeed(need="result", queries=("result",)),)
-        ),
-    )
+    monkeypatch.setattr(application, "answer_question", routed)
     config = GenerationConfig()
     with DocumentService(
         ServiceConfig(
-            database_path=database,
-            document_id=document_id,
-            method="hybrid",
-            reading_agent=True,
+            database_path=database, document_id=document_id, method="hybrid", route="auto"
         ),
         config,
         lambda: FakeClient(config),
         encoder=encoder,
     ) as service:
         answer = service.submit("ask", "significant")[1].result(timeout=5)
-        assert answer.trace.reading_trace["version"] == "source-navigation/v1"
-        assert calls[0][2]["delegated"] is False
-        assert calls[0][2].get("max_model_calls") is None
-        with pytest.raises(ValueError, match="already uses planned query routes"):
+        assert answer.trace.reading_trace["version"] == "routed-answer/v1"
+        assert calls[0]["route"] == "auto" and calls[0]["source_language"] == "en"
+        with pytest.raises(ValueError, match="validated retrieval profile"):
             service.submit("ask", "significant", rewrite_query=True)
+    with pytest.raises(ValueError, match="routing needs the hybrid index"):
+        DocumentService(
+            ServiceConfig(database_path=database, document_id=document_id, route="auto"),
+            config,
+            lambda: FakeClient(config),
+        )
 
 
 def test_queue_full_cancel_waiter_and_active_owned_model_only(prepared):
@@ -300,7 +294,7 @@ def test_serve_requires_environment_token_before_runtime_start(monkeypatch, caps
         create_app(None, api_token=" ")
 
 
-def test_serve_accepts_agent_with_native_reranker(prepared, monkeypatch):
+def test_serve_routes_by_default_and_reranks_only_on_the_fixed_route(prepared, monkeypatch):
     import uvicorn
 
     from page_cite_rag import api, cli, gpu_retrieval
@@ -317,42 +311,42 @@ def test_serve_accepts_agent_with_native_reranker(prepared, monkeypatch):
             raise AssertionError("startup must not execute retrieval")
 
     def run(service, **_kwargs):
-        captured["agent_enabled"] = service.config.reading_agent
+        captured["route"] = service.config.route
 
     monkeypatch.setenv("PAGE_CITE_RAG_API_TOKEN", "test-local-token")
     monkeypatch.setattr(gpu_retrieval, "StagedGpuSearch", FakeStage)
     monkeypatch.setattr(api, "create_app", lambda service, **_kwargs: service)
     monkeypatch.setattr(uvicorn, "run", run)
-    result = cli.main(
-        [
-            "serve",
-            document_id,
-            "--db",
-            str(database),
-            "--method",
-            "hybrid",
-            "--embedding-backend",
-            "native-gpu",
-            "--device",
-            "cuda",
-            "--gpu-uuid",
-            "GPU-12345678-1234-1234-1234-123456789abc",
-            "--agent",
-            "--rerank",
-        ]
-    )
-    assert result == 0
-    assert captured["agent_enabled"] is True
+    arguments = [
+        "serve",
+        document_id,
+        "--db",
+        str(database),
+        "--method",
+        "hybrid",
+        "--embedding-backend",
+        "native-gpu",
+        "--device",
+        "cuda",
+        "--gpu-uuid",
+        "GPU-12345678-1234-1234-1234-123456789abc",
+        "--rerank",
+    ]
+    # Routing uses the validated retrieval profile, which has no reranker.
+    assert cli.main(arguments) == 1 and "route" not in captured
+    assert cli.main([*arguments, "--route", "fixed"]) == 0
+    assert captured["route"] == "fixed"
     assert captured["reranker"] is not None
 
 
+@pytest.mark.parametrize("backend", ["pinned-ollama", "llama"])
 @pytest.mark.parametrize("temperature_limit", [None, 88])
 def test_serve_native_gpu_temperature_policy_reaches_both_backends(
-    prepared, monkeypatch, temperature_limit
+    prepared, monkeypatch, temperature_limit, backend
 ):
     import uvicorn
 
-    from page_cite_rag import api, cli, gpu_retrieval, llama
+    from page_cite_rag import api, cli, gpu_retrieval, llama, ollama_backend
 
     database, document_id, blocks = prepared
     lexical = BM25Retriever(SQLiteDocumentStore(database, read_only=True), document_id)
@@ -394,6 +388,7 @@ def test_serve_native_gpu_temperature_policy_reaches_both_backends(
     monkeypatch.setenv("PAGE_CITE_RAG_API_TOKEN", "test-local-token")
     monkeypatch.setattr(gpu_retrieval, "StagedGpuSearch", FakeStage)
     monkeypatch.setattr(llama, "LlamaModelClient", open_client)
+    monkeypatch.setattr(ollama_backend, "OllamaGgufClient", open_client)
     monkeypatch.setattr(api, "create_app", lambda service, **_kwargs: service)
     monkeypatch.setattr(uvicorn, "run", run)
     arguments = [
@@ -409,6 +404,10 @@ def test_serve_native_gpu_temperature_policy_reaches_both_backends(
         "cuda",
         "--gpu-uuid",
         "GPU-12345678-1234-1234-1234-123456789abc",
+        "--route",
+        "fixed",
+        "--backend",
+        backend,
     ]
     if temperature_limit is not None:
         arguments.extend(["--gpu-temperature-limit", str(temperature_limit)])

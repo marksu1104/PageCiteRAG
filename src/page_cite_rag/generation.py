@@ -391,6 +391,10 @@ class OllamaModelClient:
         if type(include_schema_in_prompt) is not bool:
             raise ValueError("schema prompt inclusion must be boolean")
         messages = tuple(messages)
+        # The server's chat template may read these as real turn markers, letting document
+        # text forge a turn; fail closed as the owned clients do, never rewrite the text.
+        if any("<|" in message.content or "|>" in message.content for message in messages):
+            raise ModelError("reserved chat-token delimiters in input; no silent text rewriting")
         schema = response_model.model_json_schema()
         budget = check_budget(
             messages,

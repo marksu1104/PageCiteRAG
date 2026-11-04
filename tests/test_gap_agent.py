@@ -646,3 +646,79 @@ def test_notes_the_answer_leaves_uncited_are_recorded_without_another_call(tmp_p
     assert len(model.writer_payloads) == 1
     # select + one packed read + follow-up check + writer
     assert answer.result.agent_usage.model_calls == 4
+
+
+def test_the_single_entry_routes_by_the_scoped_plan_as_validated(tmp_path, monkeypatch):
+    from page_cite_rag import application
+    from page_cite_rag.reading_plan import ReadingNeed, ScopedReadingPlan
+    from page_cite_rag.retrieval import RetrievalError
+
+    workflow, question, result, first, (s1, _s2), replies = _two_part_reading(tmp_path)
+
+    def plan(scope):
+        need = ReadingNeed(need="every finding", queries=("finding",))
+        return lambda *_a, **_k: ScopedReadingPlan(requirements=(need,), scope=scope)
+
+    def broken(*_a, **_k):
+        raise StructuredOutputError("bad plan")
+
+    def ask(route="auto", gap_replies=()):
+        model = _ScriptedModel(workflow, list(gap_replies), s1)
+        workflow._model = model
+        answer = application.answer_question(workflow, question, language="en", route=route)
+        return answer, model
+
+    # A non-hybrid index cannot route; the user is told to build it or ask fixed.
+    with pytest.raises(RetrievalError, match="route fixed"):
+        ask()
+    monkeypatch.setattr(application, "_is_hybrid_retriever", lambda _retriever: True)
+    monkeypatch.setattr(
+        application, "search_with_reading_plan", lambda _w, _q, _p: (result, (first,), {})
+    )
+
+    monkeypatch.setattr(application, "plan_document_question", plan("lookup"))
+    lookup, model = ask()
+    assert (lookup.trace["route"], lookup.trace["reason"]) == ("fixed", "planner_scope_lookup")
+    assert lookup.trace["plan"]["scope"] == "lookup"
+    assert len(model.writer_payloads) == 1 and model.gap_payloads == []
+
+    monkeypatch.setattr(application, "plan_document_question", plan("whole_document"))
+    whole, model = ask(gap_replies=replies)
+    summary = whole.trace["reading_summary"]
+    assert whole.trace["route"] == "whole_document"
+    assert summary["sections_chosen"] == ["Part 1", "Part 2"]
+    assert summary["notes"] == 2 and summary["notes_not_in_answer"] == 1
+    # scoped planner + select + one packed read + follow-up check + writer
+    assert summary["model_calls"] == 5
+    assert whole.result.prompt_version == "agentic-reading-v3"
+
+    monkeypatch.setattr(application, "plan_document_question", broken)
+    fallback, _model = ask()
+    assert (fallback.trace["route"], fallback.trace["reason"]) == ("fixed", "planner_failed")
+    with pytest.raises(StructuredOutputError):
+        ask(route="whole-document")
+
+    monkeypatch.setattr(
+        application, "plan_document_question", lambda *_a, **_k: pytest.fail("planner called")
+    )
+    fixed, _model = ask(route="fixed")
+    assert (fixed.trace["route"], fixed.trace["reason"]) == ("fixed", "requested")
+
+
+def test_without_an_outline_auto_answers_fixed_and_forced_reading_refuses(tmp_path, monkeypatch):
+    from page_cite_rag import application
+    from page_cite_rag.retrieval import RetrievalError
+
+    question = "List every finding."
+    workflow, result, blocks, first = _markdown_reading(
+        tmp_path, "Finding one.\n\nFinding two.\n", question, "Finding one"
+    )
+    monkeypatch.setattr(application, "_is_hybrid_retriever", lambda _retriever: True)
+    monkeypatch.setattr(
+        application, "plan_document_question", lambda *_a, **_k: pytest.fail("planner called")
+    )
+    workflow._model = _ScriptedModel(workflow, [], next(iter(_spans((first,)))))
+    answer = application.answer_question(workflow, question, language="en")
+    assert (answer.trace["route"], answer.trace["reason"]) == ("fixed", "no_outline")
+    with pytest.raises(RetrievalError, match="section outline"):
+        application.answer_question(workflow, question, language="en", route="whole-document")

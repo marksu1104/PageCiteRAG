@@ -18,7 +18,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from page_cite_rag.application import (
     RetrievalMethod,
-    ask_document,
     document_retriever_parts,
     document_workflow,
     explain_source,
@@ -58,8 +57,9 @@ class ServiceConfig(BaseModel):
     queue_capacity: int = Field(default=2, ge=0, le=8)
     request_timeout_seconds: float = Field(default=600, gt=1, le=600)
     idle_seconds: float = Field(default=300, gt=0, le=300)
-    reading_agent: bool = False
-    delegate_readers: bool = False
+    # Plan 5.13/5.14: auto routes whole-document questions to section reading. The product
+    # default (auto) is set by `page-cite-rag serve`; a bare config stays on fixed retrieval.
+    route: Literal["auto", "fixed", "whole-document"] = "fixed"
 
 
 class ServiceTrace(BaseModel):
@@ -147,8 +147,8 @@ class DocumentService:
         staged_search: Retriever | Callable[[str, int], SearchResult] | None = None,
     ) -> None:
         self.config = config
-        if config.delegate_readers and not config.reading_agent:
-            raise ValueError("delegated readers require the reading agent")
+        if config.route != "fixed" and config.method != "hybrid":
+            raise ValueError("routing needs the hybrid index; serve with hybrid or route fixed")
         self.model_config = model_config
         self._model_factory = model_factory
         self._staged_search = (
@@ -262,12 +262,8 @@ class DocumentService:
             raise ValueError("query rewrite option must be boolean")
         if rewrite_query and (mode != "ask" or self.config.method == "dense"):
             raise ValueError("query rewriting requires BM25 or hybrid ask")
-        if self.config.reading_agent and rewrite_query:
-            raise ValueError(
-                "the reading Agent already uses planned query routes; disable rewrite_query"
-            )
-        if self.config.reading_agent and self.config.method != "hybrid":
-            raise ValueError("the reading Agent requires an existing hybrid index")
+        if self.config.route != "fixed" and rewrite_query:
+            raise ValueError("routing uses the validated retrieval profile; disable rewrite_query")
         question.encode("utf-8")
         if mode == "explain":
             if block_id is None:
@@ -387,8 +383,6 @@ class DocumentService:
                 from page_cite_rag.query_retrieval import RewritingRetriever
 
                 retriever = RewritingRetriever(self._lexical, rewriter, self._dense)
-        if self.config.reading_agent and self.config.method != "hybrid":
-            raise ValueError("the reading Agent requires an existing hybrid index")
         workflow = document_workflow(
             self.store,
             self.config.document_id,
@@ -401,40 +395,27 @@ class DocumentService:
         started = time.perf_counter()
         reading_trace = None
         if job.mode == "ask":
-            if self.config.reading_agent:
-                from contextlib import nullcontext
+            from contextlib import nullcontext
 
-                from page_cite_rag.application import ask_with_agent
+            from page_cite_rag.application import answer_question
 
-                session = (
-                    self._staged_search.session()
-                    if self._staged_search is not None
-                    and self._staged_search.reranker_model_path is None
-                    else nullcontext()
+            session = (
+                self._staged_search.session()
+                if self.config.route != "fixed"
+                and self._staged_search is not None
+                and self._staged_search.reranker_model_path is None
+                else nullcontext()
+            )
+            with session:
+                routed = answer_question(
+                    workflow,
+                    job.question,
+                    language=job.language,
+                    source_language=self._source_language,
+                    route=self.config.route,
                 )
-                with session:
-                    from page_cite_rag.application import prepare_agent_question
-
-                    workflow, planned_search, planned_blocks, planning_trace = (
-                        prepare_agent_question(
-                            workflow,
-                            job.question,
-                            language=job.language,
-                            source_language=self._source_language,
-                        )
-                    )
-                    reviewed = ask_with_agent(
-                        workflow,
-                        job.question,
-                        language=job.language,
-                        delegated=self.config.delegate_readers,
-                        initial_search=planned_search,
-                        initial_blocks=planned_blocks,
-                    )
-                reading_trace = {**reviewed.trace, "planning": planning_trace}
-                result = reviewed.result
-            else:
-                result = ask_document(workflow, job.question, language=job.language)
+            reading_trace = routed.trace
+            result = routed.result
             if self._staged_search is not None:
                 retrieval_stage_ms = (
                     result.retrieval.elapsed_ms if result.retrieval is not None else 0.0

@@ -242,7 +242,14 @@ def test_pdf_ingest_tracks_each_page_and_cli_reads_page_back(tmp_path, capsys) -
     _write_two_page_pdf(source)
     database = tmp_path / "documents.sqlite3"
 
-    assert main(["ingest", str(source), "--db", str(database), "--language", "en"]) == 0
+    # These PDF tests exercise pdfplumber; PDFs otherwise default to Docling.
+    assert (
+        main(
+            ["ingest", str(source), "--db", str(database), "--language", "en"]
+            + ["--parser", "pdfplumber"]
+        )
+        == 0
+    )
     ingest_output = capsys.readouterr().out
     ingest_report = json.loads(ingest_output)
     document_id = ingest_report["document"]["document_id"]
@@ -291,7 +298,10 @@ def test_pdf_spacing_default_and_stream_order_have_distinct_source_identity(
     )
     database = tmp_path / "columns.sqlite3"
     assert (
-        main(["ingest", str(source), "--db", str(database), "--pdf-reading-order", "text-flow"])
+        main(
+            ["ingest", str(source), "--db", str(database), "--pdf-reading-order", "text-flow"]
+            + ["--parser", "pdfplumber"]
+        )
         == 0
     )
     result = json.loads(capsys.readouterr().out)
@@ -314,6 +324,8 @@ def test_pdf_spacing_default_and_stream_order_have_distinct_source_identity(
                 str(ratio_database),
                 "--pdf-x-tolerance-ratio",
                 "0.15",
+                "--parser",
+                "pdfplumber",
             ]
         )
         == 0
@@ -331,7 +343,10 @@ def test_pdf_order_rejects_unknown_or_non_pdf_inputs_before_creating_store(tmp_p
         prepare_source(source, pdf_x_tolerance_ratio=0.15)
     database = tmp_path / "should-not-exist.sqlite3"
     assert (
-        main(["ingest", str(source), "--db", str(database), "--pdf-reading-order", "text-flow"])
+        main(
+            ["ingest", str(source), "--db", str(database), "--pdf-reading-order", "text-flow"]
+            + ["--parser", "pdfplumber"]
+        )
         == 1
     )
     assert "only to PDF" in capsys.readouterr().err

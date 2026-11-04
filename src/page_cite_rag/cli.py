@@ -79,22 +79,23 @@ def _run_doctor(as_json: bool) -> int:
 
 def _run_ingest(args: argparse.Namespace) -> int:
     try:
-        if args.parser == "docling":
-            from page_cite_rag.docling_document import convert_pdf
+        # PDFs default to Docling, the validated parser: it keeps the outline that
+        # whole-document reading needs. pdfplumber stays available on request.
+        parser = args.parser
+        if parser == "auto":
+            parser = "docling" if Path(args.source).suffix.lower() == ".pdf" else "text"
+        if parser == "docling":
+            from page_cite_rag.docling_document import DEFAULT_ARTIFACTS, convert_pdf
             from page_cite_rag.embedding import DEFAULT_MODEL_DIR
 
-            if (
-                args.pdf_reading_order != "geometric"
-                or args.pdf_x_tolerance_ratio is not None
-                or args.docling_artifacts is None
-            ):
+            if args.pdf_reading_order != "geometric" or args.pdf_x_tolerance_ratio is not None:
                 raise DocumentIngestError(
-                    "Docling requires --docling-artifacts and does not use pdfplumber "
-                    "spacing/order options"
+                    "Docling does not use pdfplumber spacing/order options; "
+                    "pass --parser pdfplumber to use them"
                 )
             bundle = convert_pdf(
                 args.source,
-                artifacts=args.docling_artifacts,
+                artifacts=args.docling_artifacts or DEFAULT_ARTIFACTS,
                 tokenizer_dir=args.tokenizer_dir or DEFAULT_MODEL_DIR,
                 language=args.language,
                 usage_scope=args.usage_scope,
@@ -505,16 +506,34 @@ def _run_model(args: argparse.Namespace) -> int:
         return 1
 
 
+# Plan 5.13 validated the pinned GGUF on the owned Ollama server; it is the default.
+OWNED_BACKENDS = ("pinned-ollama", "llama")
+
+
 def _generation_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--backend", choices=("ollama", "llama"), default="ollama")
+    parser.add_argument(
+        "--backend",
+        choices=("pinned-ollama", "llama", "ollama"),
+        default="pinned-ollama",
+        help=(
+            "pinned-ollama (default) and llama serve the pinned, hash-checked GGUF from an "
+            "owned local server with exact token counting, as validated. ollama connects to "
+            "your own Ollama server and --llm-model: an unvalidated configuration."
+        ),
+    )
     parser.add_argument(
         "--token-budget",
         choices=("conservative", "exact"),
-        default="conservative",
-        help="Exact fixed-template token counting is opt-in and requires the llama backend.",
+        default=None,
+        help="Defaults to exact for the owned backends and conservative for your own Ollama.",
+    )
+    parser.add_argument(
+        "--llm-model", help="Model name on your own Ollama server (--backend ollama)."
     )
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
-    parser.add_argument("--gpu-uuid", help="One explicit GPU UUID; only llama CUDA supports it.")
+    parser.add_argument(
+        "--gpu-uuid", help="One explicit GPU UUID; only the owned backends support CUDA."
+    )
     parser.add_argument(
         "--gpu-temperature-limit",
         type=_positive_integer,
@@ -533,21 +552,26 @@ def _generation_options(parser: argparse.ArgumentParser) -> None:
 
 def _generation_config(args: argparse.Namespace):
     # Validate choices before loading a large embedding model or starting a server.
-    from page_cite_rag.generation import GenerationConfig
+    from page_cite_rag.generation import DEFAULT_LLM, GenerationConfig
 
-    if args.token_budget == "exact" and args.backend != "llama":
-        raise ValueError("exact token budget requires llama")
+    if args.token_budget is None:
+        args.token_budget = "exact" if args.backend in OWNED_BACKENDS else "conservative"
+    if args.token_budget == "exact" and args.backend not in OWNED_BACKENDS:
+        raise ValueError("exact token budget requires an owned backend (pinned-ollama or llama)")
+    if args.llm_model is not None and args.backend != "ollama":
+        raise ValueError("--llm-model selects a model on your own Ollama (--backend ollama)")
 
     if args.gpu_temperature_limit is not None and (
-        args.backend != "llama" or args.device != "cuda"
+        args.backend not in OWNED_BACKENDS or args.device != "cuda"
     ):
-        raise ValueError("--gpu-temperature-limit requires explicit llama CUDA")
+        raise ValueError("--gpu-temperature-limit requires an owned backend on CUDA")
 
     if args.backend == "ollama":
         if args.device != "cpu" or args.gpu_uuid is not None or args.bundle_dir is not None:
-            raise ValueError("Ollama uses the retained CPU route; CUDA/bundle options need llama")
+            raise ValueError("your own Ollama runs as configured there; CUDA/bundle need owned")
         return GenerationConfig(
             host=args.llm_host,
+            model=args.llm_model or DEFAULT_LLM,
             num_ctx=args.context_window,
             num_predict=args.output_tokens,
             timeout_seconds=args.generation_timeout,
@@ -557,7 +581,7 @@ def _generation_config(args: argparse.Namespace):
     from page_cite_rag.llama import DEFAULT_BUNDLE, LlamaConfig
 
     if args.llm_host != "http://127.0.0.1:11435":
-        raise ValueError("llama owns its loopback server; --llm-host is only for Ollama")
+        raise ValueError("owned backends start their own server; --llm-host needs --backend ollama")
     return LlamaConfig(
         bundle_dir=args.bundle_dir or DEFAULT_BUNDLE,
         device=args.device,
@@ -574,7 +598,16 @@ def _open_generation_client(args: argparse.Namespace, config):
     if args.backend == "ollama":
         from page_cite_rag.generation import OllamaModelClient
 
+        print(
+            "page-cite-rag: using your own Ollama model; this configuration is not the "
+            "validated one, so the published comparison does not apply to it.",
+            file=sys.stderr,
+        )
         return OllamaModelClient(config)
+    if args.backend == "pinned-ollama":
+        from page_cite_rag.ollama_backend import OllamaGgufClient
+
+        return OllamaGgufClient(config, budget_policy="exact")
     from page_cite_rag.llama import LlamaModelClient
 
     if args.token_budget == "exact":
@@ -646,6 +679,40 @@ def _print_answer(result, output_format: str) -> None:
         print(f"Note: {_terminal_safe(limitation)}")
 
 
+_ROUTE_REASONS = {
+    "requested": "requested with --route",
+    "planner_scope_lookup": "the question asks for a specific answer",
+    "planner_scope_whole_document": "the question needs reading across the document",
+    "planner_failed": "the question planner failed, so fixed retrieval answered",
+    "no_outline": "the document has no section outline for whole-document reading",
+}
+
+
+def _print_route(trace: dict) -> None:
+    """Show how the answer was produced; reading notes stay in --format json."""
+    reason = _ROUTE_REASONS.get(trace.get("reason"), str(trace.get("reason")))
+    if trace.get("route") != "whole_document":
+        print(f"Route: fixed retrieval ({reason}).")
+        return
+    summary = trace["reading_summary"]
+    print(f"Route: whole-document reading ({reason}).")
+    sections = [
+        *summary["sections_chosen"],
+        *summary["sections_from_search"],
+        *summary["sections_followed_up"],
+    ]
+    shown = "; ".join(_terminal_safe(title) for title in sections[:12])
+    more = f" and {len(sections) - 12} more" if len(sections) > 12 else ""
+    print(f"Sections read ({len(sections)}): {shown}{more}")
+    print(
+        f"Reading notes: {summary['notes']}, of which {summary['notes_not_in_answer']} are not "
+        "cited in the answer (see --format json); notes are unverified, citations are checked."
+    )
+    print(f"Model calls: {summary['model_calls']}; elapsed {summary['elapsed_seconds']} s.")
+    if summary["navigation_degraded"]:
+        print("Note: section reading stopped early; the answer may be incomplete.")
+
+
 def _run_answer(args: argparse.Namespace) -> int:
     from page_cite_rag.application import (
         ask_document,
@@ -660,8 +727,7 @@ def _run_answer(args: argparse.Namespace) -> int:
     client = None
     retrieval_session = None
     retrieval_owner = [None]
-    agent_enabled = getattr(args, "agent", False)
-    delegate_readers = getattr(args, "delegate_readers", False)
+    route = getattr(args, "route", "fixed") if args.command == "ask" else "fixed"
     native_gpu = getattr(args, "native_gpu", False)
     request_timeout = args.request_timeout_seconds
     if (
@@ -702,12 +768,6 @@ def _run_answer(args: argparse.Namespace) -> int:
             raise ModelTimeoutError("local request exceeded its total deadline")
 
     try:
-        if delegate_readers and not agent_enabled:
-            raise ValueError("--delegate-readers requires --agent")
-        if agent_enabled and (
-            args.command != "ask" or args.backend != "llama" or args.token_budget != "exact"
-        ):
-            raise ValueError("--agent requires ask with --backend llama --token-budget exact")
         config = _generation_config(args)
         if not args.question.strip() or len(args.question) > 4000:
             raise ValueError("question must be nonblank and at most 4000 characters")
@@ -726,24 +786,27 @@ def _run_answer(args: argparse.Namespace) -> int:
             store, args.document_id
         )
         if args.command == "ask" and args.method is None:
-            args.method = "hybrid" if docling_source or native_gpu or agent_enabled else "bm25"
+            args.method = "hybrid" if docling_source or native_gpu or route != "fixed" else "bm25"
         if args.command == "ask":
-            if agent_enabled and args.method != "hybrid":
-                raise ValueError("the reading Agent requires an existing hybrid index")
-            if agent_enabled and (args.rewrite_query or args.rerank):
-                raise ValueError(
-                    "the reading Agent uses the shared planner profile; disable lexical "
-                    "rewrite and reranking"
+            # RetrievalError messages are shown to the user; they carry no input or paths.
+            if route != "fixed" and args.method != "hybrid":
+                raise RetrievalError(
+                    "routing needs the hybrid index; use --method hybrid or --route fixed"
+                )
+            if route != "fixed" and (args.rewrite_query or args.rerank):
+                raise RetrievalError(
+                    "routing uses the validated retrieval profile; use --route fixed for query "
+                    "rewriting or reranking"
                 )
             if args.rerank and not native_gpu:
                 raise ValueError("--rerank requires --native-gpu")
             if native_gpu and (
-                args.backend != "llama"
+                args.backend not in OWNED_BACKENDS
                 or args.device != "cuda"
                 or not args.gpu_uuid
                 or args.method not in ("dense", "hybrid")
             ):
-                raise ValueError("--native-gpu requires dense/hybrid llama CUDA")
+                raise ValueError("--native-gpu requires dense/hybrid with an owned backend on CUDA")
             if args.rewrite_query and args.method == "dense":
                 raise ValueError("query rewriting is lexical-only; use bm25 or hybrid")
             if native_gpu:
@@ -777,7 +840,7 @@ def _run_answer(args: argparse.Namespace) -> int:
                     retriever = RewritingRetriever(None, rewriter, search_backend=gpu_retriever)
                 else:
                     retriever = gpu_retriever
-                if agent_enabled and not args.rerank:
+                if route != "fixed" and not args.rerank:
                     retrieval_session = gpu_retriever.session()
                     retrieval_session.__enter__()
                 lexical, dense = None, None
@@ -802,7 +865,7 @@ def _run_answer(args: argparse.Namespace) -> int:
         precomputed_search = None
         precomputed_blocks = ()
         initial_gpu_search_trace = None
-        if native_gpu and not agent_enabled:
+        if native_gpu and route == "fixed":
             search_workflow = document_workflow(
                 store,
                 args.document_id,
@@ -872,62 +935,39 @@ def _run_answer(args: argparse.Namespace) -> int:
             top_k=workflow_config.top_k,
             neighbor_blocks=workflow_config.neighbor_blocks,
         )
-        if agent_enabled:
-            from page_cite_rag.application import ask_with_agent, prepare_agent_question
+        if route != "fixed":
+            from page_cite_rag.application import answer_question
 
-            workflow, search_result, blocks, planning_trace = prepare_agent_question(
+            routed = answer_question(
                 workflow,
                 args.question,
                 language=args.language,
                 source_language=document.language,
-            )
-            reading_run = ask_with_agent(
-                workflow,
-                args.question,
-                language=args.language,
-                delegated=delegate_readers,
-                initial_search=search_result,
-                initial_blocks=blocks,
+                route=route,
             )
             ensure_request_time()
-            reading_run.trace["planning"] = planning_trace
             if retrieval_session is not None:
                 retrieval_session.__exit__(None, None, None)
                 retrieval_session = None
-            final_gpu_trace = getattr(retriever, "last_trace", None)
-            agent_gpu_search_trace = (
-                dict(final_gpu_trace) if native_gpu and isinstance(final_gpu_trace, dict) else None
-            )
-            result = reading_run.result
+            result = routed.result
             if args.format == "json":
-                report = {
-                    "answer": result.model_dump(mode="json"),
-                    "reading_trace": reading_run.trace,
-                    "agent_trace": reading_run.trace["agent"],
-                }
+                report = {"answer": result.model_dump(mode="json"), "routing": routed.trace}
                 if initial_gpu_search_trace is not None:
                     report["initial_gpu_search_trace"] = initial_gpu_search_trace
-                if agent_gpu_search_trace is not None:
-                    report["agent_gpu_search_trace"] = agent_gpu_search_trace
                 if (
-                    args.backend == "llama"
+                    args.backend in OWNED_BACKENDS
                     and args.device == "cuda"
                     and callable(getattr(client, "diagnostics", None))
                 ):
                     report["gpu_generation_diagnostics"] = client.diagnostics()
                 print(
                     _terminal_safe(
-                        json.dumps(
-                            report,
-                            ensure_ascii=False,
-                            indent=2,
-                            allow_nan=False,
-                        )
+                        json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
                     )
                 )
             else:
                 _print_answer(result, args.format)
-                print("Reading trace: source navigation and cited answer.")
+                _print_route(routed.trace)
         else:
             if args.command == "ask" and precomputed_search is not None:
                 result = workflow.answer_from_context(
@@ -948,7 +988,7 @@ def _run_answer(args: argparse.Namespace) -> int:
                 if initial_gpu_search_trace is not None:
                     report["gpu_retrieval_trace"] = initial_gpu_search_trace
                 if (
-                    args.backend == "llama"
+                    args.backend in OWNED_BACKENDS
                     and args.device == "cuda"
                     and callable(getattr(client, "diagnostics", None))
                 ):
@@ -994,7 +1034,7 @@ def _run_serve(args: argparse.Namespace) -> int:
             record = store.get_document(args.document_id)
             args.method = (
                 "hybrid"
-                if args.agent
+                if args.route != "fixed"
                 or args.embedding_backend == "native-gpu"
                 or (
                     record is not None
@@ -1005,18 +1045,16 @@ def _run_serve(args: argparse.Namespace) -> int:
             )
         if not 1 <= args.port <= 65535:
             raise ValueError("invalid loopback port")
-        if args.backend != "llama" or args.token_budget != "exact":
-            raise ValueError("local API requires llama with exact token budgeting")
         config = _generation_config(args)
+        if args.backend not in OWNED_BACKENDS or args.token_budget != "exact":
+            raise ValueError("local API requires an owned backend with exact token budgeting")
         from page_cite_rag.api import create_app
         from page_cite_rag.service import DocumentService, ServiceConfig
 
         if args.rerank and args.embedding_backend != "native-gpu":
             raise ValueError("--rerank requires --embedding-backend native-gpu")
-        if args.delegate_readers and not args.agent:
-            raise ValueError("--delegate-readers requires --agent")
-        if args.agent and (args.backend != "llama" or args.token_budget != "exact"):
-            raise ValueError("--agent requires --backend llama --token-budget exact")
+        if args.rerank and args.route != "fixed":
+            raise ValueError("routing uses the validated retrieval profile; rerank needs fixed")
         if args.embedding_backend == "native-gpu" and (
             args.method == "bm25" or args.device != "cuda" or not args.gpu_uuid
         ):
@@ -1053,8 +1091,7 @@ def _run_serve(args: argparse.Namespace) -> int:
                 queue_capacity=args.queue_capacity,
                 idle_seconds=args.idle_seconds,
                 request_timeout_seconds=args.request_timeout_seconds,
-                reading_agent=args.agent,
-                delegate_readers=args.delegate_readers,
+                route=args.route,
             ),
             config,
             lambda: _open_generation_client(args, config),
@@ -1140,9 +1177,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ingest_parser.add_argument(
         "--parser",
-        choices=("pdfplumber", "docling"),
-        default="pdfplumber",
-        help="PDF parser; Docling requires prepared local models and its optional environment.",
+        choices=("auto", "docling", "pdfplumber"),
+        default="auto",
+        help=(
+            "auto (default) parses PDFs with Docling, which keeps the section outline used by "
+            "whole-document reading and needs prepared local models; pdfplumber has no outline."
+        ),
     )
     ingest_parser.add_argument(
         "--docling-artifacts", type=Path, help="Prepared offline Docling layout/table models."
@@ -1267,19 +1307,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Opt in to lexical keyword expansion; dense keeps the original question.",
     )
     ask_parser.add_argument(
-        "--agent",
-        action="store_true",
+        "--route",
+        choices=("auto", "fixed", "whole-document"),
+        default="auto",
         help=(
-            "Use an Agent to search, read and provide a cited answer; requires --backend llama "
-            "--token-budget exact and the optional agent extra."
-        ),
-    )
-    ask_parser.add_argument(
-        "--delegate-readers",
-        action="store_true",
-        help=(
-            "Allow the reading agent to delegate up to two sequential, read-only tasks; "
-            "requires --agent and shares its token/tool budgets."
+            "auto (default) sends questions that need the whole document (list every..., "
+            "compare..., trace back...) to section-by-section reading and other questions "
+            "to fixed retrieval, as validated; fixed or whole-document forces one path."
         ),
     )
     _embedding_options(ask_parser)
@@ -1318,9 +1352,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--method", choices=("bm25", "dense", "hybrid"), default=None)
     serve_parser.add_argument("--rerank", action="store_true", help="Rerank native GPU candidates.")
     serve_parser.add_argument(
-        "--agent", action="store_true", help="Enable source-aware reading/repair."
+        "--route",
+        choices=("auto", "fixed", "whole-document"),
+        default="auto",
+        help="Same routing as ask: auto (default), fixed or whole-document.",
     )
-    serve_parser.add_argument("--delegate-readers", action="store_true")
     serve_parser.add_argument("--top-k", type=_positive_integer, default=FORMAL_RETRIEVAL.final_k)
     serve_parser.add_argument("--port", type=_positive_integer, default=8765)
     serve_parser.add_argument("--queue-capacity", type=int, default=2)
@@ -1330,7 +1366,7 @@ def build_parser() -> argparse.ArgumentParser:
     _embedding_options(serve_parser)
     _generation_options(serve_parser)
     serve_parser.set_defaults(output_tokens=3072)
-    serve_parser.set_defaults(backend="llama", token_budget="exact")
+    serve_parser.set_defaults(token_budget="exact")
 
     return parser
 
