@@ -886,3 +886,29 @@ def test_native_gpu_routed_reading_keeps_one_gpu_search_session(
         "GPU session cleanup",
     ]
     assert len(clients) == 1 and clients[0][2].close_count == 1
+
+
+def test_progress_lines_name_each_model_call_and_forward_everything_else():
+    import io
+
+    from page_cite_rag.reading_plan import ScopedReadingPlan
+
+    class Model:
+        identity = {"model": "fake"}
+
+        def generate(self, messages, response_model):
+            return response_model.__name__
+
+    stream = io.StringIO()
+    model = cli._ProgressModel(Model(), stream)
+    assert model.identity == {"model": "fake"}
+    assert model.generate((), ScopedReadingPlan) == "ScopedReadingPlan"
+    assert model.generate((), type("ProvidedFullAnswerDraft", (), {})) == "ProvidedFullAnswerDraft"
+    assert stream.getvalue() == ("[1] planning the question...\n[2] writing the cited answer...\n")
+
+
+def test_cli_request_timeout_may_extend_to_an_hour_for_cpu_only_machines(document, clients):
+    store, document_id, _ = document
+    build_bm25_index(store, document_id)
+    assert cli.main(ask_arguments(document, "--request-timeout-seconds", "3601")) == 1
+    assert cli.main(ask_arguments(document, "--request-timeout-seconds", "3600")) == 0

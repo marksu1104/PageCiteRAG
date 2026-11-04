@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+from collections import Counter
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -25,6 +27,48 @@ from page_cite_rag.source_outline import OUTLINE_KIND, SourceOutline, SourceSect
 from page_cite_rag.store import SQLiteDocumentStore, StoreError
 
 SOURCE_KIND = "docling-native-document-v1"
+# Docling joins words broken across lines in body text but not inside table cells
+# ("tele- work"), which hides table text from search. Recorded in the parser version and in
+# the saved document so reloads reproduce the coverage record.
+TABLE_JOIN_VERSION = "table-line-break-join/v1"
+NORMALIZATION_KEY = "page_cite_rag_normalization"
+_CELL_LINE_BREAK = re.compile(r"\b([^\W\d_]+)- ([^\W\d_]+)\b")
+_WORD = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)*")
+
+
+def join_table_line_breaks(document) -> int:
+    """Join words a table cell broke across lines, decided by the document's own words.
+
+    A joined form used elsewhere in the document ("telework") is joined; a hyphenated form
+    used elsewhere ("non-executive") keeps its hyphen without the line-break space; any
+    other pair is left exactly as Docling extracted it. Returns the number of joins.
+    """
+    vocabulary: Counter[str] = Counter()
+    for item in document.texts:
+        vocabulary.update(word.casefold() for word in _WORD.findall(item.text or ""))
+    cells = [cell for table in document.tables for cell in table.data.table_cells]
+    for cell in cells:
+        vocabulary.update(word.casefold() for word in _WORD.findall(cell.text or ""))
+    joins = 0
+
+    def join(match: re.Match) -> str:
+        nonlocal joins
+        left, right = match.group(1), match.group(2)
+        joined, hyphenated = (left + right).casefold(), f"{left}-{right}".casefold()
+        if vocabulary[joined] and vocabulary[joined] >= vocabulary[hyphenated]:
+            joins += 1
+            return left + right
+        if vocabulary[hyphenated]:
+            joins += 1
+            return f"{left}-{right}"
+        return match.group(0)
+
+    for cell in cells:
+        if cell.text:
+            cell.text = _CELL_LINE_BREAK.sub(join, cell.text)
+    return joins
+
+
 _SOURCE_VERSION = "docling-native-document/v2"
 DEFAULT_ARTIFACTS = Path("models/docling-pinned")
 _MODEL_HASHES = {
@@ -261,6 +305,11 @@ def bundle_from_native(
             if isinstance(document.get("body"), dict)
             and isinstance(document["body"].get("children"), list)
             else "legacy-collection-order-fallback"
+        ),
+        **(
+            {"table_cell_line_break_joins": normalization["table_cell_line_break_joins"]}
+            if isinstance(normalization := document.get(NORMALIZATION_KEY), dict)
+            else {}
         ),
         "chunk_count": len(chunks),
         "recovered_search_windows": sum(
@@ -553,6 +602,8 @@ def convert_pdf(
     result = converter.convert(path)
     if result.status != ConversionStatus.SUCCESS:
         raise DoclingDocumentError("Docling could not completely parse this PDF")
+    # Before chunking, so search chunks and stored table blocks carry the same text.
+    table_joins = join_table_line_breaks(result.document)
     page_count = len(result.document.pages)
     if page_count < 1 or _sha256_file(path) != source_sha256:
         raise DoclingDocumentError("PDF changed during conversion or has no pages")
@@ -576,12 +627,16 @@ def convert_pdf(
             }
         )
     document = result.document.export_to_dict()
+    document[NORMALIZATION_KEY] = {
+        "version": TABLE_JOIN_VERSION,
+        "table_cell_line_break_joins": table_joins,
+    }
     _recover_omitted_items(document, chunks, page_count=page_count, tokenizer=tokenizer)
     if not chunks:
         raise DoclingDocumentError("Docling found no readable chunks")
     parser_version = (
         f"docling-{versions['docling']};core-{versions['docling-core']};"
-        f"hybrid-496;tok-{tokenizer_sha256[:16]};{ADAPTER_VERSION}"
+        f"hybrid-496;tok-{tokenizer_sha256[:16]};{ADAPTER_VERSION};{TABLE_JOIN_VERSION}"
     )
     return bundle_from_native(
         document,

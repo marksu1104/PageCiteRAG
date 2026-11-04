@@ -61,7 +61,8 @@ class GenerationConfig(BaseModel):
     num_predict: int = Field(default=3072, ge=1, le=8192)
     template_reserve: int = Field(default=1024, ge=256, le=8192)
     keep_alive: str = Field(default="30m", pattern=r"^[1-9][0-9]*(s|m|h)$")
-    timeout_seconds: float = Field(default=600.0, gt=0, le=600, allow_inf_nan=False)
+    # Up to an hour so a CPU-only machine can finish; defaults stay at 600 s (GPU use).
+    timeout_seconds: float = Field(default=600.0, gt=0, le=3600, allow_inf_nan=False)
     num_thread: int = Field(default=6, ge=1, le=64)
     num_gpu: int = Field(default=0, ge=0, le=999)
 
@@ -218,6 +219,27 @@ class OutputValidationError(StructuredOutputError):
         # evaluation runner may store it in its configured run directory.
         self.raw_model_output = raw_model_output
         self.validation_errors = validation_errors
+
+
+# Chat-template turn markers such as "<|im_end|>" in document text could be read as real
+# turn boundaries. Only the model-bound copy is guarded: a WORD JOINER (U+2060) separates
+# the characters so they stay ordinary text. Stored sources and citations are unchanged,
+# and answers say when the evidence contained such markers.
+CHAT_DELIMITERS = ("<|", "|>")
+_WORD_JOINER = "\u2060"
+
+
+def guard_chat_delimiters(text: str) -> str:
+    return text.replace("<|", "<" + _WORD_JOINER + "|").replace("|>", "|" + _WORD_JOINER + ">")
+
+
+def unguard_chat_delimiters(text: str) -> str:
+    """Model output may copy the guarded markers; show them as the source wrote them."""
+    return text.replace("<" + _WORD_JOINER + "|", "<|").replace("|" + _WORD_JOINER + ">", "|>")
+
+
+def has_chat_delimiters(text: str) -> bool:
+    return any(marker in text for marker in CHAT_DELIMITERS)
 
 
 @dataclass(frozen=True)
@@ -392,9 +414,11 @@ class OllamaModelClient:
             raise ValueError("schema prompt inclusion must be boolean")
         messages = tuple(messages)
         # The server's chat template may read these as real turn markers, letting document
-        # text forge a turn; fail closed as the owned clients do, never rewrite the text.
-        if any("<|" in message.content or "|>" in message.content for message in messages):
-            raise ModelError("reserved chat-token delimiters in input; no silent text rewriting")
+        # text forge a turn; guard the model-bound copy as the owned clients do.
+        messages = tuple(
+            message.model_copy(update={"content": guard_chat_delimiters(message.content)})
+            for message in messages
+        )
         schema = response_model.model_json_schema()
         budget = check_budget(
             messages,

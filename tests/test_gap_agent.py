@@ -722,3 +722,17 @@ def test_without_an_outline_auto_answers_fixed_and_forced_reading_refuses(tmp_pa
     assert (answer.trace["route"], answer.trace["reason"]) == ("fixed", "no_outline")
     with pytest.raises(RetrievalError, match="section outline"):
         application.answer_question(workflow, question, language="en", route="whole-document")
+
+
+def test_answers_say_when_evidence_had_chat_markers_and_quote_the_original(tmp_path):
+    question = "How does the prompt template end a turn?"
+    workflow, _result, _blocks, hit = _markdown_reading(
+        tmp_path,
+        "# Paper\n\nThe template ends each turn with an <|im_end|> token.\n",
+        question,
+        "The template",
+    )
+    workflow._model = _ScriptedModel(workflow, [], next(iter(_spans((hit,)))))
+    answer = workflow.ask(question, language="en")
+    assert any("chat-template markers" in note for note in answer.limitations)
+    assert "<|im_end|>" in answer.answer_claims[0].citations[0].quote

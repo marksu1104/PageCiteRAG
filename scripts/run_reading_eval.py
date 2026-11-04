@@ -6261,11 +6261,6 @@ def _preflight_reading_plan(run_root: Path, static: dict, inputs: list[dict]) ->
 
     report = {}
     started = time.monotonic()
-    unsupported_documents = {
-        document_id
-        for document_id in {row["document_id"] for row in planned.values()}
-        if any("<|" in block.text or "|>" in block.text for block in store.get_blocks(document_id))
-    }
     with _generator_client(
         static, _llama_config(static), budget_policy="exact", recover_output_errors=False
     ) as model:
@@ -6282,11 +6277,6 @@ def _preflight_reading_plan(run_root: Path, static: dict, inputs: list[dict]) ->
             )
             for arm in static["run_selection"]["arms"]:
                 behavior = _behavior_arm(arm, plans[case_id])
-                if planned[case_id]["document_id"] in unsupported_documents:
-                    # The model client refuses chat-template delimiters in any input and
-                    # never rewrites source text; the whole case is unsupported in every arm.
-                    by_arm[arm] = {"status": "unsupported_input_reserved_chat_delimiters"}
-                    continue
                 if behavior != "fixed-rag" and planned[case_id]["status"] not in (
                     "complete",
                     "degraded",

@@ -508,6 +508,34 @@ def _run_model(args: argparse.Namespace) -> int:
 
 # Plan 5.13 validated the pinned GGUF on the owned Ollama server; it is the default.
 OWNED_BACKENDS = ("pinned-ollama", "llama")
+# One CLI request may run up to an hour on a CPU-only machine (whole-document reading
+# makes about 10-20 model calls); the default stays 600 s and the local API stays at 600 s.
+MAX_CLI_REQUEST_SECONDS = 3600
+_PROGRESS_LABELS = {
+    "ScopedReadingPlan": "planning the question",
+    "ReadingPlan": "planning the question",
+    "OutlineSelection": "choosing sections from the outline",
+    "SectionPoints": "reading sections and taking notes",
+    "FollowUpSelection": "checking what the notes refer back to",
+}
+
+
+class _ProgressModel:
+    """Forward to the model client and, on a terminal, say what each model call is for."""
+
+    def __init__(self, model, stream) -> None:
+        self._model = model
+        self._stream = stream
+        self._calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+    def generate(self, messages, response_model, *args, **kwargs):
+        self._calls += 1
+        label = _PROGRESS_LABELS.get(response_model.__name__, "writing the cited answer")
+        print(f"[{self._calls}] {label}...", file=self._stream, flush=True)
+        return self._model.generate(messages, response_model, *args, **kwargs)
 
 
 def _generation_options(parser: argparse.ArgumentParser) -> None:
@@ -543,8 +571,18 @@ def _generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--llm-host", default="http://127.0.0.1:11435")
     parser.add_argument("--context-window", type=_positive_integer, default=16384)
     parser.add_argument("--output-tokens", type=_positive_integer, default=1024)
-    parser.add_argument("--generation-timeout", type=float, default=600.0)
-    parser.add_argument("--request-timeout-seconds", type=float, default=600.0)
+    parser.add_argument(
+        "--generation-timeout",
+        type=float,
+        default=600.0,
+        help="Seconds per model call (default 600, at most 3600 for CPU-only machines).",
+    )
+    parser.add_argument(
+        "--request-timeout-seconds",
+        type=float,
+        default=600.0,
+        help="Seconds for the whole question (default 600, at most 3600 on the CLI).",
+    )
     parser.add_argument("--llm-threads", type=_positive_integer, default=2)
     parser.add_argument("--language", choices=("en", "zh-Hant", "auto"), default="zh-Hant")
     parser.add_argument("--format", choices=("text", "json"), default="text")
@@ -733,10 +771,11 @@ def _run_answer(args: argparse.Namespace) -> int:
     if (
         type(request_timeout) not in (int, float)
         or not math.isfinite(request_timeout)
-        or not 1 < request_timeout <= 600
+        or not 1 < request_timeout <= MAX_CLI_REQUEST_SECONDS
     ):
         print(
-            "page-cite-rag: request timeout must be greater than 1 and at most 600 seconds",
+            "page-cite-rag: request timeout must be greater than 1 and at most "
+            f"{MAX_CLI_REQUEST_SECONDS} seconds",
             file=sys.stderr,
         )
         return 1
@@ -926,11 +965,19 @@ def _run_answer(args: argparse.Namespace) -> int:
                 retriever = lexical if lexical is not None else dense
         if retrieval_owner[0] is None:
             retrieval_owner[0] = retriever
+        interactive = route != "fixed" and sys.stderr.isatty()
+        if interactive and args.device == "cpu" and args.backend in OWNED_BACKENDS:
+            print(
+                "page-cite-rag: the model runs on CPU; a question that needs the whole "
+                "document makes 10-20 model calls and can take tens of minutes. Use "
+                "--route fixed for one call, or a GPU with --device cuda --gpu-uuid.",
+                file=sys.stderr,
+            )
         workflow = document_workflow(
             store,
             args.document_id,
             retriever,
-            client,
+            _ProgressModel(client, sys.stderr) if interactive else client,
             config,
             top_k=workflow_config.top_k,
             neighbor_blocks=workflow_config.neighbor_blocks,

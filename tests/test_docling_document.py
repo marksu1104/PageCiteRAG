@@ -20,7 +20,7 @@ from page_cite_rag.store import SQLiteDocumentStore
 from page_cite_rag.workflows import AnswerWorkflow, read_verified_source
 
 
-def _bundle(*, search_text=None):
+def _bundle(*, search_text=None, normalization=None):
     document = {
         "texts": [
             {
@@ -74,6 +74,8 @@ def _bundle(*, search_text=None):
             "search_tokens": 16,
         }
     ]
+    if normalization is not None:
+        document["page_cite_rag_normalization"] = normalization
     return bundle_from_native(
         document,
         chunks,
@@ -82,6 +84,50 @@ def _bundle(*, search_text=None):
         page_count=2,
         parser_version="docling-2.137.0;core-2.101.1;hybrid-496;source-v1",
     )
+
+
+def test_table_line_breaks_join_only_when_the_document_uses_the_word():
+    from page_cite_rag.docling_document import join_table_line_breaks
+
+    def cell(text):
+        return SimpleNamespace(text=text)
+
+    cells = [
+        cell("tele- work arrangements"),
+        cell("non- executive members"),
+        cell("pinch- points and decom- missioning"),
+        cell("long- or short-term"),
+    ]
+    document = SimpleNamespace(
+        texts=[
+            SimpleNamespace(text="Telework grew, as non-executive members noted."),
+            SimpleNamespace(text="Long- or short-term decommissioning plans."),
+        ],
+        tables=[SimpleNamespace(data=SimpleNamespace(table_cells=cells))],
+    )
+    assert join_table_line_breaks(document) == 3
+    assert [c.text for c in cells] == [
+        "telework arrangements",
+        "non-executive members",
+        "pinch- points and decommissioning",  # "pinch points" is not used elsewhere
+        "long- or short-term",  # a real suspended hyphen is left alone
+    ]
+
+
+def test_table_join_count_is_kept_in_coverage_and_survives_reload(tmp_path):
+    record = {"version": "table-line-break-join/v1", "table_cell_line_break_joins": 4}
+    bundle = _bundle(normalization=record)
+    assert bundle.coverage["table_cell_line_break_joins"] == 4
+    assert "table_cell_line_break_joins" not in _bundle().coverage
+    store = SQLiteDocumentStore(tmp_path / "document.sqlite3")
+    store.ingest(
+        bundle.metadata,
+        bundle.units(),
+        block_factory=bundle.block_factory,
+        source_manifests=bundle.source_manifests(),
+    )
+    reopened = SQLiteDocumentStore(tmp_path / "document.sqlite3", read_only=True)
+    assert load_bundle(reopened, bundle.metadata.document_id).coverage == bundle.coverage
 
 
 def test_enumerated_source_keeps_legacy_and_new_versions_readable(tmp_path):

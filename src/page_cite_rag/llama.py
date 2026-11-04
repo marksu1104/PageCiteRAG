@@ -33,6 +33,7 @@ from page_cite_rag.generation import (
     StructuredOutputError,
     T,
     check_budget,
+    guard_chat_delimiters,
 )
 from page_cite_rag.gpu_processes import (
     GPU_DISPATCH_HEADROOM_C,
@@ -158,7 +159,8 @@ class LlamaConfig(BaseModel):
     num_predict: int = Field(default=1024, ge=1, le=8192)
     template_reserve: int = Field(default=1024, ge=256, le=4096)
     num_thread: int = Field(default=2, ge=1, le=6)
-    timeout_seconds: float = Field(default=600.0, gt=0, le=600, allow_inf_nan=False)
+    # Up to an hour so a CPU-only machine can finish; defaults stay at 600 s (GPU use).
+    timeout_seconds: float = Field(default=600.0, gt=0, le=3600, allow_inf_nan=False)
     startup_seconds: float = Field(default=60.0, gt=0, le=90, allow_inf_nan=False)
     max_gpu_memory_mib: int = Field(default=MAX_GPU_MEMORY_MIB, ge=1024, le=MAX_GPU_MEMORY_MIB)
     # Higher limits require explicit CUDA opt-in and verified driver thresholds.
@@ -195,8 +197,6 @@ def render_prompt(
     instruction into that turn rather than silently creating a second system
     turn. This is not a universal tool/multimodal/reasoning-history renderer.
     """
-    if any("<|" in message.content or "|>" in message.content for message in messages):
-        raise ModelError("reserved chat-token delimiters in input; no silent text rewriting")
     if any(message.role == "system" for message in messages[1:]):
         raise ModelError("system message must be first; no silent message reordering")
     if type(include_schema_in_prompt) is not bool:
@@ -206,11 +206,12 @@ def render_prompt(
         prompt = "<|im_start|>system\nReturn only JSON matching this schema:\n"
         prompt += json.dumps(schema, ensure_ascii=False)
         if messages and messages[0].role == "system":
-            prompt += "\n\n" + messages[0].content
+            prompt += "\n\n" + guard_chat_delimiters(messages[0].content)
             messages = messages[1:]
         prompt += "<|im_end|>\n"
     for message in messages:
-        prompt += f"<|im_start|>{message.role}\n{message.content}<|im_end|>\n"
+        content = guard_chat_delimiters(message.content)
+        prompt += f"<|im_start|>{message.role}\n{content}<|im_end|>\n"
     return prompt + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 
@@ -808,7 +809,11 @@ class LlamaModelClient:
         render_prompt(
             messages, schema, include_schema_in_prompt=include_schema_in_prompt
         )  # Validate the same text-only contract.
-        turns = [message.model_dump() for message in messages]
+        # The server applies the chat template, so guard the model-bound copy here too.
+        turns = [
+            {**message.model_dump(), "content": guard_chat_delimiters(message.content)}
+            for message in messages
+        ]
         if schema is not None and include_schema_in_prompt:
             instruction = "Return only JSON matching this schema:\n" + json.dumps(
                 schema, ensure_ascii=False

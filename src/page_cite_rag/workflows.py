@@ -27,6 +27,8 @@ from page_cite_rag.generation import (
     OutputFailureAccounting,
     PromptBudget,
     budget_for_model,
+    has_chat_delimiters,
+    unguard_chat_delimiters,
 )
 from page_cite_rag.hybrid import Retriever
 from page_cite_rag.models import Block, ParsedUnit, UnitSummary
@@ -115,6 +117,7 @@ def _traditional_chinese_converter() -> opencc.OpenCC:
 
 def _format_output_text(text: str, language: Language) -> str:
     """Normalize generated Chinese script while leaving source quotations untouched."""
+    text = unguard_chat_delimiters(text)
     if language == "zh-Hant":
         return _traditional_chinese_converter().convert(text)
     return text
@@ -821,6 +824,15 @@ class AnswerWorkflow:
             "prompt_version": self.prompt_version,
         }
         limitations = [PROVENANCE_LIMITATION_ZH if language == "zh-Hant" else PROVENANCE_LIMITATION]
+        if any(has_chat_delimiters(block.text) for block in selected):
+            limitations.append(
+                "部分原文含聊天模板符號（<| 或 |>）；送入模型前已插入隔字元，使模型將其視為一般"
+                "文字。引用仍逐字取自原文。"
+                if language == "zh-Hant"
+                else "Some source text contains chat-template markers (<| or |>); a word joiner "
+                "was inserted before generation so the model reads them as ordinary text. "
+                "Citations still quote the original exactly."
+            )
         if omitted:
             limitations.append(
                 (
