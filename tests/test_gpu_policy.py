@@ -390,3 +390,43 @@ def test_embedding_guard_still_stops_at_once_on_a_software_flag_above_80_c(monke
             temperature_limits={"max_operating_c": 93, "target_temperature_c": 84},
         )
     assert raised.value.category == "gpu_thermal_slowdown"
+
+
+def test_gpu_snapshot_allows_children_of_an_owned_server_only(monkeypatch):
+    from types import SimpleNamespace
+
+    from page_cite_rag import gpu_processes
+
+    server = SimpleNamespace(pid=1000, poll=lambda: None)
+    parents = {2000: 1000, 2100: 2000, 3000: 1}
+    monkeypatch.setattr(gpu_processes, "_parent_pid", lambda pid: parents.get(pid))
+    gpu_processes.register_owned_gpu_process(server)
+    try:
+        _sample, state = gpu_processes.snapshot_gpu_processes(
+            lambda: {"pids": [1000, 2000, 2100, 3000, 4000]}
+        )
+    finally:
+        gpu_processes.unregister_owned_gpu_process(server)
+    assert state["allowed_pids"] == [1000]
+    assert state["owned_descendant_pids"] == [2000, 2100]
+    assert state["unexpected_pids"] == [3000, 4000]
+
+
+@pytest.mark.parametrize(("refreshed", "unexpected"), [([1000], []), ([1000, 5000], [5000])])
+def test_gpu_snapshot_drops_a_vanished_pid_only_after_a_clean_recheck(
+    monkeypatch, refreshed, unexpected
+):
+    from types import SimpleNamespace
+
+    from page_cite_rag import gpu_processes
+
+    server = SimpleNamespace(pid=1000, poll=lambda: None)
+    monkeypatch.setattr(gpu_processes, "_parent_pid", lambda pid: None)
+    samples = iter(({"pids": [1000, 5000]}, {"pids": refreshed}))
+    gpu_processes.register_owned_gpu_process(server)
+    try:
+        _sample, state = gpu_processes.snapshot_gpu_processes(lambda: next(samples))
+    finally:
+        gpu_processes.unregister_owned_gpu_process(server)
+    assert state["unexpected_pids"] == unexpected
+    assert state["vanished_pids"] == ([5000] if not unexpected else [])

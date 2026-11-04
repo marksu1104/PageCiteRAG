@@ -2109,7 +2109,7 @@ def test_reading_planner_records_failures_and_never_retries_failed_cases(
 
 
 def test_same_pool_reranker_freezes_candidates_and_admits_exact_contexts(tmp_path, monkeypatch):
-    from page_cite_rag import hybrid, llama, reranker_server
+    from page_cite_rag import hybrid, reranker_server
 
     document_id = "a" * 64
     block = Block(
@@ -2193,7 +2193,7 @@ def test_same_pool_reranker_freezes_candidates_and_admits_exact_contexts(tmp_pat
             return {"guard_error": None}
 
     monkeypatch.setattr(reranker_server, "NativeRerankerServer", FakeRanker)
-    monkeypatch.setattr(llama, "LlamaModelClient", lambda *args, **kwargs: FakeModel())
+    monkeypatch.setattr(run_reading_eval, "LlamaModelClient", lambda *args, **kwargs: FakeModel())
     monkeypatch.setattr(run_reading_eval, "_llama_config", lambda *args, **kwargs: object())
     monkeypatch.setattr(
         run_reading_eval,

@@ -892,12 +892,14 @@ def static_configuration(
     generator_model_size: str = "9b",
     retrieval_grid: bool = False,
     shared_initial_reranker: bool = False,
+    generator_backend: str = "llama-cpp",
 ) -> dict:
     from page_cite_rag.embedding_native import GGUF_REVISION, GGUF_SHA256
     from page_cite_rag.full_answer import (
         PROMPT_VERSION,
         TASK_ALIGNED_PROMPT_VERSION,
     )
+    from page_cite_rag.ollama_backend import OLLAMA_VERSION, ollama_model_name
     from page_cite_rag.reranker_server import MAX_RERANK_DOCUMENTS_PER_REQUEST
     from page_cite_rag.reranker_server import MODEL_REVISION as RERANK_REVISION
     from page_cite_rag.reranker_server import MODEL_SHA256 as RERANK_SHA256
@@ -918,8 +920,12 @@ def static_configuration(
         raise ValueError("the official LongBench prompt protocol must run in its own frozen batch")
     if sampling_profile not in ("greedy", "qwen-general"):
         raise ValueError("unsupported sampling profile")
-    if generator_model_size not in ("9b", "4b"):
+    if generator_model_size not in ("9b", "4b", "27b"):
         raise ValueError("unsupported pinned generator model size")
+    if generator_backend not in ("llama-cpp", "ollama"):
+        raise ValueError("unsupported generator backend")
+    if is_longbench_official and generator_backend != "llama-cpp":
+        raise ValueError("the frozen LongBench official-adapter arm uses the llama.cpp server")
     if is_longbench_official and generator_model_size != "9b":
         raise ValueError("the frozen LongBench official-adapter arm uses the pinned 9B model")
     if (
@@ -1018,6 +1024,16 @@ def static_configuration(
                 "file": generator_spec["file"],
                 "sha256": generator_spec["sha256"],
                 "llama_commit": LLAMA_COMMIT,
+                # Recorded only for Ollama so earlier llama.cpp configurations keep their hash.
+                **(
+                    {
+                        "backend": "ollama",
+                        "ollama_version": OLLAMA_VERSION,
+                        "ollama_model": ollama_model_name(generator_model_size),
+                    }
+                    if generator_backend == "ollama"
+                    else {}
+                ),
             },
             "embedding": {
                 "name": "Qwen3-Embedding-0.6B-f16-GGUF",
@@ -2043,7 +2059,8 @@ def _run_reading_plans(run_root: Path, static: dict, inputs: list[dict]) -> dict
     terminal_error = None
     global_call_ledger, global_call_limit = _global_generation_budget(run_root, static)
     global_call_phase = _global_generation_phase(run_root, "plan")
-    with LlamaModelClient(
+    with _generator_client(
+        static,
         _llama_config(static, num_predict=static["reading_plan"]["num_predict"]),
         budget_policy="exact",
         recover_output_errors=True,
@@ -3483,7 +3500,8 @@ def _run_full_sentence_retrieval_grid(
 
         started = time.monotonic()
         call_count = input_tokens = output_tokens = 0
-        with LlamaModelClient(
+        with _generator_client(
+            static,
             _llama_config(static, num_predict=128),
             budget_policy="exact",
             recover_output_errors=False,
@@ -4134,7 +4152,8 @@ def _run_retrieval_grid(
 
         rewrite_started = time.monotonic()
         rewrite_input_tokens = rewrite_output_tokens = confirmed_calls = 0
-        with LlamaModelClient(
+        with _generator_client(
+            static,
             _llama_config(static, num_predict=128),
             budget_policy="exact",
             recover_output_errors=False,
@@ -5322,9 +5341,8 @@ def _rank_full_sentence_retrieval_grid(run_root: Path, static: dict, inputs: lis
     admission_base_wall = float(progress.get("admission_gpu_wall_seconds", 0))
     admission_gpu = None
     if missing_admissions:
-        from page_cite_rag.llama import LlamaModelClient
-
-        with LlamaModelClient(
+        with _generator_client(
+            static,
             _llama_config(static),
             budget_policy="exact",
             recover_output_errors=False,
@@ -6025,7 +6043,10 @@ def _llama_config(static: dict, *, num_predict: int = OUTPUT_TOKENS) -> LlamaCon
     bundle = (
         DEFAULT_BUNDLE
         if model_size == "9b"
-        else ROOT / "models" / "llama-qwen35-4b" / f"{LLAMA_COMMIT[:8]}-{spec['revision'][:8]}"
+        else ROOT
+        / "models"
+        / f"llama-qwen35-{model_size}"
+        / f"{LLAMA_COMMIT[:8]}-{spec['revision'][:8]}"
     )
     return LlamaConfig(
         bundle_dir=bundle,
@@ -6039,6 +6060,24 @@ def _llama_config(static: dict, *, num_predict: int = OUTPUT_TOKENS) -> LlamaCon
         max_gpu_memory_mib=MAX_GPU_MEMORY_MIB,
         max_gpu_temperature_c=GPU_TEMPERATURE_LIMIT_C,
     )
+
+
+def _generator_client(static: dict, config: LlamaConfig, **kwargs):
+    """The pinned generator on the backend frozen in the static configuration."""
+    if static.get("models", {}).get("generator", {}).get("backend") == "ollama":
+        from page_cite_rag.ollama_backend import (
+            DEFAULT_OLLAMA_MODELS,
+            DEFAULT_OLLAMA_RUNTIME,
+            OllamaGgufClient,
+        )
+
+        return OllamaGgufClient(
+            config,
+            runtime_dir=ROOT / DEFAULT_OLLAMA_RUNTIME,
+            models_dir=ROOT / DEFAULT_OLLAMA_MODELS,
+            **kwargs,
+        )
+    return LlamaModelClient(config, **kwargs)
 
 
 def _longbench_v2_admission(model, search: SearchResult, case: dict) -> dict:
@@ -6097,7 +6136,6 @@ def _longbench_v2_admission(model, search: SearchResult, case: dict) -> dict:
 
 
 def _preflight_longbench_official(run_root: Path, static: dict, inputs: list[dict]) -> dict:
-    from page_cite_rag.llama import LlamaModelClient
 
     if static["run_selection"]["arms"] != [LONG_BENCH_OFFICIAL_ARM]:
         raise ValueError("LongBench official-adapter preflight must be isolated")
@@ -6111,7 +6149,8 @@ def _preflight_longbench_official(run_root: Path, static: dict, inputs: list[dic
 
     report = {}
     started = time.monotonic()
-    with LlamaModelClient(
+    with _generator_client(
+        static,
         _llama_config(static, num_predict=128),
         budget_policy="exact",
         recover_output_errors=False,
@@ -6179,8 +6218,8 @@ def _preflight_reading_plan(run_root: Path, static: dict, inputs: list[dict]) ->
         for document_id in {row["document_id"] for row in planned.values()}
         if any("<|" in block.text or "|>" in block.text for block in store.get_blocks(document_id))
     }
-    with LlamaModelClient(
-        _llama_config(static), budget_policy="exact", recover_output_errors=False
+    with _generator_client(
+        static, _llama_config(static), budget_policy="exact", recover_output_errors=False
     ) as model:
         identity = model.identity
         for case in inputs:
@@ -6301,7 +6340,8 @@ def _preflight(run_root: Path, static: dict, inputs: list[dict]) -> dict:
 
     report = {}
     started = time.monotonic()
-    with LlamaModelClient(
+    with _generator_client(
+        static,
         _llama_config(static),
         budget_policy="exact",
         recover_output_errors=False,
@@ -6609,7 +6649,7 @@ def _preflight_reranked(run_root, static, inputs, store, retrieval):
 
     report = {}
     started = time.monotonic()
-    with LlamaModelClient(_llama_config(static), budget_policy="exact") as model:
+    with _generator_client(static, _llama_config(static), budget_policy="exact") as model:
         identity = model.identity
         for case in inputs:
             by_arm = {}
@@ -6757,7 +6797,8 @@ def _run_longbench_official_arm(
     started = time.monotonic()
     attempted = completed = 0
     stopped = None
-    with LlamaModelClient(
+    with _generator_client(
+        static,
         _llama_config(static, num_predict=128),
         budget_policy="exact",
         recover_output_errors=True,
@@ -7434,7 +7475,8 @@ def _run_arm(
     stopped = None
     global_call_ledger, global_call_limit = _global_generation_budget(run_root, static)
     global_call_phase = _global_generation_phase(run_root, "run")
-    with LlamaModelClient(
+    with _generator_client(
+        static,
         _llama_config(static),
         budget_policy="exact",
         recover_output_errors=False,
@@ -9217,9 +9259,15 @@ def main() -> int:
     )
     parser.add_argument(
         "--model-size",
-        choices=("9b", "4b"),
+        choices=("9b", "4b", "27b"),
         default="9b",
         help="select one locally pinned generator model; no fallback or download",
+    )
+    parser.add_argument(
+        "--generator-backend",
+        choices=("llama-cpp", "ollama"),
+        default="llama-cpp",
+        help="serve the pinned GGUF with the owned llama.cpp or Ollama server",
     )
     args = parser.parse_args()
     try:
@@ -9282,6 +9330,7 @@ def main() -> int:
             selected_case_ids,
             selected_arms,
             generator_model_size=args.model_size,
+            generator_backend=args.generator_backend,
             document_embedding_token_limit=args.document_embedding_token_limit,
             query_embedding_token_limit=args.query_embedding_token_limit,
             retrieval_grid=args.retrieval_grid,

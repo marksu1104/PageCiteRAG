@@ -221,6 +221,8 @@ class LlamaModelClient:
     automatic backend fallback. GPU observations are safeguards, NOT isolation.
     """
 
+    _budget_version = EXACT_BUDGET_VERSION
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -951,7 +953,7 @@ class LlamaModelClient:
                 upper,
                 self.config.num_predict,
                 self.config.num_ctx,
-                EXACT_BUDGET_VERSION,
+                self._budget_version,
                 len(tokens),
             )
         except ContextBudgetError:
@@ -1051,18 +1053,7 @@ class LlamaModelClient:
                 response = self._normalize_chat_response(chat, schema)
                 raw_model_output = chat["__verbose"]["content"]
             else:
-                response = self._request(
-                    "/completion",
-                    {
-                        "prompt": tokens,
-                        **({"json_schema": schema} if schema is not None else {}),
-                        "n_predict": self.config.num_predict,
-                        "stream": False,
-                        "cache_prompt": True,
-                        **sampling,
-                        "n_keep": -1,
-                    },
-                )
+                response = self._complete(prompt, tokens, schema, sampling)
                 raw_model_output = response.get("content")
             if response.get("truncated") is not False:
                 raise ContextBudgetError("server reported missing/true truncation status")
@@ -1172,6 +1163,27 @@ class LlamaModelClient:
             raise
         finally:
             self._generation_deadline = None
+
+    def _complete(
+        self, prompt: str, tokens: list[int], schema: dict | None, sampling: dict
+    ) -> dict:
+        """Send one rendered non-thinking prompt; return llama.cpp completion fields.
+
+        ``generate`` validates the returned fields, so another owned server only has to
+        report the same fields for the same tokens.
+        """
+        return self._request(
+            "/completion",
+            {
+                "prompt": tokens,
+                **({"json_schema": schema} if schema is not None else {}),
+                "n_predict": self.config.num_predict,
+                "stream": False,
+                "cache_prompt": True,
+                **sampling,
+                "n_keep": -1,
+            },
+        )
 
     def observations(self) -> dict:
         self._ensure_running()

@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Callable
 
 _lock = threading.RLock()
@@ -234,6 +235,7 @@ def snapshot_gpu_processes(
         exited_owned = set(registered) - live
         stale = sampled & exited_owned
         latest = sampled
+        rechecked = bool(stale)
         if stale:
             refreshed = snapshot()
             if not isinstance(refreshed, dict):
@@ -254,14 +256,51 @@ def snapshot_gpu_processes(
             expected_exited = expected_process.poll() is not None or (
                 current is not None and current is not expected_process
             )
-        unexpected = latest - live - stale
+        # A server such as Ollama runs inference in a child it starts itself.
+        descendants = {pid for pid in latest - live - stale if _descends_from(pid, live)}
+        unexpected = latest - live - stale - descendants
+        # A short-lived child (Ollama's GPU discovery) can exit between the driver sample
+        # and the /proc lookup. Recheck once: a PID still listed stays unexpected. After the
+        # stale-owner recheck above, ``latest`` already is that second sample.
+        vanished = set() if rechecked else {pid for pid in unexpected if _parent_pid(pid) is None}
+        if vanished:
+            refreshed = snapshot()
+            if not isinstance(refreshed, dict):
+                raise ValueError("GPU refresh snapshot must be an object")
+            still_listed = set(refreshed.get("pids", ()))
+            if any(type(pid) is not int or pid < 1 for pid in still_listed):
+                raise ValueError("GPU refresh snapshot contains an invalid PID")
+            vanished -= still_listed
+            unexpected -= vanished
         return value, {
             "sampled_pids": sorted(sampled),
             "allowed_pids": sorted(live),
+            "owned_descendant_pids": sorted(descendants),
+            "vanished_pids": sorted(vanished),
             "stale_owned_pids": sorted(stale),
             "unexpected_pids": sorted(unexpected),
             "owned_service_exited": expected_exited,
         }
+
+
+def _parent_pid(pid: int) -> int | None:
+    """Parent PID from ``/proc``; ``None`` when it cannot be read (treated as foreign)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat[stat.rindex(")") + 2 :].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _descends_from(pid: int, ancestors: set[int], *, max_depth: int = 16) -> bool:
+    current: int | None = pid
+    for _ in range(max_depth):
+        current = _parent_pid(current)
+        if current is None or current <= 1:
+            return False
+        if current in ancestors:
+            return True
+    return False
 
 
 def register_owned_gpu_process(process: subprocess.Popen) -> None:
