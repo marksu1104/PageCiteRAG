@@ -3106,3 +3106,40 @@ def test_cross_language_f1_uses_frozen_contract_even_if_answer_matches_gold(
     assert row["native_metric_eligible"] is expected
     assert row["answer_f1"] == (1.0 if expected else None)
     assert ("answer_f1" in dataset["metrics"]) is expected
+
+
+def test_routed_comparison_freezes_the_scoped_planner_and_routes_per_plan(tmp_path):
+    from page_cite_rag.reading_plan import ReadingPlan, ScopedReadingPlan
+
+    manifest = {"files": {"inputs.jsonl": {"sha256": "a" * 64}}, "cases": []}
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    routed = run_reading_eval.static_configuration(
+        tmp_path, manifest, selected_arms=list(run_reading_eval.ROUTED_ARMS)
+    )
+    outline = run_reading_eval.static_configuration(
+        tmp_path, manifest, selected_arms=list(run_reading_eval.AGENT_OUTLINE_ARMS)
+    )
+
+    assert routed["reading_plan"]["scope_routing"] is True
+    assert routed["reading_plan"]["schema_sha256"] == run_reading_eval.canonical_hash(
+        ScopedReadingPlan.model_json_schema()
+    )
+    # Earlier comparisons keep the unscoped planner and their configuration shape.
+    assert "scope_routing" not in outline["reading_plan"]
+    assert outline["reading_plan"]["schema_sha256"] == run_reading_eval.canonical_hash(
+        ReadingPlan.model_json_schema()
+    )
+    assert run_reading_eval._plan_model(routed) is ScopedReadingPlan
+    assert run_reading_eval._plan_model(outline) is ReadingPlan
+
+    def row(scope, status="complete"):
+        plan = {"requirements": [{"need": "n", "queries": ["q"]}], "scope": scope}
+        return {"status": status, "plan": plan}
+
+    behavior = run_reading_eval._behavior_arm
+    assert behavior("routed-reading", row("whole_document")) == "decomposition-outline-agent"
+    assert behavior("routed-reading", row("lookup")) == "fixed-rag"
+    # A failed planner never routes to section reading.
+    assert behavior("routed-reading", row("whole_document", "failed")) == "fixed-rag"
+    assert behavior("routed-reading", None) == "fixed-rag"
+    assert behavior("fixed-rag", row("whole_document")) == "fixed-rag"

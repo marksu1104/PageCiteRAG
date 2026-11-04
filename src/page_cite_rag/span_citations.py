@@ -198,7 +198,9 @@ def validate_span_claims(
     if not isinstance(draft, SpanAnswerDraft):
         raise CitationError("validated span answer draft required")
     try:
-        draft = SpanAnswerDraft.model_validate(draft.model_dump(warnings=False), strict=True)
+        # Revalidate with the draft's own (code-defined) bounds; this still rejects
+        # objects built with Pydantic's bypass constructor.
+        draft = type(draft).model_validate(draft.model_dump(warnings=False), strict=True)
         if any(not claim.text.strip() for claim in draft.claims):
             raise ValueError("blank claim")
     except (ValidationError, ValueError):

@@ -261,6 +261,7 @@ class AnswerResult(BaseModel):
         "complete-cited-answer-v10-source-backed-absence",
         "integrated-reading-agent/v1",
         "agentic-reading-v2",
+        "agentic-reading-v3",
         "source-backed-claims-v1",
     ] = PROMPT_VERSION
     budget: PromptBudget
@@ -291,7 +292,7 @@ class AnswerResult(BaseModel):
                     and self.budget.exact_input_tokens == self.agent_usage.final_input_tokens
                     and self.budget.output_reserved == self.agent_usage.final_output_limit
                 )
-            elif self.prompt_version == "agentic-reading-v2":
+            elif self.prompt_version in ("agentic-reading-v2", "agentic-reading-v3"):
                 valid_usage = (
                     self.generation_stats is not None
                     and self.budget.exact_input_tokens == self.agent_usage.final_input_tokens
@@ -304,7 +305,11 @@ class AnswerResult(BaseModel):
                 valid_usage = False
             if not valid_usage:
                 raise ValueError("agent usage must match the integrated-agent final-call budget")
-        elif self.prompt_version in ("integrated-reading-agent/v1", "agentic-reading-v2"):
+        elif self.prompt_version in (
+            "integrated-reading-agent/v1",
+            "agentic-reading-v2",
+            "agentic-reading-v3",
+        ):
             raise ValueError("integrated-agent results require their full agent usage ledger")
         if len(set(self.included_block_ids)) != len(self.included_block_ids):
             raise ValueError("included source block IDs must be unique")

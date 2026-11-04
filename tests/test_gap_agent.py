@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+from pydantic import ValidationError
 from tests.test_agent_workflow import _Retriever, _setup
 
 from page_cite_rag.agent import _spans
@@ -40,6 +42,8 @@ class _ScriptedModel:
         self.cite_source_id = cite_source_id
         self.gap_payloads: list[dict] = []
         self.writer_payloads: list[dict] = []
+        self.writer_systems: list[str] = []
+        self.writer_citations: list = []  # per writer call: source IDs or an exception
         self.evidence_limit: int | None = None
 
     def count_chat_input_tokens(self, payload):
@@ -66,7 +70,7 @@ class _ScriptedModel:
             "GapCheck",
             "FocusSelection",
             "OutlineSelection",
-            "SectionSources",
+            "SectionPoints",
             "FollowUpSelection",
         ):
             self.gap_payloads.append(payload)
@@ -76,13 +80,19 @@ class _ScriptedModel:
             value = response_model.model_validate(reply(payload) if callable(reply) else reply)
             return GenerationResult(value, _stats(), self._budget(), value.model_dump_json())
         self.writer_payloads.append(payload)
+        self.writer_systems.append(messages[0].content)
+        cited = self.writer_citations.pop(0) if self.writer_citations else [self.cite_source_id]
+        if isinstance(cited, Exception):
+            raise cited
+        claims = tuple(
+            {"text": f"ok {n}", "citations": ({"source_id": source_id},)}
+            for n, source_id in enumerate(cited)
+        )
         value = response_model.model_validate(
             {
                 "status": "answered",
-                "answer_claims": (
-                    {"text": "ok", "citations": ({"source_id": self.cite_source_id},)},
-                ),
-                "detail_claims": (),
+                "answer_claims": claims[:3],
+                "detail_claims": claims[3:],
                 "limitations": (),
             }
         )
@@ -304,22 +314,22 @@ def test_outline_reading_hands_writer_the_sources_marked_in_chosen_sections(tmp_
 
     def read(payload):
         assert payload["chosen_sections"] == ["Results"]
+        assert payload["notes_language"] == "English"
         source = next(
             item["source_id"]
             for part in payload["sections"]
             for item in part["sources"]
             if "Result paragraph" in item["text"]
         )
-        return {"source_ids": [source, source]}
+        return {"points": [{"point": "The result.", "source_ids": [source, source]}]}
 
     def follow_up(payload):
-        assert [(p["section"], p["text"].strip()) for p in payload["marked_passages"]] == [
-            ("Results", "Result paragraph.")
-        ]
+        assert payload["points"] == [{"section": "Results", "point": "The result."}]
         assert "Results" not in [e["title"] for e in payload["unread_outline"]]
         return {"section_ids": []}
 
-    model = _ScriptedModel(workflow, [choose, read, follow_up], target_source)
+    # The initial evidence sits in another section, which is read as a retrieval seed.
+    model = _ScriptedModel(workflow, [choose, read, {"points": []}, follow_up], target_source)
     workflow._model = model
     answer = ask_with_agent(
         workflow,
@@ -333,13 +343,25 @@ def test_outline_reading_hands_writer_the_sources_marked_in_chosen_sections(tmp_
     trace = answer.trace["agent"]
     assert trace["strategy"] == "outline"
     read_event = next(e for e in trace["tool_trace"] if e.get("mode") == "section")
-    assert read_event["sources_marked"] == 1
-    evidence_ids = [item["source_id"] for item in model.writer_payloads[0]["evidence"]]
-    assert target_source in evidence_ids
+    assert read_event["sources_marked"] == 1 and read_event["points"] == 1
+    writer = model.writer_payloads[0]
+    assert target_source in [item["source_id"] for item in writer["evidence"]]
+    # The note travels as an unverified checklist entry next to its original.
+    assert writer["navigation_handoff"]["reading_report"]["requirements"] == [
+        {"need": "Results", "observation": "The result.", "source_ids": [target_source]}
+    ]
+    assert "reading note" in model.writer_systems[0]
     assert blocks[1].block_id not in trace["initial_answer_block_ids"]
     assert trace["follow_up_section_ids"] == []
-    # select + one section read + follow-up check + writer
-    assert answer.result.agent_usage.model_calls == 4
+    assert trace["point_coverage"]["uncovered"] == 0
+    assert answer.result.prompt_version == "agentic-reading-v3"
+    assert [e["chosen_by"] for e in trace["tool_trace"] if e.get("mode") == "section"] == [
+        "model_section_selection",
+        "retrieval_seed",
+    ]
+    assert len(trace["seed_section_ids"]) == 1
+    # select + chosen read + seed read + follow-up check + writer
+    assert answer.result.agent_usage.model_calls == 5
 
 
 def _markdown_reading(tmp_path, text: str, question: str, hit_prefix: str):
@@ -375,12 +397,12 @@ def _markdown_reading(tmp_path, text: str, question: str, hit_prefix: str):
 
 
 def _mark(prefix: str):
-    """Scripted reader that marks the sources whose text starts with ``prefix``."""
+    """Scripted reader with one point per source whose text starts with ``prefix``."""
 
     def read(payload):
         return {
-            "source_ids": [
-                item["source_id"]
+            "points": [
+                {"point": item["text"][:40], "source_ids": [item["source_id"]]}
                 for part in payload["sections"]
                 for item in part["sources"]
                 if item["text"].startswith(prefix)
@@ -448,7 +470,9 @@ def test_long_outline_is_judged_in_parts_and_small_sections_share_one_read(tmp_p
         return _mark("Text of part 51")(payload)
 
     model = _ScriptedModel(
-        workflow, [choose, choose, read, {"section_ids": []}], next(iter(_spans((late,))))
+        workflow,
+        [choose, choose, read, {"points": []}, {"section_ids": []}],
+        next(iter(_spans((late,)))),
     )
     workflow._model = model
     answer = _ask(workflow, question, result, first)
@@ -462,7 +486,10 @@ def test_long_outline_is_judged_in_parts_and_small_sections_share_one_read(tmp_p
     assert trace["outline_pages"] == 2
     assert len(trace["selected_section_ids"]) == 2
     reads = [e for e in trace["tool_trace"] if e.get("mode") == "section"]
-    assert [len(e["section_ids"]) for e in reads] == [2]
+    assert [(e["chosen_by"], len(e["section_ids"])) for e in reads] == [
+        ("model_section_selection", 2),
+        ("retrieval_seed", 1),
+    ]
     assert late.block_id in trace["initial_answer_block_ids"]
     assert first.block_id not in trace["initial_answer_block_ids"]
 
@@ -481,7 +508,7 @@ def test_outline_reading_follows_up_where_a_marked_passage_points_back(tmp_path)
 
     def follow_up(payload):
         assert payload["sections_read"] == ["Discussion"]
-        assert payload["marked_passages"][0]["text"].startswith("As defined earlier")
+        assert payload["points"][0]["point"].startswith("As defined earlier")
         return _section_ids(payload, "Definitions")
 
     def read_back(payload):
@@ -537,3 +564,85 @@ def test_outline_reading_keeps_one_source_per_section_before_seconds_when_writer
     )
     assert len(model.writer_payloads[0]["evidence"]) == 3
     assert answer.result.status == "answered"
+
+
+def _two_part_reading(tmp_path):
+    question = "List the finding of every part."
+    text = "# Report\n\nIntro.\n\n" + "".join(f"## Part {n}\n\nFinding {n}.\n\n" for n in (1, 2))
+    workflow, result, blocks, first = _markdown_reading(tmp_path, text, question, "Finding 1")
+    second = next(block for block in blocks if block.text.startswith("Finding 2"))
+    ids = [next(iter(_spans((block,)))) for block in (first, second)]
+    replies = [lambda p: _section_ids(p, "Part 1", "Part 2"), _mark("Finding"), {}]
+    return workflow, question, result, first, ids, replies
+
+
+def test_scoped_plan_adds_the_routing_field_only_when_asked():
+    from page_cite_rag.reading_plan import (
+        SCOPE_INSTRUCTION,
+        ReadingPlan,
+        ScopedReadingPlan,
+        reading_plan_messages,
+    )
+
+    plain = reading_plan_messages("Q?", source_language="en", output_language="en")
+    scoped = reading_plan_messages(
+        "Q?", source_language="en", output_language="en", with_scope=True
+    )
+    assert SCOPE_INSTRUCTION not in plain[0].content
+    assert scoped[0].content.endswith(SCOPE_INSTRUCTION)
+    assert "scope" not in ReadingPlan.model_json_schema()["properties"]
+    plan = ScopedReadingPlan.model_validate_json(
+        json.dumps({"requirements": [{"need": "n", "queries": ["q"]}], "scope": "whole_document"})
+    )
+    assert plan.scope == "whole_document"
+    assert ScopedReadingPlan.model_json_schema()["required"] == ["requirements", "scope"]
+
+
+def test_general_answers_allow_more_detail_claims_than_benchmark_formats():
+    from page_cite_rag.full_answer import (
+        MAX_GENERAL_DETAIL_CLAIMS,
+        FullAnswerDraft,
+        ShortBenchmarkAnswerDraft,
+    )
+
+    assert MAX_GENERAL_DETAIL_CLAIMS == 15
+    assert ShortBenchmarkAnswerDraft.model_fields["detail_claims"].metadata[-1].max_length == 9
+
+    def draft(details: int) -> dict:
+        claim = {"text": "item", "citations": [{"source_id": "S1"}]}
+        return {
+            "status": "answered",
+            "answer_claims": [claim] * 3,
+            "detail_claims": [claim] * details,
+            "limitations": [],
+        }
+
+    # The whole contract, not only the field limit, must accept 3 + 15 claims.
+    assert len(FullAnswerDraft.model_validate_json(json.dumps(draft(15))).detail_claims) == 15
+    with pytest.raises(ValidationError):
+        FullAnswerDraft.model_validate_json(json.dumps(draft(16)))
+
+
+def test_a_full_list_of_eighteen_claims_passes_writer_and_citation_checks(tmp_path):
+    workflow, question, result, first, (s1, s2), replies = _two_part_reading(tmp_path)
+    model = _ScriptedModel(workflow, replies, s1)
+    model.writer_citations = [[s1, s2] * 9]
+    workflow._model = model
+    answer = _ask(workflow, question, result, first)
+
+    assert answer.result.status == "answered"
+    assert (len(answer.result.answer_claims), len(answer.result.detail_claims)) == (3, 15)
+
+
+def test_notes_the_answer_leaves_uncited_are_recorded_without_another_call(tmp_path):
+    workflow, question, result, first, (s1, _s2), replies = _two_part_reading(tmp_path)
+    model = _ScriptedModel(workflow, replies, s1)
+    workflow._model = model
+    answer = _ask(workflow, question, result, first)
+
+    coverage = answer.trace["agent"]["point_coverage"]
+    assert (coverage["points"], coverage["uncovered"]) == (2, 1)
+    assert coverage["uncovered_point_indices"] == [1]
+    assert len(model.writer_payloads) == 1
+    # select + one packed read + follow-up check + writer
+    assert answer.result.agent_usage.model_calls == 4

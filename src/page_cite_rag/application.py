@@ -188,9 +188,14 @@ def plan_document_question(
     *,
     language: Language,
     source_language: str,
+    scoped: bool = False,
 ):
-    """Create the same answer-free ReadingPlan used by the quality evaluator."""
-    from page_cite_rag.reading_plan import ReadingPlan, reading_plan_messages
+    """Create the same answer-free ReadingPlan used by the quality evaluator.
+
+    ``scoped`` also asks whether the question needs the whole document (``ScopedReadingPlan``),
+    which routes it to section reading instead of the fixed retrieval path.
+    """
+    from page_cite_rag.reading_plan import ReadingPlan, ScopedReadingPlan, reading_plan_messages
 
     outline = workflow.source_outline()
     titles = tuple(
@@ -203,11 +208,12 @@ def plan_document_question(
         ),
         output_language=language,
         outline_titles=titles,
+        with_scope=scoped,
     )
     model = workflow._model
     if model is None:
         raise ValueError("a model is required to create a reading plan")
-    generated = model.generate(messages, ReadingPlan)
+    generated = model.generate(messages, ScopedReadingPlan if scoped else ReadingPlan)
     return generated.value
 
 
@@ -958,9 +964,12 @@ def ask_with_agent(
         if on_model_call is not None:
             on_model_call(dict(writer_call))
 
+    # Outline reading hands over section notes; the writer sees them as an unverified
+    # checklist next to the originals they cite.
+    writer_workflow = workflow.with_reader_observations(True) if strategy == "outline" else workflow
     try:
         if writer_blocks:
-            result = workflow.answer_from_agent_context(
+            result = writer_workflow.answer_from_agent_context(
                 question,
                 writer_blocks,
                 navigation_handoff=handoff,
@@ -1009,6 +1018,15 @@ def ask_with_agent(
             failure_trace["writer_failure_accounting"] = accounting.model_dump(mode="json")
         raise AgentRunFailure(type(exc).__name__, failure_trace) from exc
 
+    # Plan 5.13: a code check of which reading notes reached the answer. Recorded only; a
+    # one-shot rewrite by the same 9B writer did not raise coverage in development.
+    points = reading.trace.get("reading_points") or ()
+    coverage = (
+        _point_coverage(result, points)
+        if strategy == "outline" and writer_call["status"] == "completed" and points
+        else None
+    )
+
     if writer_call["status"] == "completed":
         usage = AgentUsage(
             model_calls=ledger.model_calls,
@@ -1022,7 +1040,12 @@ def ask_with_agent(
             final_output_limit=writer_call["output_token_limit"],
         )
         result = result.model_copy(
-            update={"agent_usage": usage, "prompt_version": "agentic-reading-v2"}
+            update={
+                "agent_usage": usage,
+                "prompt_version": (
+                    "agentic-reading-v3" if strategy == "outline" else "agentic-reading-v2"
+                ),
+            }
         )
 
     agent_trace = dict(reading.trace)
@@ -1042,6 +1065,7 @@ def ask_with_agent(
             "agent_output_tokens_reserved": ledger.output_tokens + ledger.output_reserved_tokens,
             "agent_output_tokens_unobserved_reserved": ledger.output_reserved_tokens,
             "writer_call": writer_call,
+            "point_coverage": coverage,
             "writer_source_block_ids": [block.block_id for block in writer_blocks],
             "writer_context_group_ids": [group.chunk_index for group in writer_context_groups],
             "navigation_handoff": handoff,
@@ -1060,6 +1084,26 @@ def ask_with_agent(
             "agent": agent_trace,
         },
     )
+
+
+def _cited_block_ids(result: AnswerResult) -> set[str]:
+    return {citation.block_id for claim in result.claims for citation in claim.citations}
+
+
+def _point_coverage(result: AnswerResult, points) -> dict:
+    """Which reading notes the answer cites at least one source of (code check, no model)."""
+    cited = _cited_block_ids(result)
+    uncovered = [
+        index
+        for index, point in enumerate(points)
+        if point["block_ids"] and not cited.intersection(point["block_ids"])
+    ]
+    return {
+        "version": "reading-point-coverage/v2",
+        "points": len(points),
+        "uncovered": len(uncovered),
+        "uncovered_point_indices": uncovered,
+    }
 
 
 def explain_source(

@@ -55,6 +55,7 @@ from page_cite_rag.reading_plan import (
     MAX_QUERIES_PER_REQUIREMENT,
     MAX_READING_REQUIREMENTS,
     ReadingPlan,
+    ScopedReadingPlan,
     reading_plan_messages,
 )
 from page_cite_rag.retrieval import (
@@ -106,7 +107,10 @@ AGENT_FOCUS_ARMS = (
 )
 # Agent-specific structured whole-document tasks against both fixed controls.
 AGENT_OUTLINE_ARMS = ("fixed-rag", "decomposition-fixed-rag", "decomposition-outline-agent")
-READING_PLAN_ARM_SETS = (QUALITY_V1_ARMS, AGENT_FOCUS_ARMS, AGENT_OUTLINE_ARMS)
+# Plan 5.13: fixed RAG against the routed product path. The scoped planner sends
+# whole-document questions to section reading and every other question to the fixed path.
+ROUTED_ARMS = ("fixed-rag", "routed-reading")
+READING_PLAN_ARM_SETS = (QUALITY_V1_ARMS, AGENT_FOCUS_ARMS, AGENT_OUTLINE_ARMS, ROUTED_ARMS)
 READING_PLAN_CASE_CEILING = 160
 REVIEW_ARMS = {
     "repair-once": "once",
@@ -124,6 +128,7 @@ ARMS = (
     "decomposition-agent",
     "decomposition-focus-agent",
     "decomposition-outline-agent",
+    "routed-reading",
     *PROMPT_COMPARISON_ARMS,
     "fixed-rag-reranked",
     *REVIEW_ARMS,
@@ -144,6 +149,9 @@ ARM_ARCHITECTURES = {
     ),
     "decomposition-outline-agent": (
         "question_plan_then_outline_section_reading_with_verified_quotes_and_shared_writer"
+    ),
+    "routed-reading": (
+        "scoped_question_plan_then_fixed_rag_or_section_notes_and_shared_writer_with_note_coverage"
     ),
     "single-agent-no-tools": "single_agent_structured_answer_over_frozen_initial_evidence",
     "delegated-agent": "legacy_bounded_navigation_then_separate_writer",
@@ -247,6 +255,26 @@ def _is_agent_arm(arm: str) -> bool:
         "reading-agent",
         "delegated-reading-agent",
     )
+
+
+def _routed_to_reading(plan_row: dict | None) -> bool:
+    """Plan 5.13 route: section reading only for a complete whole-document plan."""
+    return (
+        isinstance(plan_row, dict)
+        and plan_row.get("status") == "complete"
+        and plan_row["plan"].get("scope") == "whole_document"
+    )
+
+
+def _behavior_arm(arm: str, plan_row: dict | None) -> str:
+    """The arm whose behavior a case follows; the routed arm takes the route's behavior."""
+    if arm != "routed-reading":
+        return arm
+    return "decomposition-outline-agent" if _routed_to_reading(plan_row) else "fixed-rag"
+
+
+def _plan_model(static: dict):
+    return ScopedReadingPlan if static["reading_plan"].get("scope_routing") else ReadingPlan
 
 
 def _agent_uses_live_retrieval(arm: str) -> bool:
@@ -948,8 +976,10 @@ def static_configuration(
         "decomposition-agent": None,
         "decomposition-focus-agent": None,
         "decomposition-outline-agent": None,
+        "routed-reading": None,
     }
     reading_plan_comparison = tuple(arms) in READING_PLAN_ARM_SETS
+    scope_routing = tuple(arms) == ROUTED_ARMS
     if shared_initial_reranker and not reading_plan_comparison:
         raise ValueError("shared initial reranking is reserved for the four reading-plan arms")
     selected_workflow_arms = {arm for arm in arms if arm in workflow_call_limits}
@@ -999,7 +1029,11 @@ def static_configuration(
             {
                 "protocol": "question-needs-and-bilingual-query-plan/v2",
                 "prompt_revision": "neutral-needs-source-language-query/v1",
-                "schema_sha256": canonical_hash(ReadingPlan.model_json_schema()),
+                "schema_sha256": canonical_hash(
+                    (ScopedReadingPlan if scope_routing else ReadingPlan).model_json_schema()
+                ),
+                # Recorded only for the routed comparison so earlier configurations keep hashes.
+                **({"scope_routing": True} if scope_routing else {}),
                 "num_predict": 1024,
                 "max_requirements": MAX_READING_REQUIREMENTS,
                 "max_queries_per_requirement": MAX_QUERIES_PER_REQUIREMENT,
@@ -1253,6 +1287,18 @@ def static_configuration(
                     "final_output_tokens_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
                     "case_deadline_seconds": MAX_CASE_WALL_SECONDS,
                     "budget_scope": "navigation_and_shared_writer; one shared planner call",
+                },
+                "routed-reading": {
+                    "route": "scoped planner: whole_document -> section notes, else fixed-rag",
+                    "model_call_limit_per_case": None,
+                    "common_writer_calls_per_case": 1,
+                    "note_coverage": "recorded code check of notes whose sources go uncited",
+                    "planner_is_shared_and_reported_separately": True,
+                    "call_input_tokens_max": MAX_INTEGRATED_AGENT_CALL_INPUT_TOKENS,
+                    "call_output_tokens_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
+                    "final_input_tokens_max": AGENT_FINAL_INPUT_LIMIT,
+                    "final_output_tokens_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
+                    "case_deadline_seconds": MAX_CASE_WALL_SECONDS,
                 },
                 "single-agent-no-tools": {
                     "model_calls_per_case_max": 1,
@@ -1936,7 +1982,7 @@ def _load_reading_plans(run_root: Path, static: dict, inputs: list[dict]) -> dic
         raise ValueError("reading-plan artifacts differ from the frozen comparison")
     for row in rows.values():
         if row.get("status") == "complete":
-            ReadingPlan.model_validate_json(
+            _plan_model(static).model_validate_json(
                 json.dumps(row["plan"], ensure_ascii=False), strict=True
             )
         elif row.get("status") == "degraded" and row.get("plan") is None:
@@ -2110,6 +2156,7 @@ def _run_reading_plans(run_root: Path, static: dict, inputs: list[dict]) -> dict
                 source_language=source_language,
                 output_language=case["language"],
                 outline_titles=titles,
+                with_scope=static["reading_plan"].get("scope_routing", False),
             )
             marker = {
                 "case_id": case_id,
@@ -2129,13 +2176,14 @@ def _run_reading_plans(run_root: Path, static: dict, inputs: list[dict]) -> dict
             )
             attempt_started = time.monotonic()
             try:
-                result = counted_model.generate(messages, ReadingPlan)
+                plan_model = _plan_model(static)
+                result = counted_model.generate(messages, plan_model)
                 record = {
                     "case_id": case_id,
                     "status": "complete",
                     "plan": result.value.model_dump(mode="json"),
                     "prompt_sha256": marker["prompt_sha256"],
-                    "response_schema_sha256": canonical_hash(ReadingPlan.model_json_schema()),
+                    "response_schema_sha256": canonical_hash(plan_model.model_json_schema()),
                     "generator_identity": generator_identity,
                     "generation_stats": result.stats.model_dump(mode="json"),
                     "raw_model_output": result.raw_model_output,
@@ -2265,7 +2313,7 @@ def _run_planned_retrieval(run_root: Path, static: dict, inputs: list[dict]) -> 
                 "planner_degraded": True,
             }
             continue
-        plan = ReadingPlan.model_validate_json(
+        plan = _plan_model(static).model_validate_json(
             json.dumps(plan_row["plan"], ensure_ascii=False), strict=True
         )
         queries, query_need_ids = planned_query_routes(case["question"], plan)
@@ -2436,7 +2484,7 @@ def _run_planned_retrieval(run_root: Path, static: dict, inputs: list[dict]) -> 
                     candidate, query_results, shared_search_trace = search_planned_hybrid(
                         retriever,
                         case["question"].strip(),
-                        ReadingPlan.model_validate_json(
+                        _plan_model(static).model_validate_json(
                             json.dumps(plans[case_id]["plan"], ensure_ascii=False), strict=True
                         ),
                         candidates_per_query=(
@@ -6226,31 +6274,32 @@ def _preflight_reading_plan(run_root: Path, static: dict, inputs: list[dict]) ->
             case_id = case["case_id"]
             by_arm = {}
             plan = (
-                ReadingPlan.model_validate_json(
+                _plan_model(static).model_validate_json(
                     json.dumps(plans[case_id]["plan"], ensure_ascii=False), strict=True
                 )
                 if plans[case_id]["status"] == "complete"
                 else None
             )
             for arm in static["run_selection"]["arms"]:
+                behavior = _behavior_arm(arm, plans[case_id])
                 if planned[case_id]["document_id"] in unsupported_documents:
                     # The model client refuses chat-template delimiters in any input and
                     # never rewrites source text; the whole case is unsupported in every arm.
                     by_arm[arm] = {"status": "unsupported_input_reserved_chat_delimiters"}
                     continue
-                if arm != "fixed-rag" and planned[case_id]["status"] not in (
+                if behavior != "fixed-rag" and planned[case_id]["status"] not in (
                     "complete",
                     "degraded",
                 ):
                     by_arm[arm] = {"status": "planned_retrieval_failed"}
                     continue
                 row = planned[case_id]
-                pool_name = "original_query" if arm == "fixed-rag" else "decomposed"
+                pool_name = "original_query" if behavior == "fixed-rag" else "decomposed"
                 result_value = (
                     shared_reranks[f"{case_id}::{pool_name}"]["result"]
                     if shared_reranks is not None
                     else row["original_query_result"]
-                    if arm == "fixed-rag"
+                    if behavior == "fixed-rag"
                     else row["result"]
                 )
                 search = _search_result_from_json(result_value)
@@ -6264,7 +6313,7 @@ def _preflight_reading_plan(run_root: Path, static: dict, inputs: list[dict]) ->
                     top_k=top_k,
                     answer_format=_answer_format_for(case),
                 )
-                if arm != "fixed-rag" and plan is not None:
+                if behavior != "fixed-rag" and plan is not None:
                     workflow = workflow.with_reading_plan(plan)
                 blocks = workflow._context_blocks(
                     search, workflow._read_hits(search, case["question"])
@@ -6285,8 +6334,9 @@ def _preflight_reading_plan(run_root: Path, static: dict, inputs: list[dict]) ->
                 by_arm[arm] = {
                     "status": "ready",
                     "reading_plan_status": (
-                        plans[case_id]["status"] if arm != "fixed-rag" else "not_used"
+                        plans[case_id]["status"] if behavior != "fixed-rag" else "not_used"
                     ),
+                    **({"route": behavior} if arm == "routed-reading" else {}),
                     "document_id": row["document_id"],
                     "retrieved_block_ids": [hit.block.block_id for hit in search.hits],
                     "admitted_block_ids": [block.block_id for block in admitted],
@@ -7383,6 +7433,7 @@ def _remaining_quality_writer_reservation(
                 "decomposition-agent": 2,
                 "decomposition-focus-agent": 2,
                 "decomposition-outline-agent": 2,
+                "routed-reading": 2,
             }[arm]
     return total
 
@@ -7496,6 +7547,10 @@ def _run_arm(
             if target.exists():
                 continue
             preflight_case = _preflight_for_arm(preflight, case["case_id"], arm, prompt_revision)
+            # Files and records stay under ``arm``; ``behavior`` decides what runs.
+            behavior = _behavior_arm(
+                arm, plan_rows[case["case_id"]] if plan_rows is not None else None
+            )
             if static.get("reading_plan") is not None and preflight_case.get("status") != "ready":
                 atomic_json_once(
                     target,
@@ -7537,10 +7592,10 @@ def _run_arm(
                 # Gap navigation calls go through this wrapper, so each protects its own writer.
                 current_case_remaining = int(
                     (
-                        arm == "fixed-rag-followup-once"
+                        behavior == "fixed-rag-followup-once"
                         and counted_model.generate_calls == counted_model._case_start_calls
                     )
-                    or arm
+                    or behavior
                     in (
                         "decomposition-agent",
                         "decomposition-focus-agent",
@@ -7559,11 +7614,11 @@ def _run_arm(
             counted_model.begin_case(
                 structured_call_limit=(
                     1
-                    if arm in ("fixed-rag", "decomposition-fixed-rag")
+                    if behavior in ("fixed-rag", "decomposition-fixed-rag")
                     else 2
-                    if arm == "fixed-rag-followup-once"
+                    if behavior == "fixed-rag-followup-once"
                     else 4
-                    if arm in REVIEW_ARMS
+                    if behavior in REVIEW_ARMS
                     else None
                 ),
                 required_remaining_calls=remaining_quality_writer_calls,
@@ -7576,7 +7631,7 @@ def _run_arm(
             base_row = retrieval[case["case_id"]]
             plan = None
             reading_plan_status = "not_used"
-            if static.get("reading_plan") is not None and arm == "fixed-rag":
+            if static.get("reading_plan") is not None and behavior == "fixed-rag":
                 retrieved_row = planned_rows[case["case_id"]]
                 row = {
                     **base_row,
@@ -7590,7 +7645,7 @@ def _run_arm(
                         "original_query_candidate_passage_ids", []
                     ),
                 }
-            elif static.get("reading_plan") is not None and arm != "fixed-rag":
+            elif static.get("reading_plan") is not None and behavior != "fixed-rag":
                 plan_row = plan_rows[case["case_id"]]
                 retrieved_row = planned_rows[case["case_id"]]
                 # A failed planner is answered from the original-query fallback, without a plan.
@@ -7607,7 +7662,7 @@ def _run_arm(
                     raise ValueError("preflight admitted a failed reading plan or retrieval")
                 reading_plan_status = plan_row["status"]
                 if plan_row["status"] == "complete":
-                    plan = ReadingPlan.model_validate_json(
+                    plan = _plan_model(static).model_validate_json(
                         json.dumps(plan_row["plan"], ensure_ascii=False), strict=True
                     )
                 row = {
@@ -7623,7 +7678,7 @@ def _run_arm(
                     shared_reranker=static.get("retrieval", {}).get("reranker", False),
                 )
             if planned_reranks is not None:
-                pool_name = "original_query" if arm == "fixed-rag" else "decomposed"
+                pool_name = "original_query" if behavior == "fixed-rag" else "decomposed"
                 ranked = planned_reranks[f"{case['case_id']}::{pool_name}"]
                 row = {
                     **row,
@@ -7643,7 +7698,7 @@ def _run_arm(
                 _context_group_limit(static) if static.get("reading_plan") is not None else TOP_K
             )
             retriever = FrozenSearchRetriever(search, top_k=workflow_top_k)
-            if _agent_uses_live_retrieval(arm) or arm in REVIEW_ARMS:
+            if _agent_uses_live_retrieval(behavior) or behavior in REVIEW_ARMS:
                 reranker_model_path = None
                 if static.get("retrieval", {}).get("reranker", False):
                     from page_cite_rag.reranker_server import DEFAULT_MODEL_PATH
@@ -7660,7 +7715,7 @@ def _run_arm(
                     reranker_model_path=reranker_model_path,
                     candidates=(
                         static["reading_plan"]["retrieval_candidates_per_branch"]
-                        if static.get("reading_plan") is not None and arm != "fixed-rag"
+                        if static.get("reading_plan") is not None and behavior != "fixed-rag"
                         else None
                     ),
                 )
@@ -7858,7 +7913,7 @@ def _run_arm(
                 try:
                     if deadline_expired.is_set():
                         raise TimeoutError("case deadline expired before generation")
-                    if arm in REVIEW_ARMS:
+                    if behavior in REVIEW_ARMS:
                         review_search = search.model_copy(
                             update={"context_groups": context.context_groups}
                         )
@@ -7886,14 +7941,14 @@ def _run_arm(
                         result = reviewed.result
                         reading_trace = reviewed.trace
                     else:
-                        if not _is_agent_arm(arm):
+                        if not _is_agent_arm(behavior):
                             result = workflow.answer_from_context(
                                 case["question"],
                                 context.blocks,
                                 language=case["language"],
                                 context_groups=context.context_groups,
                             )
-                            if arm == "fixed-rag-followup-once":
+                            if behavior == "fixed-rag-followup-once":
                                 first_answer_result = result
                                 followup_trace = {
                                     "protocol": "fixed-rag-followup-once/v1",
@@ -7987,7 +8042,7 @@ def _run_arm(
                         else:
                             retrieval_session = (
                                 retriever.session()
-                                if _agent_uses_live_retrieval(arm)
+                                if _agent_uses_live_retrieval(behavior)
                                 and getattr(retriever, "reranker_model_path", None) is None
                                 else nullcontext()
                             )
@@ -7998,14 +8053,16 @@ def _run_arm(
                                     language=case["language"],
                                     initial_search=search,
                                     initial_blocks=blocks,
-                                    delegated=arm == "delegated-agent",
-                                    data_tools_enabled=arm != "single-agent-no-tools",
+                                    delegated=behavior == "delegated-agent",
+                                    data_tools_enabled=behavior != "single-agent-no-tools",
                                     strategy={
                                         "decomposition-agent": "gap",
                                         "decomposition-focus-agent": "focus",
                                         "decomposition-outline-agent": "outline",
-                                    }.get(arm, "react"),
-                                    max_model_calls=1 if arm == "single-agent-no-tools" else None,
+                                    }.get(behavior, "react"),
+                                    max_model_calls=(
+                                        1 if behavior == "single-agent-no-tools" else None
+                                    ),
                                     on_model_call=record_agent_model_call,
                                     on_wire_request=(
                                         capture_agent_wire_request
@@ -8033,7 +8090,7 @@ def _run_arm(
                     final_attempted = counted_model.generate_calls > final_calls_before
                     if isinstance(exc, ReviewRunFailure):
                         reading_trace = exc.trace
-                    if arm == "fixed-rag-followup-once" and first_answer_result is not None:
+                    if behavior == "fixed-rag-followup-once" and first_answer_result is not None:
                         result = first_answer_result
                         followup_trace = followup_trace or {
                             "protocol": "fixed-rag-followup-once/v1",
@@ -8088,7 +8145,7 @@ def _run_arm(
 
             if deadline_expired.is_set():
                 keep_initial_followup_answer = (
-                    arm == "fixed-rag-followup-once"
+                    behavior == "fixed-rag-followup-once"
                     and first_answer_result is not None
                     and result is not None
                     and followup_trace is not None
@@ -8191,6 +8248,7 @@ def _run_arm(
                 "dataset": case["dataset"],
                 "answer_format": _answer_format_for(case),
                 "reading_plan_status": reading_plan_status,
+                **({"route": behavior} if arm == "routed-reading" else {}),
                 "reading_plan_degraded_reason": (
                     plan_rows[case["case_id"]].get("degraded_reason")
                     if reading_plan_status == "degraded"

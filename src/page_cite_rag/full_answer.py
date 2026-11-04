@@ -55,6 +55,18 @@ from page_cite_rag.workflows import (
 )
 
 PROMPT_VERSION = "complete-cited-answer-v10-source-backed-absence"
+# General answers list one item per claim; 3 + 9 claims cut off whole-document lists (plan
+# 5.13 development: inventory answers filled all 12 with reading notes left). Benchmark
+# short-answer and multiple-choice contracts keep 9 detail claims.
+MAX_GENERAL_DETAIL_CLAIMS = 15
+
+
+class _VerifiedAnswerSpanDraft(SpanAnswerDraft):
+    """Citation-verification container for every answer and detail claim of one answer."""
+
+    claims: tuple[SpanClaimDraft, ...] = Field(default=(), max_length=3 + MAX_GENERAL_DETAIL_CLAIMS)
+
+
 TASK_ALIGNED_PROMPT_VERSION = "complete-cited-answer-v5-task-aligned"
 EVIDENCE_SELECTION_PROMPT_VERSION = "evidence-selection/v1"
 _SYSTEM_TEMPLATE = (
@@ -168,6 +180,15 @@ _HANDOFF_INSTRUCTIONS = (
     "and relationships, preserving conditions and attribution. Distinguish this study from "
     "related work. State remaining gaps."
 )
+_NOTES_INSTRUCTIONS = (
+    " Each handoff requirement here is a reading note: a short restatement of what its "
+    "listed sources say about one part of the task, grouped by section title. Notes are "
+    "unverified. Use them as a checklist: turn every note that answers the question into a "
+    "cited claim checked against the original text, citing that note's sources; notes about "
+    "the same item may share one claim. Correct or drop a note the original does not support. "
+    "Content found in the sources belongs in claims, never in limitations; use limitations "
+    "only for what the supplied sources do not answer."
+)
 _READING_EXAMPLES = (
     "Worked examples below use fictional documents. They illustrate faithful "
     "explanation, not facts or sources for the actual question.\nExample 1. Source: "
@@ -263,7 +284,9 @@ class FullAnswerDraft(_StatusDiscriminatedDraft):
 
     status: Literal["answered", "partial", "insufficient_evidence"]
     answer_claims: tuple[FullClaimDraft, ...] = Field(default=(), max_length=3)
-    detail_claims: tuple[FullClaimDraft, ...] = Field(default=(), max_length=9)
+    detail_claims: tuple[FullClaimDraft, ...] = Field(
+        default=(), max_length=MAX_GENERAL_DETAIL_CLAIMS
+    )
     limitations: tuple[LimitationText, ...] = Field(default=(), max_length=8)
 
     @field_validator("limitations")
@@ -276,8 +299,8 @@ class FullAnswerDraft(_StatusDiscriminatedDraft):
     @model_validator(mode="after")
     def validate_answer_contract(self) -> FullAnswerDraft:
         total = len(self.answer_claims) + len(self.detail_claims)
-        if total > 12:
-            raise ValueError("answer and detail claims are limited to 12 claims")
+        if total > 3 + MAX_GENERAL_DETAIL_CLAIMS:
+            raise ValueError("answer and detail claims exceed the general answer limit")
         if self.status in ("answered", "partial") and not self.answer_claims:
             raise ValueError("answered output requires a direct answer")
         if self.status == "partial" and not self.limitations:
@@ -588,13 +611,19 @@ class FullAnswerWorkflow(AnswerWorkflow):
             "ProvidedAnsweredFullAnswerDraft",
             __base__=AnsweredFullAnswerDraft,
             answer_claims=(tuple[answer_claim, ...], Field(min_length=1, max_length=3)),
-            detail_claims=(tuple[detail_claim, ...], Field(default=(), max_length=9)),
+            detail_claims=(
+                tuple[detail_claim, ...],
+                Field(default=(), max_length=MAX_GENERAL_DETAIL_CLAIMS),
+            ),
         )
         partial = create_model(
             "ProvidedPartialFullAnswerDraft",
             __base__=PartialFullAnswerDraft,
             answer_claims=(tuple[answer_claim, ...], Field(min_length=1, max_length=3)),
-            detail_claims=(tuple[detail_claim, ...], Field(default=(), max_length=9)),
+            detail_claims=(
+                tuple[detail_claim, ...],
+                Field(default=(), max_length=MAX_GENERAL_DETAIL_CLAIMS),
+            ),
             limitations=(tuple[LimitationText, ...], Field(min_length=1, max_length=8)),
         )
         insufficient = create_model(
@@ -607,7 +636,10 @@ class FullAnswerWorkflow(AnswerWorkflow):
             "ProvidedFullAnswerDraft",
             __base__=FullAnswerDraft,
             answer_claims=(tuple[answer_claim, ...], Field(default=(), max_length=3)),
-            detail_claims=(tuple[detail_claim, ...], Field(default=(), max_length=9)),
+            detail_claims=(
+                tuple[detail_claim, ...],
+                Field(default=(), max_length=MAX_GENERAL_DETAIL_CLAIMS),
+            ),
         )
         response.__schema_variants__ = (answered, partial, insufficient)
         return response
@@ -1054,6 +1086,8 @@ class FullAnswerWorkflow(AnswerWorkflow):
             )
         if self._navigation_handoff is not None:
             system_content += _HANDOFF_INSTRUCTIONS
+            if self._reader_observations:
+                system_content += _NOTES_INSTRUCTIONS
         if self._reading_plan is not None:
             system_content += (
                 " The reading plan is an unverified checklist derived from the question, not "
@@ -1565,7 +1599,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
                 for claim in draft.detail_claims
             )
             claims = answer_claims + detail_claims
-            mapped = SpanAnswerDraft(
+            mapped = _VerifiedAnswerSpanDraft(
                 status="answered" if claims else "insufficient_evidence",
                 claims=claims,
                 limitations=draft.limitations,
