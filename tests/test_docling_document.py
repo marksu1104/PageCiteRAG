@@ -114,6 +114,25 @@ def test_table_line_breaks_join_only_when_the_document_uses_the_word():
     ]
 
 
+def test_cjk_line_wrap_spaces_are_removed_but_other_spaces_stay():
+    from page_cite_rag.docling_document import join_cjk_line_breaks
+
+    item = SimpleNamespace(text="社會的失 溫與淡漠，重新打開長 者閱讀", orig=None)
+    listed = SimpleNamespace(text="南投 縣立圖書館", orig="㈠ 南投 縣立圖書館")
+    mixed = SimpleNamespace(text="使用 BM25 與 dense 檢索 in English text", orig=None)
+    cell = SimpleNamespace(text="閱讀體 驗路徑")
+    document = SimpleNamespace(
+        texts=[item, listed, mixed],
+        tables=[SimpleNamespace(data=SimpleNamespace(table_cells=[cell]))],
+    )
+    assert join_cjk_line_breaks(document) == 4
+    assert item.text == "社會的失溫與淡漠，重新打開長者閱讀"
+    assert (listed.text, listed.orig) == ("南投縣立圖書館", "㈠南投縣立圖書館")
+    # A space next to Latin letters or digits is real and kept.
+    assert mixed.text == "使用 BM25 與 dense 檢索 in English text"
+    assert cell.text == "閱讀體驗路徑"
+
+
 def test_table_join_count_is_kept_in_coverage_and_survives_reload(tmp_path):
     record = {"version": "table-line-break-join/v1", "table_cell_line_break_joins": 4}
     bundle = _bundle(normalization=record)
@@ -296,12 +315,16 @@ def test_chunk_index_reloads_without_reembedding_documents(tmp_path):
     payload = json.loads(messages[1].content)
     assert len(selected) == 3
     context_group = payload["context_groups"][0]
-    assert context_group["text"] == result.context_groups[0].text
+    # The chunk's own text only repeated its sources; the group keeps its heading path.
+    assert "text" not in context_group
+    assert context_group.get("headings", []) == bundle.chunks[0]["chunk"]["meta"].get(
+        "headings", []
+    )
     sources = {source["source_id"]: source for source in context_group["sources"]}
     assert set(sources) == {"S1", "S2", "S3"}
     assert sources["S2"]["text"] == "The increase is 42% only under condition A."
     assert "evidence" not in payload
-    assert messages[1].content.count("The increase is 42% only under condition A.") == 2
+    assert messages[1].content.count("The increase is 42% only under condition A.") == 1
     assert "42%" in sources["S3"]["text"]
     assert sources["S3"]["native_ref"] == "#/tables/0"
     assert sources["S3"]["table_scope"] == "whole_table"

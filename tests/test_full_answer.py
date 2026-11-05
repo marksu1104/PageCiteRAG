@@ -720,7 +720,29 @@ def test_docling_context_presents_each_exact_source_text_next_to_its_id(tmp_path
     assert first["source_id"] == "S1" and first["text"] == blocks[0].text
     assert first["table_row"] == [0, 1] and first["table_column"] == [0, 1]
     serialized = json.dumps(payload, ensure_ascii=False)
-    assert serialized.count(blocks[0].text.rstrip("\n")) == 2
+    assert serialized.count(blocks[0].text.rstrip("\n")) == 1
+    assert all("text" not in group for group in payload["context_groups"])
+
+    # A long source split across chunks is sent once; later chunks point to it.
+    shared = tuple(
+        SearchContextGroup(
+            chunk_index=index,
+            text=blocks[0].text,
+            source_refs=("#/texts/0",),
+            source_block_ids=(blocks[0].block_id,),
+        )
+        for index in range(3)
+    )
+    payload = json.loads(
+        workflow._messages_with_context_groups(
+            "What does the paper say?", "en", "local", blocks[:1], None, shared
+        )[1].content
+    )
+    assert [group["sources"] for group in payload["context_groups"][1:]] == [
+        [{"source_id": "S1", "text_in": "C1"}],
+        [{"source_id": "S1", "text_in": "C1"}],
+    ]
+    assert json.dumps(payload, ensure_ascii=False).count(blocks[0].text.rstrip("\n")) == 1
 
 
 def test_evidence_first_fails_closed_on_an_unknown_source_id(tmp_path):

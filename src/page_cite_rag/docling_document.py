@@ -69,6 +69,40 @@ def join_table_line_breaks(document) -> int:
     return joins
 
 
+# PDF text extraction joins wrapped lines with a space, which in Chinese or Japanese text
+# splits a word ("失 溫"); those scripts put no spaces between characters, so a single space
+# between two such characters is removed from saved text and search chunks alike.
+CJK_JOIN_VERSION = "cjk-line-break-join/v1"
+_CJK = (
+    "\u2e80-\u2fff\u3000-\u303f\u3040-\u30ff\u3100-\u312f\u3200-\u32ff\u3400-\u4dbf"
+    "\u4e00-\u9fff\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef"
+)
+_CJK_LINE_BREAK = re.compile(f"(?<=[{_CJK}]) (?=[{_CJK}])")
+
+
+def join_cjk_line_breaks(document) -> int:
+    """Remove line-wrap spaces between two CJK characters; returns the number removed."""
+    joins = 0
+
+    def join(text: str) -> str:
+        nonlocal joins
+        joined, count = _CJK_LINE_BREAK.subn("", text)
+        joins += count
+        return joined
+
+    for item in document.texts:
+        if item.text:
+            item.text = join(item.text)
+        # The original keeps any list marker; it must still end with the saved text.
+        if getattr(item, "orig", None):
+            item.orig = _CJK_LINE_BREAK.sub("", item.orig)
+    for table in document.tables:
+        for cell in table.data.table_cells:
+            if cell.text:
+                cell.text = join(cell.text)
+    return joins
+
+
 _SOURCE_VERSION = "docling-native-document/v2"
 DEFAULT_ARTIFACTS = Path("models/docling-pinned")
 _MODEL_HASHES = {
@@ -307,7 +341,11 @@ def bundle_from_native(
             else "legacy-collection-order-fallback"
         ),
         **(
-            {"table_cell_line_break_joins": normalization["table_cell_line_break_joins"]}
+            {
+                key: normalization[key]
+                for key in ("table_cell_line_break_joins", "cjk_line_break_joins")
+                if key in normalization
+            }
             if isinstance(normalization := document.get(NORMALIZATION_KEY), dict)
             else {}
         ),
@@ -604,6 +642,7 @@ def convert_pdf(
         raise DoclingDocumentError("Docling could not completely parse this PDF")
     # Before chunking, so search chunks and stored table blocks carry the same text.
     table_joins = join_table_line_breaks(result.document)
+    cjk_joins = join_cjk_line_breaks(result.document)
     page_count = len(result.document.pages)
     if page_count < 1 or _sha256_file(path) != source_sha256:
         raise DoclingDocumentError("PDF changed during conversion or has no pages")
@@ -628,15 +667,17 @@ def convert_pdf(
         )
     document = result.document.export_to_dict()
     document[NORMALIZATION_KEY] = {
-        "version": TABLE_JOIN_VERSION,
+        "version": f"{TABLE_JOIN_VERSION};{CJK_JOIN_VERSION}",
         "table_cell_line_break_joins": table_joins,
+        "cjk_line_break_joins": cjk_joins,
     }
     _recover_omitted_items(document, chunks, page_count=page_count, tokenizer=tokenizer)
     if not chunks:
         raise DoclingDocumentError("Docling found no readable chunks")
     parser_version = (
         f"docling-{versions['docling']};core-{versions['docling-core']};"
-        f"hybrid-496;tok-{tokenizer_sha256[:16]};{ADAPTER_VERSION};{TABLE_JOIN_VERSION}"
+        f"hybrid-496;tok-{tokenizer_sha256[:16]};{ADAPTER_VERSION};{TABLE_JOIN_VERSION};"
+        f"{CJK_JOIN_VERSION}"
     )
     return bundle_from_native(
         document,

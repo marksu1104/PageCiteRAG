@@ -903,6 +903,7 @@ def static_configuration(
 ) -> dict:
     from page_cite_rag.embedding_native import GGUF_REVISION, GGUF_SHA256
     from page_cite_rag.full_answer import (
+        CONTEXT_GROUP_PAYLOAD_VERSION,
         PROMPT_VERSION,
         TASK_ALIGNED_PROMPT_VERSION,
     )
@@ -1112,6 +1113,7 @@ def static_configuration(
         },
         "answer": {
             "default_contract": PROMPT_VERSION,
+            "context_group_payload": CONTEXT_GROUP_PAYLOAD_VERSION,
             "prompt_revisions_by_arm": {arm: _prompt_revision_for_arm(arm) for arm in arms},
             "contracts_by_arm": {
                 arm: (
