@@ -126,28 +126,7 @@ class FakeClient:
                 check_budget(messages, None, self.config),
             )
         payload = json.loads(messages[1].content)
-        from page_cite_rag.review import SourceReview
-
-        if issubclass(schema_class, SourceReview):
-            already_reviewed = sum(issubclass(schema, SourceReview) for _, schema in self.calls) > 1
-            value = schema_class.model_validate_json(
-                json.dumps(
-                    {
-                        "verdict": "supported" if already_reviewed else "needs_revision",
-                        "needs_reading": not already_reviewed,
-                        "issues": []
-                        if already_reviewed
-                        else [
-                            {
-                                "kind": "missing_evidence",
-                                "description": "Read the eligibility conditions.",
-                                "source_block_ids": [],
-                            }
-                        ],
-                    }
-                )
-            )
-        elif self.insufficient:
+        if self.insufficient:
             value = schema_class.model_validate_json(
                 json.dumps({"status": "insufficient_evidence", "limitations": ["Not stated."]})
             )

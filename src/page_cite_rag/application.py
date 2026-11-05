@@ -409,6 +409,14 @@ def answer_question(
         trace.update(route="fixed", reason="planner_failed", planner_error=type(error).__name__)
         return AgentAnswer(result, trace)
     trace["plan"] = plan.model_dump(mode="json")
+    from page_cite_rag.reading_plan import is_foreign_language_query
+
+    trace["dropped_foreign_queries"] = [
+        query
+        for need in plan.requirements
+        for query in need.queries
+        if is_foreign_language_query(query, question)
+    ]
     if route == "auto" and plan.scope == "lookup":
         result = ask_document(workflow, question, language=language)
         trace.update(route="fixed", reason="planner_scope_lookup")
@@ -450,244 +458,23 @@ def answer_question(
     return AgentAnswer(reading.result, trace)
 
 
-_FATAL_AGENT_TOOL_STATUSES = {
-    "scope_unavailable",
-    "invalid_source_or_cursor",
-    "invalid_source_ids",
-    "source_unavailable",
-    "outside_source_scope",
-    "outside_reader_scope",
-    "invalid_terminal_state",
-}
-
-
-def _recoverable_navigation_failure(error: Exception) -> bool:
-    """Recover only a malformed report or context exhaustion from verified originals."""
-    from page_cite_rag.agent import AgentRunFailure
-
-    if not isinstance(error, AgentRunFailure) or error.error_type not in {
-        "InvalidAgentTerminalState",
-        "InvalidStructuredAnswerSchema",
-        "AgentBudgetExceeded",
-    }:
-        return False
-    trace = error.trace
-    terminal = trace.get("navigator_terminal_state")
-    stop_reason = trace.get("budget_stop_reason")
-    recoverable_context_stop = stop_reason in {
-        "bootstrap_input_limit",
-        "context_limit",
-        "per_call_input_limit",
-        "writer_reserve_deadline",
-    }
-    # ToolStrategy rejects malformed report arguments before executing tools.
-    # Discard that one report; pending data tools or invalid calls remain fatal.
-    invalid_report_only = (
-        isinstance(terminal, dict)
-        and error.error_type == "InvalidStructuredAnswerSchema"
-        and terminal.get("pending_tool_call_count") == 1
-        and terminal.get("pending_structured_tool_call_count") == 1
-        and terminal.get("pending_data_tool_call_count") == 0
-        and terminal.get("terminal_tool_call_count") == 1
-        and terminal.get("terminal_invalid_tool_call_count") == 0
-        and terminal.get("finish_reason") in {"tool_calls", "function_call"}
-    )
-    if (
-        not isinstance(terminal, dict)
-        or terminal.get("cancelled_or_timed_out") is not False
-        or (terminal.get("pending_tool_call_count") != 0 and not invalid_report_only)
-        or terminal.get("terminal_invalid_tool_call_count", 0) != 0
-        or trace.get("cooldown_error_type") is not None
-    ):
-        return False
-    if error.error_type == "AgentBudgetExceeded":
-        if not recoverable_context_stop or terminal.get("status") != "budget_stopped":
-            return False
-    elif stop_reason is not None:
-        return False
-    if error.error_type == "InvalidAgentTerminalState":
-        if terminal.get("reason") != "missing_structured_response":
-            return False
-        if terminal.get("finish_reason") not in {"length", "stop"}:
-            return False
-        if terminal.get("terminal_tool_call_count") != 0:
-            return False
-    elif (
-        error.error_type == "InvalidStructuredAnswerSchema"
-        and terminal.get("status") != "invalid_structured_answer"
-    ):
-        return False
-    events = trace.get("tool_trace")
-    if not isinstance(events, list) or any(
-        not isinstance(event, dict) or event.get("status") in _FATAL_AGENT_TOOL_STATUSES
-        for event in events
-    ):
-        return False
-    calls = trace.get("model_call_records")
-    if not isinstance(calls, list) or not calls:
-        return False
-    if stop_reason == "writer_reserve_deadline":
-        if not isinstance(calls[-1], dict) or calls[-1].get("status") != "blocked_before_dispatch":
-            return False
-        completed_calls = calls[:-1]
-    else:
-        completed_calls = calls
-    return all(
-        isinstance(call, dict)
-        and call.get("status") == "completed"
-        and type(call.get("input_tokens_exact")) is int
-        and type(call.get("output_tokens_observed")) is int
-        for call in completed_calls
-    )
-
-
-def _recover_original_context(
-    workflow: FullAnswerWorkflow,
-    question: str,
-    search: SearchResult,
-    initial_blocks: Sequence[Block],
-    error: Exception,
-):
-    """Rebuild only program-verified initial/read originals after a recoverable report failure."""
-    from page_cite_rag.agent import AgentContext, AgentRun, ReadingReport
-
-    if not _recoverable_navigation_failure(error):
-        raise error
-    trace = dict(error.trace)
-    initial_ids = trace.get("initial_answer_block_ids")
-    if (
-        not isinstance(initial_ids, list)
-        or not initial_ids
-        or any(not isinstance(block_id, str) for block_id in initial_ids)
-    ):
-        raise error
-    initial_by_id = {block.block_id: block for block in initial_blocks}
-    if len(initial_by_id) != len(initial_blocks) or not set(initial_ids).issubset(initial_by_id):
-        raise error
-
-    read_ids = []
-    returned_group_ids: list[int] = []
-    for event in trace["tool_trace"]:
-        if event.get("tool") != "read_source" or event.get("status") not in {"ok", "partial"}:
-            continue
-        returned = event.get("returned_block_ids")
-        if not isinstance(returned, list) or any(not isinstance(item, str) for item in returned):
-            raise error
-        read_ids.extend(returned)
-        group_ids = event.get("returned_context_group_ids", [])
-        if not isinstance(group_ids, list) or any(type(item) is not int for item in group_ids):
-            raise error
-        returned_group_ids.extend(group_ids)
-    read_ids = list(dict.fromkeys(read_ids))
-    selected_group_ids = trace.get("selected_context_group_ids", [])
-    if not isinstance(selected_group_ids, list) or any(
-        type(item) is not int for item in selected_group_ids
-    ):
-        raise error
-    initial_id_set = set(initial_ids)
-    groups = {
-        group.chunk_index: group
-        for group in search.context_groups
-        if group.chunk_index in selected_group_ids
-        and set(group.source_block_ids).issubset(initial_id_set)
-    }
-    native_source = getattr(workflow, "_native_source", None)
-    group_block_ids: set[str] = set()
-    if returned_group_ids and native_source is None:
-        raise error
-    if native_source is not None:
-        for group_id in set(returned_group_ids):
-            if not 0 <= group_id < len(native_source.chunk_block_ids):
-                raise error
-            from page_cite_rag.retrieval import SearchContextGroup
-
-            group = SearchContextGroup(
-                chunk_index=group_id,
-                text=native_source.contextualized_chunk_text(group_id),
-                source_refs=native_source.context_refs_for_chunk(group_id),
-                source_block_ids=native_source.context_block_ids_for_chunk(group_id),
-            )
-            groups[group_id] = group
-            group_block_ids.update(group.source_block_ids)
-    eligible_read_ids = list(dict.fromkeys([*read_ids, *sorted(group_block_ids)]))
-    try:
-        read_blocks = tuple(
-            workflow._read_block(block_id)
-            for block_id in eligible_read_ids
-            if block_id not in initial_by_id
-        )
-    except Exception:
-        raise error from None
-    expected_read_ids = [value for value in eligible_read_ids if value not in initial_by_id]
-    if any(
-        block.block_id != block_id
-        for block, block_id in zip(read_blocks, expected_read_ids, strict=True)
-    ):
-        raise error
-    verified_groups = tuple(groups[index] for index in sorted(groups))
-    for group in verified_groups:
-        try:
-            workflow._validate_context_group(group)
-        except Exception:
-            raise error from None
-
-    original_blocks_list = []
-    seen_block_ids = set()
-    for block in [initial_by_id[block_id] for block_id in initial_ids] + list(read_blocks):
-        if block.block_id not in seen_block_ids:
-            original_blocks_list.append(block)
-            seen_block_ids.add(block.block_id)
-    original_blocks = tuple(original_blocks_list)
-    available_ids = {block.block_id for block in original_blocks}
-    if any(not set(group.source_block_ids).issubset(available_ids) for group in verified_groups):
-        raise error
-    trace.update(
-        navigation_degraded=True,
-        navigation_recovery="verified_originals_after_incomplete_structured_report",
-        navigation_failure_type=error.error_type,
-        navigation_report_partial=True,
-        navigation_handoff_note=None,
-        navigation_handoff_note_status="recovered_without_structured_report",
-    )
-    # Degradation is recorded in the trace; the writer is not told the whole question is open.
-    report = ReadingReport(requirements=[], unresolved=[])
-    return AgentRun(
-        context=AgentContext(
-            tuple(initial_by_id[block_id] for block_id in initial_ids),
-            tuple(
-                group
-                for group in verified_groups
-                if set(group.source_block_ids).issubset(initial_id_set)
-            ),
-            trace.get("final_answer_input_tokens"),
-        ),
-        trace=trace,
-        structured_response=report,
-        acquired_context=AgentContext(original_blocks, verified_groups, None),
-    )
-
-
 def ask_with_agent(
     workflow: FullAnswerWorkflow,
     question: str,
     *,
     language: Language = "zh-Hant",
-    delegated: bool = False,
-    data_tools_enabled: bool = True,
     max_model_calls: int | None = None,
     initial_search: SearchResult | None = None,
     initial_blocks: Sequence[Block] | None = None,
     on_model_call: Callable[[dict], bool | None] | None = None,
-    on_wire_request: Callable[[dict], None] | None = None,
-    strategy: Literal["gap", "focus", "outline", "react"] = "react",
+    strategy: Literal["gap", "focus", "outline"] = "outline",
 ) -> AgentAnswer:
-    """Navigate with one request-scoped agent, then use the shared cited-answer writer.
+    """Read with one program-driven reader, then use the shared cited-answer writer.
 
-    ``gap`` asks the model only which question parts are missing and lets the program
-    search and read; ``focus`` narrows the writer to the few sources that state each
-    need; ``outline`` reads the sections chosen from the document outline, follows up once
-    on what they refer back to and hands the writer only the sources the reader marked;
-    ``react`` is the tool-calling loop.
+    ``outline`` (the product path) reads the sections chosen from the document outline and
+    notes, per window, what the task asks for; ``gap`` asks only which question parts are
+    missing and lets the program search and read; ``focus`` narrows the writer to the few
+    sources that state each need. One budget ledger covers reading and the writer.
     """
     from page_cite_rag.agent import (
         AGENT_WRITER_RESERVE_SECONDS,
@@ -697,9 +484,8 @@ def ask_with_agent(
         _AgentBudgetLedger,
         _AgentBudgetStop,
         _spans,
-        local_chat_model,
-        run_bounded_reading_agent,
     )
+    from page_cite_rag.gap_agent import run_focus_reading, run_gap_reading, run_outline_reading
 
     if (initial_search is None) != (initial_blocks is None):
         raise ValueError("initial search and source blocks must be supplied together")
@@ -725,79 +511,26 @@ def ask_with_agent(
         wait_for_headroom = getattr(model, "wait_for_gpu_headroom", None)
         return wait_for_headroom() if callable(wait_for_headroom) else 0.0
 
-    # Keep old isolated diagnostics available; the normal single-agent path uses
-    # one ledger for navigation and the common writer.
-    legacy_integrated = not delegated and not data_tools_enabled
     output_limit = min(MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS, workflow._budget_config.num_predict)
-    ledger = None
-    navigation_calls = max_model_calls
-    if not delegated and not legacy_integrated:
-        if navigation_calls is not None and (
-            type(navigation_calls) is not int or navigation_calls < 1
-        ):
-            raise ValueError("an optional single-agent model-call limit must be positive")
-        ledger = _AgentBudgetLedger(
-            model_call_limit=navigation_calls + 1 if navigation_calls is not None else None,
-            call_input_limit=MAX_INTEGRATED_AGENT_CALL_INPUT_TOKENS,
-            total_input_limit=None,
-            call_output_limit=output_limit,
-            total_output_limit=None,
-            tool_call_limit=None,
-        )
-    if strategy not in ("gap", "focus", "outline", "react"):
+    if max_model_calls is not None and (type(max_model_calls) is not int or max_model_calls < 1):
+        raise ValueError("an optional reading model-call limit must be positive")
+    ledger = _AgentBudgetLedger(
+        model_call_limit=max_model_calls + 1 if max_model_calls is not None else None,
+        call_input_limit=MAX_INTEGRATED_AGENT_CALL_INPUT_TOKENS,
+        total_input_limit=None,
+        call_output_limit=output_limit,
+        total_output_limit=None,
+        tool_call_limit=None,
+    )
+    readers = {"gap": run_gap_reading, "focus": run_focus_reading, "outline": run_outline_reading}
+    if strategy not in readers:
         raise ValueError("unknown reading strategy")
-    use_gap = strategy in ("gap", "focus", "outline") and not delegated and not legacy_integrated
-    try:
-        if use_gap:
-            from page_cite_rag.gap_agent import (
-                run_focus_reading,
-                run_gap_reading,
-                run_outline_reading,
-            )
-
-            reading = {
-                "gap": run_gap_reading,
-                "focus": run_focus_reading,
-                "outline": run_outline_reading,
-            }[strategy](workflow, question, language, search, blocks, cooldown=navigation_cooldown)
-            for call in reading.trace["gap_model_calls"]:
-                ledger.admit(call["input_tokens"], workflow._budget_config.num_ctx)
-                ledger.complete(call["output_tokens"])
-        else:
-            chat_model_context = (
-                local_chat_model(model, on_request=on_wire_request)
-                if on_wire_request is not None
-                else local_chat_model(model)
-            )
-            with chat_model_context as chat_model:
-                reading = run_bounded_reading_agent(
-                    workflow,
-                    question,
-                    language,
-                    search,
-                    blocks,
-                    chat_model,
-                    count_chat_input_tokens=model.count_chat_input_tokens,
-                    delegated=delegated,
-                    cooldown=navigation_cooldown,
-                    max_model_calls=(
-                        max_model_calls
-                        if max_model_calls is not None
-                        else 7
-                        if delegated
-                        else 1
-                        if legacy_integrated
-                        else navigation_calls
-                    ),
-                    final_answer=legacy_integrated,
-                    shared_ledger=ledger,
-                    data_tools_enabled=data_tools_enabled,
-                    on_model_call=on_model_call,
-                )
-    except AgentRunFailure as exc:
-        if delegated or legacy_integrated:
-            raise
-        reading = _recover_original_context(workflow, question, search, blocks, exc)
+    reading = readers[strategy](
+        workflow, question, language, search, blocks, cooldown=navigation_cooldown
+    )
+    for call in reading.trace["gap_model_calls"]:
+        ledger.admit(call["input_tokens"], workflow._budget_config.num_ctx)
+        ledger.complete(call["output_tokens"])
     retrieval_trace = RetrievalTrace(
         method=search.method,
         index_id=search.index_id,
@@ -807,70 +540,6 @@ def ask_with_agent(
         query_plan=workflow._query_plan(),
         branches=search.branches,
     )
-    if delegated:
-        result = workflow.answer_from_context(
-            question,
-            reading.context.blocks,
-            language=language,
-            context_groups=reading.context.context_groups,
-        )
-        result = result.model_copy(update={"retrieval": retrieval_trace})
-        return AgentAnswer(
-            result,
-            {
-                "version": "source-navigation/v1",
-                "strategy": "delegated",
-                "agent": reading.trace,
-            },
-        )
-
-    if legacy_integrated:
-        final_call = reading.trace.get("final_model_call")
-        if not isinstance(final_call, dict) or final_call.get("status") != "completed":
-            failure_trace = dict(reading.trace)
-            failure_trace["failure_stage"] = "structured_final_call"
-            failure_trace["failure_type"] = "missing_completed_final_call"
-            raise AgentRunFailure("InvalidAgentTerminalState", failure_trace)
-        output_tokens = reading.trace.get("agent_output_tokens_observed")
-        usage = AgentUsage(
-            model_calls=reading.trace["model_calls_completed"],
-            tool_calls=reading.trace["tool_calls_recorded"],
-            input_tokens=reading.trace["agent_input_tokens_exact"],
-            output_tokens=output_tokens,
-            output_tokens_reserved=reading.trace["agent_output_tokens_unobserved_reserved"],
-            output_usage_complete=output_tokens is not None,
-            final_input_tokens=final_call["input_tokens_exact"],
-            final_output_tokens=final_call["output_tokens_observed"],
-            final_output_limit=final_call["output_token_limit"],
-        )
-        try:
-            result = workflow.answer_from_agent_draft(
-                question,
-                reading.context.blocks,
-                reading.structured_response,
-                language=language,
-                context_groups=reading.context.context_groups,
-                omitted_block_ids=reading.context.omitted_block_ids,
-                retrieval=retrieval_trace,
-                agent_usage=usage,
-                elapsed_ms=(perf_counter() - started) * 1000,
-            )
-        except Exception as exc:
-            failure_trace = dict(reading.trace)
-            failure_trace["failure_stage"] = "answer_validation"
-            failure_trace["failure_type"] = type(exc).__name__
-            raise AgentRunFailure(type(exc).__name__, failure_trace) from exc
-        return AgentAnswer(
-            result,
-            {
-                "version": "integrated-reading-agent/v1",
-                "strategy": "integrated_single_agent_diagnostic",
-                "agent": reading.trace,
-            },
-        )
-
-    if ledger is None:
-        raise RuntimeError("single-agent shared writer ledger was not initialized")
     acquired = reading.acquired_context or reading.context
     report = reading.structured_response
     report_block_ids = {id for finding in report.requirements for id in finding.source_ids}
@@ -1129,7 +798,8 @@ def ask_with_agent(
         raise AgentRunFailure(type(exc).__name__, failure_trace) from exc
 
     # Plan 5.13: a code check of which reading notes reached the answer. Recorded only; a
-    # one-shot rewrite by the same 9B writer did not raise coverage in development.
+    # one-shot rewrite (5.13) and an add-only supplement call (5.15) by the same 9B writer
+    # both failed their development checks.
     points = reading.trace.get("reading_points") or ()
     coverage = (
         _point_coverage(result, points)

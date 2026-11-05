@@ -4,7 +4,7 @@ import json
 
 import pytest
 from pydantic import ValidationError
-from tests.test_agent_workflow import _Retriever, _setup
+from tests.reading_fixtures import _Retriever, _setup
 
 from page_cite_rag.agent import _spans
 from page_cite_rag.application import ask_with_agent
@@ -656,7 +656,7 @@ def test_the_single_entry_routes_by_the_scoped_plan_as_validated(tmp_path, monke
     workflow, question, result, first, (s1, _s2), replies = _two_part_reading(tmp_path)
 
     def plan(scope):
-        need = ReadingNeed(need="every finding", queries=("finding",))
+        need = ReadingNeed(need="every finding", queries=("finding", "Quels sont les résultats"))
         return lambda *_a, **_k: ScopedReadingPlan(requirements=(need,), scope=scope)
 
     def broken(*_a, **_k):
@@ -680,6 +680,7 @@ def test_the_single_entry_routes_by_the_scoped_plan_as_validated(tmp_path, monke
     lookup, model = ask()
     assert (lookup.trace["route"], lookup.trace["reason"]) == ("fixed", "planner_scope_lookup")
     assert lookup.trace["plan"]["scope"] == "lookup"
+    assert lookup.trace["dropped_foreign_queries"] == ["Quels sont les résultats"]
     assert len(model.writer_payloads) == 1 and model.gap_payloads == []
 
     monkeypatch.setattr(application, "plan_document_question", plan("whole_document"))

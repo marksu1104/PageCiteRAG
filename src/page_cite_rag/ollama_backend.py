@@ -275,6 +275,3 @@ class OllamaGgufClient(LlamaModelClient):
 
     def count_chat_input_tokens(self, payload: dict) -> int:
         raise ModelError("native chat-template token counting is unavailable on Ollama")
-
-    def openai_compatible_credentials(self) -> tuple[str, str]:
-        raise ModelError("the tool-calling reader is unavailable on the Ollama backend")

@@ -114,6 +114,32 @@ def stable_need_id(index: int) -> str:
     return f"need-{index + 1:02d}"
 
 
+# The planner may write a query in a third language (French or German for an English or
+# Chinese question, plan 5.15). The prompt rule alone did not stop it, so such queries are
+# dropped here; the original question is always searched as well. A word is a signal when it
+# carries one of these letters or is one of these function words (words that are also common
+# English, such as "die" or "pour", are left out); one accented name is not enough.
+_FOREIGN_LETTERS = frozenset("àâäáãåçéèêëíìîïñóòôöõúùûüýÿßœæ")
+_FOREIGN_WORDS = frozenset(
+    "le la les de des du au une dans sur est sont qui que avec il pourquoi und der das den "
+    "dem ein eine einer für wird wurden werden welche welcher wie beim oder ist sind nicht "
+    "zur zum".split()
+)
+_WORD = re.compile(r"[^\W\d_]+")
+
+
+def _foreign_signals(text: str) -> int:
+    return sum(
+        word in _FOREIGN_WORDS or any(char in _FOREIGN_LETTERS for char in word)
+        for word in _WORD.findall(text.casefold())
+    )
+
+
+def is_foreign_language_query(query: str, question: str) -> bool:
+    """Whether a planned query reads as a Latin-script language the question is not in."""
+    return _foreign_signals(query) >= 2 and _foreign_signals(question) < 2
+
+
 def planned_queries(question: str, plan: ReadingPlan) -> dict[str, tuple[str, ...]]:
     """Map stable need IDs to deduplicated subqueries; keep the original query separately."""
     if not isinstance(question, str) or not question.strip():
@@ -122,7 +148,11 @@ def planned_queries(question: str, plan: ReadingPlan) -> dict[str, tuple[str, ..
     result = {}
     for index, need in enumerate(plan.requirements):
         unique = tuple(
-            dict.fromkeys(query for query in need.queries if query.casefold() != original)
+            dict.fromkeys(
+                query
+                for query in need.queries
+                if query.casefold() != original and not is_foreign_language_query(query, question)
+            )
         )
         result[stable_need_id(index)] = unique
     return result

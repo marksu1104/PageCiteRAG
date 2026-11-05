@@ -857,8 +857,6 @@ def test_generated_limitation_bounds_match_citation_materialization(answer_forma
 
 @pytest.mark.parametrize("answer_format", ["short_answer", "multiple_choice"])
 def test_completed_answer_can_include_a_scope_note_without_changing_status(answer_format):
-    from langchain.agents.structured_output import OutputToolBinding, ToolStrategy
-
     workflow = object.__new__(FullAnswerWorkflow)
     workflow.answer_format = answer_format
     draft = {
@@ -871,11 +869,11 @@ def test_completed_answer_can_include_a_scope_note_without_changing_status(answe
         draft["short_answer"] = {"text": "The Table of the House", "citations": [citation]}
     else:
         draft.update(choice="B", choice_citations=[citation])
-    strategy = ToolStrategy(workflow.agent_tool_model(), handle_errors=False)
-    parsed = OutputToolBinding.from_schema_spec(strategy.schema_specs[0]).parse(draft)
+    model = workflow.agent_response_model()
+    parsed = model.model_validate_json(json.dumps(draft))
     assert parsed.status == "answered"
     assert parsed.limitations == tuple(draft["limitations"])
     # A genuinely partial answer still needs an explicit missing requested part.
     draft.update(status="partial", limitations=[])
     with pytest.raises(ValueError):
-        OutputToolBinding.from_schema_spec(strategy.schema_specs[0]).parse(draft)
+        model.model_validate_json(json.dumps(draft))

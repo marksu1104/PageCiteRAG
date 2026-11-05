@@ -21,15 +21,8 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from page_cite_rag.agent import (
-    MAX_AGENT_MODEL_CALLS,
-    MAX_AGENT_TOOL_CALLS,
-    MAX_AGENT_TOTAL_INPUT_TOKENS,
-    MAX_AGENT_TOTAL_OUTPUT_TOKENS,
-    MAX_EXACT_INPUT_TOKENS,
     MAX_INTEGRATED_AGENT_CALL_INPUT_TOKENS,
     MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
-    MAX_INTEGRATED_AGENT_TOTAL_INPUT_TOKENS,
-    MAX_READER_TASKS,
 )
 from page_cite_rag.answer_metrics import AnswerPrediction, AnswerReference, score_prediction
 from page_cite_rag.dense import DenseRetriever, build_dense_index, dense_index_kind
@@ -45,6 +38,7 @@ from page_cite_rag.ingest import prepare_source
 from page_cite_rag.llama import (
     DEFAULT_BUNDLE,
     LLAMA_COMMIT,
+    MAX_EXACT_INPUT_TOKENS,
     LlamaConfig,
     LlamaModelClient,
     model_spec,
@@ -88,10 +82,8 @@ PREP_QUERY_EMBED_TOKEN_LIMIT = 25_000
 PREP_QUERY_EMBED_TOKEN_GLOBAL_LIMIT = 100_000
 MAX_INVOCATION_WALL_SECONDS = 50 * 60
 MAX_CASE_WALL_SECONDS = 600
-MAX_WORKFLOW_COMPARISON_CASES = 24
 LONG_BENCH_MAX_INVOCATION_WALL_SECONDS = 90 * 60
 LONG_BENCH_OFFICIAL_ARM = "longbench-v2-official-rag"
-DEFAULT_ARMS = ("fixed-rag", "single-agent")
 QUALITY_V1_ARMS = (
     "fixed-rag",
     "fixed-rag-followup-once",
@@ -111,19 +103,14 @@ AGENT_OUTLINE_ARMS = ("fixed-rag", "decomposition-fixed-rag", "decomposition-out
 # whole-document questions to section reading and every other question to the fixed path.
 ROUTED_ARMS = ("fixed-rag", "routed-reading")
 READING_PLAN_ARM_SETS = (QUALITY_V1_ARMS, AGENT_FOCUS_ARMS, AGENT_OUTLINE_ARMS, ROUTED_ARMS)
+DEFAULT_ARMS = ROUTED_ARMS
 READING_PLAN_CASE_CEILING = 160
-REVIEW_ARMS = {
-    "repair-once": "once",
-    "reading-agent": "agent",
-    "delegated-reading-agent": "delegated",
-}
 PROMPT_COMPARISON_ARMS = {
     "fixed-rag-prompt-task-aligned": "task-aligned-v5",
 }
 ARMS = (
-    *DEFAULT_ARMS,
+    "fixed-rag",
     "fixed-rag-followup-once",
-    "single-agent-no-tools",
     "decomposition-fixed-rag",
     "decomposition-agent",
     "decomposition-focus-agent",
@@ -131,7 +118,6 @@ ARMS = (
     "routed-reading",
     *PROMPT_COMPARISON_ARMS,
     "fixed-rag-reranked",
-    *REVIEW_ARMS,
     LONG_BENCH_OFFICIAL_ARM,
 )
 ARM_ARCHITECTURES = {
@@ -139,7 +125,6 @@ ARM_ARCHITECTURES = {
     "fixed-rag-followup-once": (
         "shared_reranked_initial_context_then_one_deterministic_hybrid_pool_followup"
     ),
-    "single-agent": "single_agent_navigation_then_shared_answer_writer",
     "decomposition-fixed-rag": "question_plan_then_multi_query_hybrid_rrf_then_shared_writer",
     "decomposition-agent": (
         "question_plan_multi_query_hybrid_rrf_then_bounded_agent_and_shared_writer"
@@ -153,13 +138,8 @@ ARM_ARCHITECTURES = {
     "routed-reading": (
         "scoped_question_plan_then_fixed_rag_or_section_notes_and_shared_writer_with_note_coverage"
     ),
-    "single-agent-no-tools": "single_agent_structured_answer_over_frozen_initial_evidence",
-    "delegated-agent": "legacy_bounded_navigation_then_separate_writer",
     "fixed-rag-prompt-task-aligned": "fixed_hybrid_retrieval_then_one_structured_answer",
     "fixed-rag-reranked": "fixed_hybrid_retrieval_then_one_structured_answer",
-    "repair-once": "structured_review_then_at_most_one_answer_repair",
-    "reading-agent": "bounded_reader_review_then_shared_answer_workflow",
-    "delegated-reading-agent": "bounded_delegated_reader_review_then_shared_answer_workflow",
     LONG_BENCH_OFFICIAL_ARM: "official_longbench_prompt_over_fixed_retrieval_context",
 }
 RUNNER_VERSION = "frozen-reading-eval-v31-batch-declared"
@@ -244,17 +224,16 @@ def _prompt_revision_for_arm(arm: str) -> str:
     return PROMPT_COMPARISON_ARMS.get(arm, "contract-consistent")
 
 
+# Program-driven readers; each maps to an ask_with_agent strategy.
+AGENT_STRATEGIES = {
+    "decomposition-agent": "gap",
+    "decomposition-focus-agent": "focus",
+    "decomposition-outline-agent": "outline",
+}
+
+
 def _is_agent_arm(arm: str) -> bool:
-    return arm in (
-        "single-agent",
-        "decomposition-agent",
-        "decomposition-focus-agent",
-        "decomposition-outline-agent",
-        "single-agent-no-tools",
-        "delegated-agent",
-        "reading-agent",
-        "delegated-reading-agent",
-    )
+    return arm in AGENT_STRATEGIES
 
 
 def _routed_to_reading(plan_row: dict | None) -> bool:
@@ -278,11 +257,11 @@ def _plan_model(static: dict):
 
 
 def _agent_uses_live_retrieval(arm: str) -> bool:
-    return _is_agent_arm(arm) and arm != "single-agent-no-tools"
+    return _is_agent_arm(arm)
 
 
 def _is_fixed_rag_arm(arm: str) -> bool:
-    return not _is_agent_arm(arm) and arm not in REVIEW_ARMS
+    return not _is_agent_arm(arm)
 
 
 def _longbench_v2_official_prompt(context: str, question: str, choices: dict[str, str]) -> str:
@@ -971,7 +950,6 @@ def static_configuration(
         "fixed-rag": 1,
         "fixed-rag-reranked": 1,
         "fixed-rag-followup-once": 2,
-        "single-agent": None,
         "decomposition-fixed-rag": 1,
         "decomposition-agent": None,
         "decomposition-focus-agent": None,
@@ -982,7 +960,6 @@ def static_configuration(
     scope_routing = tuple(arms) == ROUTED_ARMS
     if shared_initial_reranker and not reading_plan_comparison:
         raise ValueError("shared initial reranking is reserved for the four reading-plan arms")
-    selected_workflow_arms = {arm for arm in arms if arm in workflow_call_limits}
     answer_call_budget = None
     reading_plan_budget = None
     if reading_plan_comparison:
@@ -1001,18 +978,6 @@ def static_configuration(
             "planner_phase_generation_dispatch_limit": 72,
             "model_calls_per_agent_case_limit": None,
             "case_deadline_seconds": MAX_CASE_WALL_SECONDS,
-        }
-    elif "single-agent" in selected_workflow_arms and len(selected_workflow_arms) > 1:
-        if len(case_ids) > MAX_WORKFLOW_COMPARISON_CASES:
-            raise ValueError("workflow comparison exceeds its frozen 24-case development ceiling")
-        answer_call_budget = {
-            "cases": len(case_ids),
-            "per_case_model_call_limit_by_arm": {
-                arm: workflow_call_limits[arm] for arm in arms if arm in selected_workflow_arms
-            },
-            "single_agent_per_case_call_limit": None,
-            "case_deadline_seconds": MAX_CASE_WALL_SECONDS,
-            "batch_generation_dispatch_limit": "frozen_global_and_phase_ledgers",
         }
     effective_sampling_profile = "longbench-official" if is_longbench_official else sampling_profile
     generator_spec = model_spec(generator_model_size)
@@ -1200,7 +1165,7 @@ def static_configuration(
             "retry": False,
         },
         "agent": {
-            "framework": "LangChain create_agent",
+            "framework": "program-driven structured readers (page_cite_rag.gap_agent)",
             "architecture_by_arm": {
                 arm: ARM_ARCHITECTURES[arm] for arm in arms if arm in ARM_ARCHITECTURES
             },
@@ -1225,19 +1190,6 @@ def static_configuration(
                     "followup_candidate_block_limit": FIXED_FOLLOWUP_BLOCKS,
                     "total_input_tokens_per_call_max": EXACT_INPUT_LIMIT,
                     "total_output_tokens_per_case_max": OUTPUT_TOKENS * 2,
-                },
-                "single-agent": {
-                    "model_call_limit_per_case": None,
-                    "common_writer_calls_per_case": 1,
-                    "data_tool_event_limit_per_case": None,
-                    "call_input_tokens_max": MAX_INTEGRATED_AGENT_CALL_INPUT_TOKENS,
-                    "total_input_tokens_per_case_limit": None,
-                    "call_output_tokens_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
-                    "total_output_tokens_per_case_limit": None,
-                    "final_input_tokens_max": AGENT_FINAL_INPUT_LIMIT,
-                    "final_output_tokens_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
-                    "case_deadline_seconds": MAX_CASE_WALL_SECONDS,
-                    "budget_scope": "single_agent_navigation_and_common_writer_shared_ledger",
                 },
                 "decomposition-fixed-rag": {
                     "model_calls_per_case_max": 1,
@@ -1300,54 +1252,10 @@ def static_configuration(
                     "final_output_tokens_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
                     "case_deadline_seconds": MAX_CASE_WALL_SECONDS,
                 },
-                "single-agent-no-tools": {
-                    "model_calls_per_case_max": 1,
-                    "data_tool_events_per_case_max": 0,
-                    "total_input_tokens_per_case_max": MAX_INTEGRATED_AGENT_TOTAL_INPUT_TOKENS,
-                    "call_output_tokens_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
-                    "total_output_tokens_per_case_max": MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
-                    "budget_scope": "one_structured_answer_over_frozen_initial_evidence",
-                },
-                "delegated-agent": {
-                    "navigation_model_calls_per_case_max": MAX_AGENT_MODEL_CALLS,
-                    "separate_final_writer_calls_per_case_max": 1,
-                    "total_model_calls_per_case_max": MAX_AGENT_MODEL_CALLS + 1,
-                    "navigation_input_tokens_max": MAX_AGENT_TOTAL_INPUT_TOKENS,
-                    "final_writer_input_tokens_max": AGENT_FINAL_INPUT_LIMIT,
-                    "total_input_tokens_per_case_max": MAX_AGENT_TOTAL_INPUT_TOKENS
-                    + AGENT_FINAL_INPUT_LIMIT,
-                    "navigation_output_tokens_max": MAX_AGENT_TOTAL_OUTPUT_TOKENS,
-                    "final_writer_output_tokens_max": OUTPUT_TOKENS,
-                    "total_output_tokens_per_case_max": MAX_AGENT_TOTAL_OUTPUT_TOKENS
-                    + OUTPUT_TOKENS,
-                    "data_tool_events_per_case_max": MAX_AGENT_TOOL_CALLS,
-                    "readers_per_case_max": MAX_READER_TASKS,
-                    "budget_scope": "legacy_navigation_and_readers_then_separate_writer",
-                },
             },
             "sequential": True,
-            "shared_budget_by_arm": {
-                "single-agent": True,
-                "single-agent-no-tools": True,
-                "delegated-agent": False,
-            },
-            "legacy_delegated_arm_is_default": False,
         },
         "answer_call_budget": answer_call_budget,
-        "source_review": {
-            "implementation": "page_cite_rag.review.answer_with_review",
-            "checker_is_quality_evaluator": False,
-            "strategies_by_arm": REVIEW_ARMS,
-            "structured_call_limit_per_case": 4,
-            "navigation_call_limit_per_case": 4,
-            "total_call_limits_by_arm": {
-                "repair-once": 4,
-                "reading-agent": 8,
-                "delegated-reading-agent": 8,
-            },
-            "max_repair_cycles": 1,
-            "generation_records": "actual messages, schema, raw output and usage for every stage",
-        },
         "gpu": {
             "uuid": GPU_UUID,
             "memory_limit_mib": MAX_GPU_MEMORY_MIB,
@@ -1525,7 +1433,6 @@ def _copy_preparation_checkpoint(run_root: Path, source_root: Path, static: dict
         "src/page_cite_rag/llama.py",
         "src/page_cite_rag/query.py",
         "src/page_cite_rag/reading_plan.py",
-        "src/page_cite_rag/review.py",
         "src/page_cite_rag/retrieval_profile.py",
         "src/page_cite_rag/service.py",
         "src/page_cite_rag/workflows.py",
@@ -7336,11 +7243,9 @@ class _CountingModelClient:
             global_call_index = self._reserve_global_call(
                 response_model, required_remaining_calls=self._required_remaining_calls()
             )
-        from page_cite_rag.review import SourceReview
-
         record = {
             "call_index": self.generate_calls - self._case_start_calls + 1,
-            "role": "checker" if issubclass(response_model, SourceReview) else "answer",
+            "role": "answer",
             "response_model": response_model.__name__,
             "global_call_index": global_call_index,
             "messages": [message.model_dump(mode="json") for message in messages],
@@ -7394,19 +7299,8 @@ def _remaining_quality_writer_reservation(
         raise ModelError("current case writer reservation is invalid")
     selected_arms = tuple(static.get("run_selection", {}).get("arms", ()))
     total = current_case_remaining_calls
-    if selected_arms == ("single-agent",):
-        directory = run_root / "single-agent"
-        for case_id in static["run_selection"]["case_ids"]:
-            if case_id == current_case_id:
-                continue
-            if (directory / f"{case_id}.json").exists():
-                continue
-            if (directory / ".attempts" / f"{case_id}.json").exists():
-                continue
-            total += 1
-        return total
     if selected_arms not in READING_PLAN_ARM_SETS:
-        raise ModelError("writer reservation requires a supported single-agent or four-arm run")
+        raise ModelError("writer reservation requires a registered reading-plan comparison")
     for arm in selected_arms:
         directory = run_root / arm
         for case_id in static["run_selection"]["case_ids"]:
@@ -7452,19 +7346,6 @@ def _structured_usage(records: list[dict]) -> dict:
     }
 
 
-def _review_agent_trace(trace: dict | None) -> dict | None:
-    if not isinstance(trace, dict):
-        return None
-    if isinstance(trace.get("agent"), dict):
-        return trace["agent"]
-    failed = trace.get("failed_stage_trace")
-    if isinstance(failed, dict):
-        if "model_call_records" in failed:
-            return failed
-        return _review_agent_trace(failed)
-    return None
-
-
 def _run_arm(
     run_root: Path,
     static: dict,
@@ -7496,14 +7377,8 @@ def _run_arm(
     if not selected or (case_id is not None and selected[0]["case_id"] != case_id):
         raise ValueError("requested case ID is not in the frozen input manifest")
 
-    from page_cite_rag.agent import (
-        AgentRunFailure,
-        ReadingReport,
-        _admit,
-        local_chat_model,
-    )
+    from page_cite_rag.agent import AgentRunFailure, ReadingReport, _admit
     from page_cite_rag.application import FrozenSearchRetriever, ask_with_agent, document_workflow
-    from page_cite_rag.review import ReviewRunFailure, answer_with_review
     from page_cite_rag.workflows import RetrievalTrace
 
     arm_dir = run_root / arm
@@ -7575,7 +7450,7 @@ def _run_arm(
                 if (
                     global_call_phase not in {"development", "answer", "regression_answers"}
                     or tuple(static.get("run_selection", {}).get("arms", ()))
-                    not in {*READING_PLAN_ARM_SETS, ("single-agent",)}
+                    not in READING_PLAN_ARM_SETS
                     or _generation_batch_root(run_root) is None
                 ):
                     return 0
@@ -7585,13 +7460,7 @@ def _run_arm(
                         behavior == "fixed-rag-followup-once"
                         and counted_model.generate_calls == counted_model._case_start_calls
                     )
-                    or behavior
-                    in (
-                        "decomposition-agent",
-                        "decomposition-focus-agent",
-                        "decomposition-outline-agent",
-                        "single-agent",
-                    )
+                    or _is_agent_arm(behavior)
                 )
                 return _remaining_quality_writer_reservation(
                     run_root,
@@ -7607,8 +7476,6 @@ def _run_arm(
                     if behavior in ("fixed-rag", "decomposition-fixed-rag")
                     else 2
                     if behavior == "fixed-rag-followup-once"
-                    else 4
-                    if behavior in REVIEW_ARMS
                     else None
                 ),
                 required_remaining_calls=remaining_quality_writer_calls,
@@ -7688,7 +7555,7 @@ def _run_arm(
                 _context_group_limit(static) if static.get("reading_plan") is not None else TOP_K
             )
             retriever = FrozenSearchRetriever(search, top_k=workflow_top_k)
-            if _agent_uses_live_retrieval(behavior) or behavior in REVIEW_ARMS:
+            if _agent_uses_live_retrieval(behavior):
                 reranker_model_path = None
                 if static.get("retrieval", {}).get("reranker", False):
                     from page_cite_rag.reranker_server import DEFAULT_MODEL_PATH
@@ -7888,12 +7755,6 @@ def _run_arm(
                 )
                 return None
 
-            def capture_agent_wire_request(record: dict) -> None:
-                append_jsonl_record(
-                    arm_dir / "wire-requests.jsonl",
-                    {"case_id": case["case_id"], "arm": arm, **record},
-                )
-
             attempted += 1
             shared_retrieval_seconds = max(0.0, search.elapsed_ms / 1000)
             remaining_case_seconds = (
@@ -7903,164 +7764,117 @@ def _run_arm(
                 try:
                     if deadline_expired.is_set():
                         raise TimeoutError("case deadline expired before generation")
-                    if behavior in REVIEW_ARMS:
-                        review_search = search.model_copy(
-                            update={"context_groups": context.context_groups}
+                    if not _is_agent_arm(behavior):
+                        result = workflow.answer_from_context(
+                            case["question"],
+                            context.blocks,
+                            language=case["language"],
+                            context_groups=context.context_groups,
                         )
-                        with retriever.session():
-                            if _is_agent_arm(arm):
-                                with local_chat_model(counted_model) as chat_model:
-                                    reviewed = answer_with_review(
-                                        workflow,
-                                        case["question"],
-                                        language=case["language"],
-                                        strategy=REVIEW_ARMS[arm],
-                                        initial_search=review_search,
-                                        initial_blocks=context.blocks,
-                                        chat_model=chat_model,
-                                    )
-                            else:
-                                reviewed = answer_with_review(
-                                    workflow,
-                                    case["question"],
-                                    language=case["language"],
-                                    strategy=REVIEW_ARMS[arm],
-                                    initial_search=review_search,
-                                    initial_blocks=context.blocks,
-                                )
-                        result = reviewed.result
-                        reading_trace = reviewed.trace
-                    else:
-                        if not _is_agent_arm(behavior):
-                            result = workflow.answer_from_context(
-                                case["question"],
-                                context.blocks,
-                                language=case["language"],
-                                context_groups=context.context_groups,
-                            )
-                            if behavior == "fixed-rag-followup-once":
-                                first_answer_result = result
-                                followup_trace = {
-                                    "protocol": "fixed-rag-followup-once/v1",
-                                    "triggered": result.status
-                                    in ("partial", "insufficient_evidence"),
-                                    "initial_status": result.status,
-                                    "candidate_selection": (
-                                        "next_unseen_complete_source_blocks_from_frozen_hybrid_pool"
-                                    ),
-                                    "candidate_limit": FIXED_FOLLOWUP_BLOCKS,
-                                    "initial_hit_block_ids": [
-                                        hit.block.block_id for hit in search.hits
-                                    ],
-                                    "initial_admitted_block_ids": [
+                        if behavior == "fixed-rag-followup-once":
+                            first_answer_result = result
+                            followup_trace = {
+                                "protocol": "fixed-rag-followup-once/v1",
+                                "triggered": result.status in ("partial", "insufficient_evidence"),
+                                "initial_status": result.status,
+                                "candidate_selection": (
+                                    "next_unseen_complete_source_blocks_from_frozen_hybrid_pool"
+                                ),
+                                "candidate_limit": FIXED_FOLLOWUP_BLOCKS,
+                                "initial_hit_block_ids": [
+                                    hit.block.block_id for hit in search.hits
+                                ],
+                                "initial_admitted_block_ids": [
+                                    block.block_id for block in context.blocks
+                                ],
+                                "candidate_block_ids": [],
+                                "admitted_block_ids": [],
+                                "state": "not_triggered",
+                            }
+                            if followup_trace["triggered"]:
+                                candidate_value = row.get("candidate_result")
+                                if not isinstance(candidate_value, dict):
+                                    raise ValueError("fixed follow-up needs its frozen hybrid pool")
+                                followup_search = _fixed_followup_search(
+                                    search,
+                                    _search_result_from_json(candidate_value),
+                                    initial_admitted_block_ids=[
                                         block.block_id for block in context.blocks
                                     ],
-                                    "candidate_block_ids": [],
-                                    "admitted_block_ids": [],
-                                    "state": "not_triggered",
-                                }
-                                if followup_trace["triggered"]:
-                                    candidate_value = row.get("candidate_result")
-                                    if not isinstance(candidate_value, dict):
-                                        raise ValueError(
-                                            "fixed follow-up needs its frozen hybrid pool"
-                                        )
-                                    followup_search = _fixed_followup_search(
-                                        search,
-                                        _search_result_from_json(candidate_value),
-                                        initial_admitted_block_ids=[
-                                            block.block_id for block in context.blocks
-                                        ],
-                                        limit=FIXED_FOLLOWUP_BLOCKS,
-                                    )
-                                    if followup_search is None:
-                                        followup_trace["state"] = "no_unseen_candidates"
-                                    else:
-                                        followup_blocks = workflow._context_blocks(
-                                            followup_search,
-                                            workflow._read_hits(followup_search, case["question"]),
-                                        )
-                                        followup_trace["candidate_block_ids"] = [
-                                            block.block_id for block in followup_blocks
-                                        ]
-                                        expanded, admission_trace = _fixed_followup_admission(
-                                            workflow,
-                                            case["question"],
-                                            case["language"],
-                                            context,
-                                            followup_search,
-                                            tuple(followup_blocks),
-                                        )
-                                        followup_trace["context_admission"] = admission_trace
-                                        followup_trace["admitted_block_ids"] = [
-                                            block_id
-                                            for block_id in admission_trace.get(
-                                                "new_block_ids_admitted", []
-                                            )
-                                        ]
-                                        followup_trace["omitted_block_ids"] = list(
-                                            expanded.omitted_block_ids
-                                            if expanded is not None
-                                            else []
-                                        )
-                                        followup_trace["exact_input_tokens"] = (
-                                            expanded.exact_input_tokens
-                                            if expanded is not None
-                                            else None
-                                        )
-                                        if expanded is None:
-                                            followup_trace["state"] = admission_trace["state"]
-                                        else:
-                                            followup_trace["state"] = "started"
-                                            try:
-                                                result = workflow.answer_from_context(
-                                                    case["question"],
-                                                    expanded.blocks,
-                                                    language=case["language"],
-                                                    context_groups=expanded.context_groups,
-                                                )
-                                                followup_trace["state"] = "completed"
-                                                followup_trace["final_status"] = result.status
-                                            except Exception as followup_error:
-                                                result = first_answer_result
-                                                followup_trace["state"] = (
-                                                    "failed_fallback_to_initial_answer"
-                                                )
-                                                followup_trace["error_type"] = type(
-                                                    followup_error
-                                                ).__name__
-                        else:
-                            retrieval_session = (
-                                retriever.session()
-                                if _agent_uses_live_retrieval(behavior)
-                                and getattr(retriever, "reranker_model_path", None) is None
-                                else nullcontext()
-                            )
-                            with retrieval_session:
-                                navigation_answer = ask_with_agent(
-                                    workflow,
-                                    case["question"],
-                                    language=case["language"],
-                                    initial_search=search,
-                                    initial_blocks=blocks,
-                                    delegated=behavior == "delegated-agent",
-                                    data_tools_enabled=behavior != "single-agent-no-tools",
-                                    strategy={
-                                        "decomposition-agent": "gap",
-                                        "decomposition-focus-agent": "focus",
-                                        "decomposition-outline-agent": "outline",
-                                    }.get(behavior, "react"),
-                                    max_model_calls=(
-                                        1 if behavior == "single-agent-no-tools" else None
-                                    ),
-                                    on_model_call=record_agent_model_call,
-                                    on_wire_request=(
-                                        capture_agent_wire_request
-                                        if global_call_phase == "protocol"
-                                        else None
-                                    ),
+                                    limit=FIXED_FOLLOWUP_BLOCKS,
                                 )
-                            result = navigation_answer.result
+                                if followup_search is None:
+                                    followup_trace["state"] = "no_unseen_candidates"
+                                else:
+                                    followup_blocks = workflow._context_blocks(
+                                        followup_search,
+                                        workflow._read_hits(followup_search, case["question"]),
+                                    )
+                                    followup_trace["candidate_block_ids"] = [
+                                        block.block_id for block in followup_blocks
+                                    ]
+                                    expanded, admission_trace = _fixed_followup_admission(
+                                        workflow,
+                                        case["question"],
+                                        case["language"],
+                                        context,
+                                        followup_search,
+                                        tuple(followup_blocks),
+                                    )
+                                    followup_trace["context_admission"] = admission_trace
+                                    followup_trace["admitted_block_ids"] = [
+                                        block_id
+                                        for block_id in admission_trace.get(
+                                            "new_block_ids_admitted", []
+                                        )
+                                    ]
+                                    followup_trace["omitted_block_ids"] = list(
+                                        expanded.omitted_block_ids if expanded is not None else []
+                                    )
+                                    followup_trace["exact_input_tokens"] = (
+                                        expanded.exact_input_tokens
+                                        if expanded is not None
+                                        else None
+                                    )
+                                    if expanded is None:
+                                        followup_trace["state"] = admission_trace["state"]
+                                    else:
+                                        followup_trace["state"] = "started"
+                                        try:
+                                            result = workflow.answer_from_context(
+                                                case["question"],
+                                                expanded.blocks,
+                                                language=case["language"],
+                                                context_groups=expanded.context_groups,
+                                            )
+                                            followup_trace["state"] = "completed"
+                                            followup_trace["final_status"] = result.status
+                                        except Exception as followup_error:
+                                            result = first_answer_result
+                                            followup_trace["state"] = (
+                                                "failed_fallback_to_initial_answer"
+                                            )
+                                            followup_trace["error_type"] = type(
+                                                followup_error
+                                            ).__name__
+                    else:
+                        retrieval_session = (
+                            retriever.session()
+                            if _agent_uses_live_retrieval(behavior)
+                            and getattr(retriever, "reranker_model_path", None) is None
+                            else nullcontext()
+                        )
+                        with retrieval_session:
+                            navigation_answer = ask_with_agent(
+                                workflow,
+                                case["question"],
+                                language=case["language"],
+                                initial_search=search,
+                                initial_blocks=blocks,
+                                strategy=AGENT_STRATEGIES[behavior],
+                                on_model_call=record_agent_model_call,
+                            )
+                        result = navigation_answer.result
                     final_attempted = counted_model.generate_calls > final_calls_before
                     result = result.model_copy(
                         update={
@@ -8078,8 +7892,6 @@ def _run_arm(
                     completed += 1
                 except Exception as exc:
                     final_attempted = counted_model.generate_calls > final_calls_before
-                    if isinstance(exc, ReviewRunFailure):
-                        reading_trace = exc.trace
                     if behavior == "fixed-rag-followup-once" and first_answer_result is not None:
                         result = first_answer_result
                         followup_trace = followup_trace or {
@@ -8096,11 +7908,9 @@ def _run_arm(
                     else:
                         failure = {
                             "error_type": exc.error_type
-                            if isinstance(exc, (AgentRunFailure, ReviewRunFailure))
-                            else type(exc).__name__,
-                            "agent_trace": exc.trace
                             if isinstance(exc, AgentRunFailure)
-                            else _review_agent_trace(reading_trace),
+                            else type(exc).__name__,
+                            "agent_trace": exc.trace if isinstance(exc, AgentRunFailure) else None,
                             "reading_trace": reading_trace,
                             "final_answer_attempted": final_attempted,
                         }
@@ -8171,8 +7981,7 @@ def _run_arm(
             agent_trace = (
                 navigation_answer.trace["agent"]
                 if navigation_answer is not None
-                else _review_agent_trace(reading_trace)
-                or (failure.get("agent_trace") if failure else None)
+                else (failure.get("agent_trace") if failure else None)
             )
             agent_input = agent_trace.get("agent_input_tokens_exact") if agent_trace else 0
             agent_call_records = agent_trace.get("model_call_records", []) if agent_trace else []

@@ -301,3 +301,36 @@ def test_fusion_accepts_an_original_question_with_surrounding_whitespace():
     fused = fuse_planned_searches("Question?  ", (result,), top_k=1)
 
     assert fused.query == "Question?  "
+
+
+def test_third_language_planner_queries_are_dropped_but_the_question_stays():
+    from page_cite_rag.reading_plan import is_foreign_language_query, planned_query_routes
+
+    question = "How was Country C built into the illustrative dataset?"
+    assert is_foreign_language_query("Comment sont définis l'opérateur minimum ?", question)
+    assert is_foreign_language_query("Wie wird der Wert für die Debatte bestimmt", question)
+    assert not is_foreign_language_query("Country C dataset construction", question)
+    assert not is_foreign_language_query("C 國資料集如何建立", question)
+    assert is_foreign_language_query("Quel classificateur est utilisé ?", "分類器是什麼？")
+    # One accented name in an English query is not a language switch.
+    assert not is_foreign_language_query("Visit to the longhouse at Brattahlíð", question)
+    # A question already written in French keeps its French queries.
+    assert not is_foreign_language_query("Comment sont définis les seuils", "Où est défini C ?")
+    plan = ReadingPlan.model_validate_json(
+        json.dumps(
+            {
+                "requirements": [
+                    {
+                        "need": "How Country C was built",
+                        "queries": [
+                            "Country C construction",
+                            "Commentaire sur la construction de Country C",
+                        ],
+                    }
+                ]
+            }
+        ),
+        strict=True,
+    )
+    queries, _routes = planned_query_routes(question, plan)
+    assert queries == (question, "Country C construction")

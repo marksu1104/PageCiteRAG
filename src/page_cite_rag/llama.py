@@ -615,13 +615,6 @@ class LlamaModelClient:
         if f"offloaded {expected}/{expected} layers to GPU" not in log:
             raise ModelError("requested full GPU offload was not confirmed")
 
-    def openai_compatible_credentials(self) -> tuple[str, str]:
-        """Expose only this owned loopback server to an optional local agent adapter."""
-        self._ensure_running()
-        if self._http is None or self._auth_token is None:
-            raise ModelError("local chat endpoint is unavailable")
-        return str(self._http.base_url).rstrip("/") + "/v1", self._auth_token
-
     def count_chat_input_tokens(self, payload: dict) -> int:
         """Count the exact pinned chat-template input without generating a completion."""
         if not isinstance(payload, dict) or payload.get("model") != "page-cite-rag-qwen35":

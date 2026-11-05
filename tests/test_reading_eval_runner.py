@@ -2,7 +2,6 @@ import hashlib
 import importlib.util
 import json
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -185,8 +184,8 @@ def test_selected_reranker_is_shared_with_agent_initial_context():
         "block_to_passage_id": {"ranked-block": "passage-1"},
     }
 
-    assert run_reading_eval._row_for_arm(row, "single-agent")["result"] == row["result"]
-    shared = run_reading_eval._row_for_arm(row, "single-agent", shared_reranker=True)
+    assert run_reading_eval._row_for_arm(row, "decomposition-agent")["result"] == row["result"]
+    shared = run_reading_eval._row_for_arm(row, "decomposition-agent", shared_reranker=True)
     fixed = run_reading_eval._row_for_arm(row, "fixed-rag-reranked")
 
     assert shared["result"] == row["reranked_result"]
@@ -485,7 +484,7 @@ def test_longbench_prepare_refuses_missing_or_mismatched_protocol_hash(
 
 
 def test_agent_final_input_limit_matches_fixed_rag_budget():
-    from page_cite_rag.agent import MAX_EXACT_INPUT_TOKENS
+    from page_cite_rag.llama import MAX_EXACT_INPUT_TOKENS
 
     assert run_reading_eval.EXACT_INPUT_LIMIT == 12_000
     assert run_reading_eval.AGENT_FINAL_INPUT_LIMIT == MAX_EXACT_INPUT_TOKENS
@@ -826,88 +825,6 @@ def test_static_configuration_freezes_optional_nonofficial_metric(tmp_path):
         )
 
 
-def test_static_configuration_pins_integrated_agent_limits_and_primary_arms(tmp_path):
-    manifest = {
-        "files": {"inputs.jsonl": {"sha256": "a" * 64}},
-        "cases": [{"case_id": f"case-{index}"} for index in range(24)],
-    }
-    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-
-    static = run_reading_eval.static_configuration(
-        tmp_path,
-        manifest,
-        selected_case_ids=[f"case-{index}" for index in range(24)],
-        selected_arms=["fixed-rag-reranked", "single-agent"],
-    )
-
-    assert static["run_selection"]["arms"] == ["fixed-rag-reranked", "single-agent"]
-    assert static["runner_version"] == "frozen-reading-eval-v31-batch-declared"
-    assert static["agent"]["architecture_by_arm"] == {
-        "fixed-rag-reranked": "fixed_hybrid_retrieval_then_one_structured_answer",
-        "single-agent": "single_agent_navigation_then_shared_answer_writer",
-    }
-    assert static["retrieval"]["reranker"] is True
-    assert static["agent"]["resource_profiles_by_arm"]["fixed-rag-reranked"] == {
-        "model_calls_per_case_max": 1,
-        "data_tool_events_per_case_max": 0,
-        "total_input_tokens_per_case_max": 12_000,
-        "total_output_tokens_per_case_max": 3_072,
-        "initial_evidence": "shared_hybrid_then_rerank",
-    }
-    integrated = static["agent"]["resource_profiles_by_arm"]["single-agent"]
-    assert integrated["model_call_limit_per_case"] is None
-    assert integrated["common_writer_calls_per_case"] == 1
-    assert integrated["call_input_tokens_max"] == 12_000
-    assert integrated["call_output_tokens_max"] == 3_072
-    assert integrated["data_tool_event_limit_per_case"] is None
-    assert integrated["total_input_tokens_per_case_limit"] is None
-    assert integrated["total_output_tokens_per_case_limit"] is None
-    assert integrated["case_deadline_seconds"] == 600
-    assert static["agent"]["shared_budget_by_arm"]["single-agent"] is True
-    assert "delegated-agent" not in static["run_selection"]["arms"]
-    assert static["answer_call_budget"] == {
-        "cases": 24,
-        "per_case_model_call_limit_by_arm": {"fixed-rag-reranked": 1, "single-agent": None},
-        "single_agent_per_case_call_limit": None,
-        "case_deadline_seconds": 600,
-        "batch_generation_dispatch_limit": "frozen_global_and_phase_ledgers",
-    }
-
-
-def test_three_workflow_static_budget_is_bounded_before_execution(tmp_path):
-    manifest = {"files": {"inputs.jsonl": {"sha256": "a" * 64}}, "cases": []}
-    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    arms = ["fixed-rag-reranked", "fixed-rag-followup-once", "single-agent"]
-
-    static = run_reading_eval.static_configuration(
-        tmp_path,
-        manifest,
-        selected_case_ids=[f"case-{index}" for index in range(24)],
-        selected_arms=arms,
-    )
-
-    assert static["answer_call_budget"] == {
-        "cases": 24,
-        "per_case_model_call_limit_by_arm": {
-            "fixed-rag-reranked": 1,
-            "fixed-rag-followup-once": 2,
-            "single-agent": None,
-        },
-        "single_agent_per_case_call_limit": None,
-        "case_deadline_seconds": 600,
-        "batch_generation_dispatch_limit": "frozen_global_and_phase_ledgers",
-    }
-    assert static["retrieval"]["reranker"] is True
-
-    with pytest.raises(ValueError, match="24-case development ceiling"):
-        run_reading_eval.static_configuration(
-            tmp_path,
-            manifest,
-            selected_case_ids=[f"case-{index}" for index in range(25)],
-            selected_arms=arms,
-        )
-
-
 def test_quality_v1_static_budget_accounts_for_the_shared_planner(tmp_path):
     manifest = {
         "files": {"inputs.jsonl": {"sha256": "a" * 64}},
@@ -983,7 +900,7 @@ def test_quality_comparison_can_freeze_shared_initial_reranking(tmp_path):
             tmp_path,
             manifest,
             selected_case_ids=[f"case-{index}" for index in range(72)],
-            selected_arms=["fixed-rag", "single-agent"],
+            selected_arms=["fixed-rag", "fixed-rag-reranked"],
             shared_initial_reranker=True,
         )
 
@@ -1288,26 +1205,6 @@ def test_declared_batch_budget_uses_its_own_approved_phase_ledger(tmp_path):
         == "regression_answers"
     )
 
-    single_agent_run = batch_root / "development" / "agent-six"
-    selection = {
-        "run_selection": {
-            "arms": ["single-agent"],
-            "case_ids": ["case-1", "case-2", "case-3"],
-        }
-    }
-    (single_agent_run / "single-agent" / ".attempts").mkdir(parents=True)
-    (single_agent_run / "single-agent" / ".attempts" / "case-3.json").write_text("{}")
-    assert (
-        run_reading_eval._remaining_quality_writer_reservation(
-            single_agent_run,
-            selection,
-            current_arm="single-agent",
-            current_case_id="case-1",
-            current_case_remaining_calls=1,
-        )
-        == 2
-    )
-
 
 def _open_batch(batch_root, revision, limits):
     batch_root.mkdir(parents=True, exist_ok=True)
@@ -1427,27 +1324,6 @@ def test_eval_top_k_keeps_full_source_mapping_for_selected_chunks():
     assert limited.context_groups == (groups[0],)
     assert [hit.block.block_id for hit in limited.hits] == list(groups[0].source_block_ids)
     assert [hit.rank for hit in limited.hits] == [1, 2]
-
-
-def test_static_configuration_records_no_tools_same_context_diagnostic(tmp_path):
-    manifest = {"files": {"inputs.jsonl": {"sha256": "a" * 64}}, "cases": []}
-    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-
-    static = run_reading_eval.static_configuration(
-        tmp_path,
-        manifest,
-        selected_case_ids=["exposed-case"],
-        selected_arms=["fixed-rag", "single-agent-no-tools"],
-    )
-
-    assert static["agent"]["architecture_by_arm"]["single-agent-no-tools"] == (
-        "single_agent_structured_answer_over_frozen_initial_evidence"
-    )
-    profile = static["agent"]["resource_profiles_by_arm"]["single-agent-no-tools"]
-    assert profile["model_calls_per_case_max"] == 1
-    assert profile["data_tool_events_per_case_max"] == 0
-    assert static["agent"]["shared_budget_by_arm"]["single-agent-no-tools"] is True
-    assert static["run_selection"]["arms"] == ["fixed-rag", "single-agent-no-tools"]
 
 
 def test_static_configuration_pins_selected_generator_bundle(tmp_path, monkeypatch):
@@ -1721,7 +1597,7 @@ def test_nonofficial_normalization_is_frozen_and_applies_to_both_arms(tmp_path):
         {"case_id": "cross", "language": "en", "source_language": "zh-Hant"},
     ]
     gold = [{"case_id": case["case_id"], "answers": ["厦门大学。"]} for case in cases]
-    arms = ("fixed-rag", "single-agent")
+    arms = ("fixed-rag", "decomposition-agent")
     for arm in arms:
         directory = tmp_path / arm
         directory.mkdir()
@@ -1883,7 +1759,7 @@ def test_prepared_checkpoint_reuses_only_verified_artifacts(
         },
         "run_selection": {
             "case_ids": ["one"],
-            "arms": ["fixed-rag-reranked", "single-agent"],
+            "arms": ["fixed-rag-reranked", "decomposition-agent"],
         },
         "answer": {"default_contract": "new-shared-writer"},
         "agent": {"architecture": "navigation-then-writer", "call_limit": 6},
@@ -1895,7 +1771,7 @@ def test_prepared_checkpoint_reuses_only_verified_artifacts(
         "dataset_manifest_sha256": "previous-manifest",
         "run_selection": {
             "case_ids": ["one"],
-            "arms": ["fixed-rag-reranked", "fixed-rag-followup-once", "single-agent"],
+            "arms": ["fixed-rag-reranked", "fixed-rag-followup-once", "decomposition-agent"],
         },
         "answer": {"default_contract": "old-writer"},
         "agent": {"architecture": "old-navigation", "call_limit": 8},
@@ -2358,14 +2234,14 @@ def test_embedding_startup_guard_failure_records_exception_sample(tmp_path):
     assert record["gpu_trace"]["last_gpu_sample"] == StartupGuardError.sample
 
 
-@pytest.mark.parametrize("arms", [("fixed-rag",), ("fixed-rag", "single-agent")])
+@pytest.mark.parametrize("arms", [("fixed-rag",), ("fixed-rag", "decomposition-agent")])
 def test_score_run_compares_only_selected_arms_and_labels_case_scope(tmp_path, arms):
     case_id = "longbench-v2-case"
     manifest = {"cases": [{"case_id": case_id, "dataset": "longbench-v2-single-document-qa"}]}
     manifest["files"] = {"inputs.jsonl": {"rows": 24}}
     inputs = [{"case_id": case_id}]
     gold = [{"case_id": case_id, "answer": "B"}]
-    for arm, answer in (("fixed-rag", "B"), ("single-agent", "A")):
+    for arm, answer in (("fixed-rag", "B"), ("decomposition-agent", "A")):
         arm_dir = tmp_path / arm
         arm_dir.mkdir()
         (arm_dir / f"{case_id}.json").write_text(
@@ -2411,9 +2287,9 @@ def test_score_run_compares_only_selected_arms_and_labels_case_scope(tmp_path, a
         ]
         == 1.0
     )
-    if "single-agent" in arms:
+    if "decomposition-agent" in arms:
         assert (
-            result["arms"]["single-agent"]["datasets"]["longbench-v2-single-document-qa"][
+            result["arms"]["decomposition-agent"]["datasets"]["longbench-v2-single-document-qa"][
                 "metrics"
             ]["accuracy"]
             == 0.0
@@ -2692,7 +2568,7 @@ def test_official_longbench_keeps_healthy_client_but_stops_on_fatal_failure(
     assert result["remaining_slots"] == (0 if failure_kind == "output_limit" else 1)
 
 
-@pytest.mark.parametrize("arms", [("fixed-rag",), ("fixed-rag", "single-agent")])
+@pytest.mark.parametrize("arms", [("fixed-rag",), ("fixed-rag", "decomposition-agent")])
 def test_score_run_reports_missing_and_interrupted_slots_only_for_selected_arms(tmp_path, arms):
     for arm in arms:
         arm_dir = tmp_path / arm
@@ -2726,7 +2602,7 @@ def test_score_run_reports_missing_and_interrupted_slots_only_for_selected_arms(
     assert not (tmp_path / "scores.json").exists()
 
 
-@pytest.mark.parametrize("arms", [("fixed-rag",), ("fixed-rag", "single-agent")])
+@pytest.mark.parametrize("arms", [("fixed-rag",), ("fixed-rag", "decomposition-agent")])
 @pytest.mark.parametrize("wrong_field", ["arm", "case_id"])
 def test_score_run_selected_arms_retain_raw_identity_checks(tmp_path, arms, wrong_field):
     arm_dir = tmp_path / arms[-1]
@@ -2793,264 +2669,6 @@ def test_task_format_override_is_explicit_and_validated():
     assert run_reading_eval._answer_format_for({"dataset": "longbench-v1-qmsum"}) == "general"
     with pytest.raises(ValueError, match="frozen task_format"):
         run_reading_eval._answer_format_for({"dataset": "qasper", "task_format": "summary"})
-
-
-@pytest.mark.parametrize(
-    ("arm", "guard_failure"),
-    [
-        ("repair-once", False),
-        ("reading-agent", False),
-        ("delegated-reading-agent", False),
-        ("reading-agent", True),
-    ],
-)
-def test_review_arms_share_product_flow_and_account_every_stage(
-    tmp_path, monkeypatch, arm, guard_failure
-):
-    from pydantic import BaseModel
-
-    import page_cite_rag.agent as agent_module
-    import page_cite_rag.review as review_module
-    from page_cite_rag.generation import (
-        ChatMessage,
-        GenerationConfig,
-        GenerationResult,
-        GenerationStats,
-        PromptBudget,
-    )
-    from page_cite_rag.ingest import prepare_source
-    from page_cite_rag.retrieval import SearchHit, SearchResult
-    from page_cite_rag.workflows import AnswerResult
-
-    source = tmp_path / "source.md"
-    source.write_text("# Method\n\nUse only under condition A.\n", encoding="utf-8")
-    prepared = prepare_source(source, usage_scope="self-authored-test")
-    store = SQLiteDocumentStore(tmp_path / "documents.sqlite3")
-    store.ingest(prepared.document, prepared.iter_units())
-    block = store.get_blocks(prepared.document.document_id)[1]
-    question = "Which conditions apply?"
-    search = SearchResult(
-        document_id=block.document_id,
-        index_id="test-index",
-        method="hybrid",
-        query=question,
-        hits=(SearchHit(rank=1, score=1.0, block=block),),
-        elapsed_ms=1.0,
-    )
-    config = GenerationConfig(num_predict=1536)
-    budget = PromptBudget(1124, 1536, 16384, "exact-test", 100)
-    stats = GenerationStats(
-        prompt_eval_count=100,
-        eval_count=10,
-        total_duration=0,
-        load_duration=None,
-        prompt_eval_duration=0,
-        eval_duration=0,
-        done_reason="stop",
-        elapsed_ms=1.0,
-    )
-    staged_instances = []
-
-    class FakeStagedSearch:
-        def __init__(self, *_args, **_kwargs):
-            self.active = False
-            self.session_calls = 0
-            self.last_trace = {}
-            staged_instances.append(self)
-
-        @contextmanager
-        def session(self):
-            self.session_calls += 1
-            self.active = True
-            try:
-                yield self
-            finally:
-                self.active = False
-
-    class WriterValue(BaseModel):
-        text: str
-
-    class FakeModel:
-        identity = {"model": "scripted-test"}
-
-        def __init__(self, *_args, **_kwargs):
-            self.config = config
-            self.call_count = 0
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            pass
-
-        def prepare_budget(self, *_args):
-            return budget
-
-        def generate(self, _messages, response_model):
-            assert staged_instances[-1].active
-            self.call_count += 1
-            is_checker = response_model is review_module.SourceReview
-            value = (
-                review_module.SourceReview(verdict="supported", needs_reading=False, issues=())
-                if is_checker
-                else WriterValue(text="source-backed answer")
-            )
-            raw = f"{'checker' if is_checker else 'answer'}-{self.call_count}"
-            return GenerationResult(value, stats, budget, raw)
-
-        def diagnostics(self):
-            return {"guard_error": "gpu_thermal_slowdown"} if guard_failure else {}
-
-    @contextmanager
-    def fake_local_chat(model):
-        assert isinstance(model, run_reading_eval._CountingModelClient)
-        yield object()
-
-    observed = []
-
-    def shared_review(workflow, original_question, **kwargs):
-        observed.append(kwargs)
-        assert original_question == question
-        assert kwargs["initial_blocks"] == (block,)
-        if guard_failure:
-            workflow._model.generate(
-                (ChatMessage(role="user", content="actual stage input"),), WriterValue
-            )
-            failed_navigation = {
-                "agent_input_tokens_exact": 40,
-                "model_call_records": [
-                    {
-                        "status": "not_dispatched_cooldown_failed",
-                        "input_tokens_exact": 40,
-                    }
-                ],
-                "cooldown_error_type": "ModelError",
-            }
-            failure = agent_module.AgentRunFailure("ModelError", failed_navigation)
-            raise review_module.ReviewRunFailure(
-                failure, {"failed_stage_trace": failed_navigation, "stages": []}
-            ) from failure
-        for schema in (WriterValue, review_module.SourceReview) * 2:
-            workflow._model.generate(
-                (ChatMessage(role="user", content="actual stage input"),), schema
-            )
-        navigation = None
-        if arm != "repair-once":
-            navigation = {
-                "agent_input_tokens_exact": 80,
-                "agent_output_tokens_observed": 10,
-                "agent_output_tokens_reserved": 10,
-                "model_call_records": [
-                    {
-                        "status": "completed",
-                        "input_tokens_exact": 40,
-                        "output_tokens_observed": 5,
-                        "elapsed_ms": 1.0,
-                    }
-                    for _ in range(2)
-                ],
-                "selected_block_ids": [block.block_id],
-            }
-        result = AnswerResult(
-            document_id=block.document_id,
-            mode="local",
-            question=question,
-            language="en",
-            status="insufficient_evidence",
-            answer="Source does not establish the complete answer.",
-            answer_claims=(),
-            detail_claims=(),
-            limitations=(),
-            included_block_ids=(block.block_id,),
-            omitted_block_ids=(),
-            stop_reason="model_insufficient_evidence",
-            retrieval=None,
-            generation_stats=stats,
-            model_identity=workflow._model.identity,
-            budget=budget,
-            elapsed_ms=1.0,
-        )
-        return review_module.ReviewedAnswer(result, {"agent": navigation, "stages": []})
-
-    case = {
-        "case_id": "review-case",
-        "dataset": "qasper",
-        "question": question,
-        "language": "en",
-        "task_format": "general",
-    }
-    static = {
-        "run_selection": {"arms": [arm]},
-        "answer": {
-            "prompt_revisions_by_arm": {arm: "contract-consistent"},
-            "sampling_profile": "greedy",
-        },
-    }
-    preflight_case = {
-        "admitted_block_ids": [block.block_id],
-        "omitted_block_ids": [],
-        "retrieved_block_ids": [block.block_id],
-        "prompt_budget_admitted_block_ids": [block.block_id],
-        "exact_final_input_tokens": 100,
-    }
-    (tmp_path / "preflight.json").write_text(
-        json.dumps(
-            {
-                "static_configuration_sha256": run_reading_eval.canonical_hash(static),
-                "generator_identity": FakeModel.identity,
-                "cases": {
-                    "review-case": {"by_prompt_revision": {"contract-consistent": preflight_case}}
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(run_reading_eval, "LlamaModelClient", FakeModel)
-    monkeypatch.setattr(run_reading_eval, "_llama_config", lambda _static: config)
-    monkeypatch.setattr(run_reading_eval, "StagedGpuSearch", FakeStagedSearch)
-    monkeypatch.setattr(
-        run_reading_eval,
-        "_load_prepared",
-        lambda *_: (
-            store,
-            {
-                "review-case": {
-                    "document_id": block.document_id,
-                    "result": search.model_dump(mode="json"),
-                }
-            },
-        ),
-    )
-    monkeypatch.setattr(agent_module, "local_chat_model", fake_local_chat)
-    monkeypatch.setattr(review_module, "answer_with_review", shared_review)
-
-    inputs = [case, {**case, "case_id": "next-case"}] if guard_failure else [case]
-    outcome = run_reading_eval._run_arm(tmp_path, static, inputs, arm, None)
-
-    raw = json.loads((tmp_path / arm / "review-case.json").read_text(encoding="utf-8"))
-    assert observed[0]["strategy"] == run_reading_eval.REVIEW_ARMS[arm]
-    assert staged_instances[0].session_calls == 1
-    assert not staged_instances[0].active
-    if guard_failure:
-        assert outcome["successful_slots_this_invocation"] == 0
-        assert outcome["stopped"] == "gpu_guard_stopped"
-        assert outcome["remaining_slots"] == 1
-        assert not (tmp_path / arm / ".attempts" / "next-case.json").exists()
-        assert raw["failure"]["reading_trace"]["failed_stage_trace"]
-        assert raw["completion_calls_attempted"] == 1
-        assert raw["input_tokens_lower_bound"] == 100
-        assert raw["output_tokens_lower_bound"] == 10
-        return
-    assert outcome["successful_slots_this_invocation"] == 1
-    assert len(raw["structured_generation_records"]) == 4
-    assert raw["structured_generation_records"][0]["messages"][0]["content"] == "actual stage input"
-    assert raw["structured_generation_records"][-1]["raw_model_output"] == "checker-4"
-    assert raw["raw_model_output"] == "answer-3"
-    assert raw["completion_calls_attempted"] == (4 if arm == "repair-once" else 6)
-    assert raw["input_tokens_lower_bound"] == (400 if arm == "repair-once" else 480)
-    assert raw["output_tokens_lower_bound"] == (40 if arm == "repair-once" else 50)
-    assert raw["output_usage_unknown"] is False
-    assert raw["reading_trace"] is not None
 
 
 def test_official_summary_track_scores_visible_details_and_not_metadata(tmp_path):
