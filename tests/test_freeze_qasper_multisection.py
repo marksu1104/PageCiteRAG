@@ -57,3 +57,30 @@ def test_selection_refuses_a_count_the_split_cannot_supply():
             count=2,
             seed="42",
         )
+
+
+def test_no_answer_selection_keeps_only_questions_every_annotator_found_unanswerable():
+    def question(qid, *unanswerable):
+        return Question(qid, "What?", tuple(Annotation(flag, ()) for flag in unanswerable))
+
+    passages = (Passage("x-a", 0, 0, "Text."),)
+    papers = [
+        Paper("p1", passages, (question("q1", True, True), question("q2", True, False))),
+        Paper("p2", passages, (question("q3", True, False),)),
+        Paper("p3", passages, (question("q4", True),)),
+    ]
+    selected, eligible_questions, _ = freeze.select_cases(
+        papers, exposed={"p3"}, reserved=frozenset(), count=1, seed="42", stratum="no-answer"
+    )
+    assert eligible_questions == 1 and selected[0][2].question_id == "q1"
+    # A development set draws only from papers already seen.
+    seen, _, _ = freeze.select_cases(
+        papers,
+        exposed={"p3"},
+        reserved=frozenset(),
+        count=1,
+        seed="42",
+        stratum="no-answer",
+        exposure="exposed",
+    )
+    assert seen[0][2].question_id == "q4"

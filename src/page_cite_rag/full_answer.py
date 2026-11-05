@@ -1390,26 +1390,22 @@ class FullAnswerWorkflow(AnswerWorkflow):
                     strict=True,
                 )
             draft = FullAnswerDraft.model_validate(draft.model_dump(warnings=False), strict=True)
-            answer_claims = tuple(
-                SpanClaimDraft(
+            removed = 0
+
+            def span_claim(claim):
+                nonlocal removed
+                source_ids = list(dict.fromkeys(citation.source_id for citation in claim.citations))
+                removed += len(claim.citations) - len(source_ids)
+                return SpanClaimDraft(
                     text=claim.text,
                     citations=tuple(
-                        SpanCitationDraft(span_id=available[citation.source_id].span_id)
-                        for citation in claim.citations
+                        SpanCitationDraft(span_id=available[source_id].span_id)
+                        for source_id in source_ids
                     ),
                 )
-                for claim in draft.answer_claims
-            )
-            detail_claims = tuple(
-                SpanClaimDraft(
-                    text=claim.text,
-                    citations=tuple(
-                        SpanCitationDraft(span_id=available[citation.source_id].span_id)
-                        for citation in claim.citations
-                    ),
-                )
-                for claim in draft.detail_claims
-            )
+
+            answer_claims = tuple(span_claim(claim) for claim in draft.answer_claims)
+            detail_claims = tuple(span_claim(claim) for claim in draft.detail_claims)
             claims = answer_claims + detail_claims
             mapped = _VerifiedAnswerSpanDraft(
                 status="answered" if claims else "insufficient_evidence",
@@ -1430,4 +1426,5 @@ class FullAnswerWorkflow(AnswerWorkflow):
         return verified, {
             "answer_claims": verified[:answer_count],
             "detail_claims": verified[answer_count:],
+            "citation_duplicates_removed": removed,
         }

@@ -626,6 +626,30 @@ def _fake_routed_answer(events=None):
     return answer
 
 
+@pytest.mark.parametrize("skipped", [0, 7])
+def test_route_reports_sources_skipped_at_the_read_limit(capsys, skipped):
+    cli._print_route(
+        {
+            "route": "whole_document",
+            "reason": "requested",
+            "reading_summary": {
+                "sections_chosen": [],
+                "sections_from_search": [],
+                "sections_followed_up": [],
+                "notes": 0,
+                "notes_not_in_answer": 0,
+                "model_calls": 2,
+                "elapsed_seconds": 1,
+                "navigation_degraded": False,
+                "sources_skipped_for_read_limit": skipped,
+            },
+        }
+    )
+    text = capsys.readouterr().out
+    assert ("7 source passages were skipped" in text) is (skipped > 0)
+    assert ("reading call limit" in text) is (skipped > 0)
+
+
 def test_auto_route_cli_answers_through_the_shared_entry_and_reports_it(
     document, clients, monkeypatch, capsys
 ):

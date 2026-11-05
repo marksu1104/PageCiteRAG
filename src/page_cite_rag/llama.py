@@ -319,7 +319,9 @@ class LlamaModelClient:
         except BaseException as error:
             self.close()
             if isinstance(error, ModelError):
-                error.diagnostics = self.diagnostics(include_log=True)
+                error.diagnostics = self.diagnostics(
+                    include_log="server_failure_log_tail" not in self._diagnostic
+                )
             raise
 
     def _file_state(self, manifest: dict) -> dict:
@@ -632,7 +634,34 @@ class LlamaModelClient:
             raise self._guard_error
         if self._process is None or self._process.poll() is not None:
             self._capture_process_status()
-            raise ModelError("owned llama server exited; no automatic restart")
+            self._capture_log_tail()
+            # Only recognized runtime messages belong in automatic failure details.
+            # Prompt/output dumps and their unprefixed continuation lines are omitted;
+            # the existing raw log remains available only through include_log=True.
+            tail = "\n".join(
+                line
+                for line in self._server_log_tail.splitlines()
+                if re.match(
+                    r"^(?:time=\S+ level=\w+ source=\S+ |ggml_|llama_|srv |"
+                    r"main: |common_|load_|Error: |panic: |fatal error: )",
+                    line,
+                )
+                and not re.search(
+                    r"(?i)\b(?:prompt|response|content|text|tokens?|piece|input|output)\b|"
+                    r"<\||\|>|[{}]|\\[nr]",
+                    line,
+                )
+            )
+            with self._diagnostic_lock:
+                self._diagnostic["server_failure_log_tail"] = tail
+            self._record_request_error("server_exited")
+            error = ModelError(
+                # query.py stops on this exact phrase; keep it when changing the message.
+                "owned llama server exited; no automatic restart"
+                + (f"\nServer log tail:\n{tail}" if tail else "")
+            )
+            error.diagnostics = self.diagnostics()
+            raise error
 
     def _request(self, path: str, payload: dict | None = None, *, allow_loading=False) -> dict:
         import httpx
@@ -715,6 +744,11 @@ class LlamaModelClient:
             if expired.is_set():
                 self._record_request_error("timeout")
                 raise ModelTimeoutError("local llama generation exceeded its time budget") from None
+            try:
+                self._ensure_running()
+            except ModelError as error:
+                self._record_request_error("server_exited")
+                raise error from None
             self._record_request_error("connection")
             raise ModelError("local llama response or connection failed; no retry") from None
         except (ValueError, UnicodeError):

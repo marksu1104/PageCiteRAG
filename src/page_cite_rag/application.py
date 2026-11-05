@@ -448,6 +448,7 @@ def answer_question(
             "sections_followed_up": named("follow_up_section_ids"),
             "notes": agent.get("reading_point_count", 0),
             "notes_not_in_answer": coverage.get("uncovered", 0),
+            "sources_skipped_for_read_limit": agent.get("sources_skipped_for_read_limit", 0),
             # The scoped planner call plus every reading and writer call.
             "model_calls": 1 + (agent.get("model_calls_attempted") or 0),
             "navigation_degraded": agent.get("navigation_degraded", False),

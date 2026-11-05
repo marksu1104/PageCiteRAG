@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import httpx
@@ -23,7 +24,9 @@ class Output(BaseModel):
     answer: str
 
 
-def make_ollama(tmp_path, monkeypatch, *, blob_sha=None, ps=None, generated=None, tokens=30):
+def make_ollama(
+    tmp_path, monkeypatch, *, blob_sha=None, ps=None, generated=None, tokens=30, exit_on_start=False
+):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "fake-model").write_bytes(b"fake weights")
@@ -45,10 +48,24 @@ def make_ollama(tmp_path, monkeypatch, *, blob_sha=None, ps=None, generated=None
     )
     lifecycle = {"returncode": None, "stops": 0}
     monkeypatch.setattr(
-        ollama_backend,
-        "launch_owned_llama_process",
-        lambda *args, **kwargs: SimpleNamespace(pid=12345, poll=lambda: lifecycle["returncode"]),
+        ollama_backend.socket,
+        "socket",
+        lambda: nullcontext(
+            SimpleNamespace(bind=lambda _: None, getsockname=lambda: ("127.0.0.1", 12345))
+        ),
     )
+
+    def launch(*args, **kwargs):
+        if exit_on_start:
+            kwargs["stdout"].write(
+                b'time=now level=ERROR source=server.go:1 msg="runner startup failed"\n'
+                b"private document continuation\n"
+            )
+            kwargs["stdout"].flush()
+            lifecycle["returncode"] = 17
+        return SimpleNamespace(pid=12345, poll=lambda: lifecycle["returncode"])
+
+    monkeypatch.setattr(ollama_backend, "launch_owned_llama_process", launch)
     monkeypatch.setattr(ollama_backend, "register_owned_gpu_process", lambda process: None)
 
     def terminate(self):
@@ -165,3 +182,30 @@ def test_ollama_rejects_a_resident_context_other_than_configured(tmp_path, monke
     ps = {"name": NAME, "context_length": 4096, "size": 100, "size_vram": 0}
     with pytest.raises(ModelError, match="context differs"):
         make_ollama(tmp_path, monkeypatch, ps=ps)
+
+
+def test_ollama_startup_exit_keeps_safe_log_after_temporary_directory_cleanup(
+    tmp_path, monkeypatch
+):
+    with pytest.raises(ModelError, match="runner startup failed") as caught:
+        make_ollama(tmp_path, monkeypatch, exit_on_start=True)
+    snapshot = caught.value.diagnostics
+    assert snapshot["closed"]
+    assert snapshot["exit_code_before_termination"] == 17
+    assert "runner startup failed" in snapshot["server_failure_log_tail"]
+    assert "private" not in json.dumps(snapshot)
+    assert "private" not in str(caught.value)
+
+
+def test_ollama_exit_before_first_dispatch_keeps_log_without_restart(tmp_path, monkeypatch):
+    client, calls, lifecycle = make_ollama(tmp_path, monkeypatch)
+    client._log.write(b"ggml_cuda_init: CUDA driver initialization failed\n")
+    client._log.flush()
+    lifecycle["returncode"] = 17
+    with pytest.raises(ModelError, match="CUDA driver initialization failed") as caught:
+        client.generate(MESSAGES, Output)
+    client.close()
+    assert "CUDA driver initialization failed" in client.diagnostics()["server_failure_log_tail"]
+    assert caught.value.diagnostics["exit_code_before_termination"] == 17
+    assert not [p for path, p in calls if path == "/api/generate" and p.get("prompt")]
+    assert client.diagnostics()["closed"]

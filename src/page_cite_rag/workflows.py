@@ -250,6 +250,9 @@ class AnswerResult(BaseModel):
     retrieval: RetrievalTrace | None
     generation_stats: GenerationStats | None
     agent_usage: AgentUsage | None = None
+    # Exact repeats of one source within one claim, dropped before citation checks; the
+    # claim's support is unchanged, so one repeated reference no longer voids the answer.
+    citation_duplicates_removed: int = Field(default=0, ge=0)
     model_identity: dict
     prompt_version: Literal[
         "complete-cited-answer-v1",

@@ -58,6 +58,7 @@ class _Model:
         self.partial = False
         self.invalid_selection_id = False
         self.duplicate_selection_id = False
+        self.repeat_answer_citation = False
         self.select_last = False
         self.seen_requests = []
         self.fail_at = None
@@ -120,7 +121,14 @@ class _Model:
                 "answer_claims": [
                     {
                         "text": "The result rose by 42% only under condition A.",
-                        "citations": [{"source_id": item["source_id"]} for item in evidence[:2]],
+                        "citations": [
+                            {"source_id": item["source_id"]}
+                            for item in (
+                                [evidence[0], *evidence[:2]]
+                                if self.repeat_answer_citation
+                                else evidence[:2]
+                            )
+                        ],
                     },
                 ],
                 "detail_claims": [
@@ -899,3 +907,30 @@ def test_completed_answer_can_include_a_scope_note_without_changing_status(answe
     draft.update(status="partial", limitations=[])
     with pytest.raises(ValueError):
         model.model_validate_json(json.dumps(draft))
+
+
+def test_a_source_repeated_within_one_claim_is_cited_once_and_counted(tmp_path):
+    path = tmp_path / "paper.txt"
+    path.write_text("The result rose by 42%.\n\nOnly under condition A.\n", encoding="utf-8")
+    prepared = prepare_source(path)
+    store = SQLiteDocumentStore(tmp_path / "paper.sqlite3")
+    store.ingest(prepared.document, prepared.iter_units())
+    blocks = store.get_blocks(prepared.document.document_id)
+    config = GenerationConfig(num_ctx=16384, num_predict=1536)
+    model = _Model(config)
+    model.repeat_answer_citation = True
+    workflow = FullAnswerWorkflow(
+        SQLiteDocumentStore(store.database_path, read_only=True),
+        prepared.document.document_id,
+        _Retriever(prepared.document.document_id, blocks),
+        model,
+        config,
+    )
+    result = workflow.ask("How much, and under what condition?")
+    # The model cited S1 twice in one claim; the answer stands with S1 cited once.
+    assert result.status == "answered"
+    assert [c.quote[:14] for c in result.answer_claims[0].citations] == [
+        "The result ros",
+        "Only under con",
+    ]
+    assert result.citation_duplicates_removed == 1

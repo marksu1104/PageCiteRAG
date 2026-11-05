@@ -747,6 +747,11 @@ def _print_route(trace: dict) -> None:
         "cited in the answer (see --format json); notes are unverified, citations are checked."
     )
     print(f"Model calls: {summary['model_calls']}; elapsed {summary['elapsed_seconds']} s.")
+    if skipped := summary.get("sources_skipped_for_read_limit", 0):
+        print(
+            f"Note: {skipped} source passages were skipped "
+            "because the reading call limit was reached."
+        )
     if summary["navigation_degraded"]:
         print("Note: section reading stopped early; the answer may be incomplete.")
 

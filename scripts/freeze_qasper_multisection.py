@@ -1,5 +1,9 @@
 """Freeze QASPER questions whose human-annotated evidence spans two or more sections.
 
+``--stratum no-answer`` instead freezes questions every annotator marked unanswerable
+(plan 5.17), to check that answering more often does not turn refusals into guesses.
+``--exposure exposed`` draws only from papers already seen, for development sets.
+
 Plan 5.10 step 4. The validation split was exposed during development, so this reads a
 local, pinned QASPER split (``train`` by default; no model is trained, and the
 annotations are human-made in every split). Papers seen in any ``outputs`` artifact and
@@ -17,6 +21,7 @@ import os
 import sys
 import tempfile
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,14 +35,29 @@ prepare = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(prepare)
 
 
-def select_cases(papers, exposed: set[str], reserved: frozenset[str], count: int, seed: str):
+def select_cases(
+    papers,
+    exposed: set[str],
+    reserved: frozenset[str],
+    count: int,
+    seed: str,
+    *,
+    stratum: str = "multi-section",
+    exposure: str = "unexposed",
+):
     candidates = []
     for paper in papers:
-        if paper.paper_id in exposed or paper.paper_id in reserved or not paper.passages:
+        seen = paper.paper_id in exposed
+        if (seen != (exposure == "exposed")) or paper.paper_id in reserved or not paper.passages:
             continue
         section_of = {passage.passage_id: passage.section_index for passage in paper.passages}
         for question in paper.questions:
             if not question.annotations:
+                continue
+            if stratum == "no-answer":
+                if all(annotation.unanswerable for annotation in question.annotations):
+                    rank = prepare._rank("qasper", question.question_id, seed=seed)
+                    candidates.append((rank, paper, question, None, 0))
                 continue
             alignment = align_question(paper, question)
             if alignment.exclusion_reason or not alignment.gold_passage_ids:
@@ -64,6 +84,10 @@ def main() -> int:
     parser.add_argument("--qasper-data-dir", type=Path, default=ROOT / "data/qasper")
     parser.add_argument("--split", choices=("train", "validation"), default="train")
     parser.add_argument("--count", type=int, default=48)
+    parser.add_argument(
+        "--stratum", choices=("multi-section", "no-answer"), default="multi-section"
+    )
+    parser.add_argument("--exposure", choices=("unexposed", "exposed"), default="unexposed")
     parser.add_argument("--selection-seed", type=int, default=42)
     parser.add_argument("--exclude-manifest", type=Path, action="append", default=[])
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -81,7 +105,7 @@ def main() -> int:
     exposed = {question_paper.get(value, value) for value in exposed_questions}
     reserved = prepare._reserved_ids(args.exclude_manifest)
     selected, eligible_questions, eligible_papers = select_cases(
-        papers, exposed, reserved, args.count, seed
+        papers, exposed, reserved, args.count, seed, stratum=args.stratum, exposure=args.exposure
     )
     references = read_answer_references(
         args.qasper_data_dir, args.split, {item[2].question_id for item in selected}
@@ -113,11 +137,17 @@ def main() -> int:
         gold.append(
             {
                 "case_id": case_id,
-                "stratum": "multi_section_evidence",
+                "stratum": (
+                    "no_answer" if args.stratum == "no-answer" else "multi_section_evidence"
+                ),
                 "evidence_section_count": sections,
                 "references": [asdict(ref) for ref in references[question.question_id]],
-                "aligned_evidence_passage_ids": list(alignment.gold_passage_ids),
-                "evidence_alignment_issues": list(alignment.annotation_issues),
+                "aligned_evidence_passage_ids": (
+                    list(alignment.gold_passage_ids) if alignment is not None else []
+                ),
+                "evidence_alignment_issues": (
+                    list(alignment.annotation_issues) if alignment is not None else []
+                ),
             }
         )
     input_bytes, gold_bytes = prepare._jsonl_bytes(inputs), prepare._jsonl_bytes(gold)
@@ -128,7 +158,7 @@ def main() -> int:
             "dataset": "qasper",
             "source_id": row["source_id"],
             "language": "en",
-            "previously_exposed": False,
+            "previously_exposed": args.exposure == "exposed",
             "question_sha256": prepare._sha256(row["question"].encode("utf-8")),
             "source_sha256": prepare._sha256(prepare._jsonl_bytes(row["source"]["paragraphs"])),
             "gold_sha256": prepare._canonical_hash(gold_by_id[row["case_id"]]),
@@ -137,16 +167,26 @@ def main() -> int:
     ]
     manifest = {
         "format": "pagecite-reading-eval/v5",
-        "created_date_utc": "2026-11-04",
+        "created_date_utc": datetime.now(timezone.utc).date().isoformat(),
         "seed": args.selection_seed,
         "reserved_ids_excluded": sorted(reserved),
         "state": "frozen_inputs_not_run",
         "handling": "Redistribute QASPER inputs, gold and outputs only as CC-BY-4.0 permits.",
         "selection_policy": {
             "qasper": (
-                f"{args.split} split; exclude papers seen in outputs and reserved manifests; "
-                "keep questions whose aligned human evidence spans >=2 sections; at most one "
-                f"question per paper in seeded hash order; {args.count} cases"
+                f"{args.split} split; "
+                + (
+                    "only papers already seen in outputs"
+                    if args.exposure == "exposed"
+                    else "exclude papers seen in outputs"
+                )
+                + " and reserved manifests; "
+                + (
+                    "keep questions every annotator marked unanswerable"
+                    if args.stratum == "no-answer"
+                    else "keep questions whose aligned human evidence spans >=2 sections"
+                )
+                + f"; at most one question per paper in seeded hash order; {args.count} cases"
             )
         },
         "exposure_scan": {
@@ -155,7 +195,9 @@ def main() -> int:
             "qasper_previously_exposed_papers": len(exposed & {p.paper_id for p in papers}),
             "eligible_questions": eligible_questions,
             "eligible_papers": eligible_papers,
-            "qasper_selected_previously_exposed_cases": 0,
+            "qasper_selected_previously_exposed_cases": (
+                len(cases) if args.exposure == "exposed" else 0
+            ),
         },
         "sources": {
             "qasper": {
@@ -173,7 +215,7 @@ def main() -> int:
             )
         },
         "non_comparability": (
-            f"{args.split}-split multi-section subset; local model, prompt and retrieval; "
+            f"{args.split}-split {args.stratum} subset; local model, prompt and retrieval; "
             "not a leaderboard score"
         ),
         "files": {

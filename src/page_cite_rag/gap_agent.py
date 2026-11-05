@@ -663,8 +663,19 @@ def run_outline_reading(
         nonlocal degraded, read_attempts
         chosen_titles = [name_of(sections[sid]) for sid in chosen]
         for window in _read_windows([sections[sid] for sid in chosen], all_blocks):
-            if degraded or read_attempts >= MAX_SECTION_READ_CALLS:
+            if degraded:
                 return
+            if read_attempts >= MAX_SECTION_READ_CALLS:
+                events.append(
+                    {
+                        "tool": "read_source",
+                        "status": "skipped_read_limit",
+                        "chosen_by": chosen_by,
+                        "section_ids": list(dict.fromkeys(s.section_id for s, _ in window)),
+                        "sources_offered": len(window),
+                    }
+                )
+                continue
             by_source: dict[str, tuple[SourceSection, Block]] = {}
             parts: dict[str, dict] = {}
             for section, block in window:
@@ -939,6 +950,11 @@ def run_outline_reading(
             for finding in kept
         ],
         "marked_block_count": len(by_rank),
+        "sources_skipped_for_read_limit": sum(
+            event["sources_offered"]
+            for event in events
+            if event.get("status") == "skipped_read_limit"
+        ),
         "writer_omitted_marked_block_ids": omitted_marks,
         "tool_trace": events,
         "tool_calls_recorded": len(events),

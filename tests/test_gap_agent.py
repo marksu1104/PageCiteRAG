@@ -725,6 +725,53 @@ def test_without_an_outline_auto_answers_fixed_and_forced_reading_refuses(tmp_pa
         application.answer_question(workflow, question, language="en", route="whole-document")
 
 
+def test_read_limit_records_every_remaining_window_and_reaches_the_summary(tmp_path, monkeypatch):
+    from page_cite_rag import application, gap_agent
+    from page_cite_rag.reading_plan import ReadingNeed, ScopedReadingPlan
+
+    question = "List every finding."
+    workflow, result, blocks, first = _markdown_reading(
+        tmp_path,
+        "# Report\n\n## Part 1\n\nFinding one.\n\n## Part 2\n\nFinding two.\n",
+        question,
+        "## Part 1",
+    )
+    monkeypatch.setattr(gap_agent, "MAX_SECTION_READ_CALLS", 1)
+    monkeypatch.setattr(gap_agent, "MAX_SECTION_WINDOW_CHARS", 1)
+    monkeypatch.setattr(application, "_is_hybrid_retriever", lambda _: True)
+    monkeypatch.setattr(application, "search_with_reading_plan", lambda *_: (result, (first,), {}))
+    monkeypatch.setattr(
+        application,
+        "plan_document_question",
+        lambda *a, **k: ScopedReadingPlan(
+            requirements=(ReadingNeed(need="findings", queries=("findings",)),),
+            scope="whole_document",
+        ),
+    )
+    model = _ScriptedModel(
+        workflow,
+        [lambda p: _section_ids(p, "Part 1", "Part 2"), _mark("## Part 1")],
+        next(iter(_spans((first,)))),
+    )
+    workflow._model = model
+    answer = application.answer_question(workflow, question, language="en")
+    trace = answer.trace["reading"]["agent"]
+    skipped = [e for e in trace["tool_trace"] if e["status"] == "skipped_read_limit"]
+    assert len(skipped) == 3
+    assert all(
+        e["tool"] == "read_source"
+        and e["chosen_by"] == "model_section_selection"
+        and len(e["section_ids"]) == 1
+        and e["sources_offered"] == 1
+        for e in skipped
+    )
+    assert trace["sources_skipped_for_read_limit"] == 3
+    assert answer.trace["reading_summary"]["sources_skipped_for_read_limit"] == 3
+    assert len(model.gap_payloads) == 2  # selection and one read, without continuation
+    assert len(model.writer_payloads) == 1
+    assert answer.result.prompt_version == "agentic-reading-v3"
+
+
 def test_answers_say_when_evidence_had_chat_markers_and_quote_the_original(tmp_path):
     question = "How does the prompt template end a turn?"
     workflow, _result, _blocks, hit = _markdown_reading(

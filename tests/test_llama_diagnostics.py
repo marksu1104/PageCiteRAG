@@ -141,6 +141,57 @@ def test_natural_exit_is_distinct_from_our_termination(tmp_path, monkeypatch):
     assert not state.signals
 
 
+@pytest.mark.parametrize("during_request", [False, True])
+def test_server_exit_retains_filtered_tail_in_diagnostics_and_error(
+    tmp_path, monkeypatch, during_request
+):
+    def fail(request):
+        state.code = 17
+        raise httpx.ReadError("private transport data")
+
+    runtime_line = "ggml_cuda_init: CUDA initialization failed"
+    raw = (
+        "old log\n" * 1000
+        + "srv prompt = private document text\nprivate continuation\n"
+        + 'time=now level=DEBUG source=server.go:1 msg="response" content="private answer"\n'
+        + f"{runtime_line}\n"
+        + "main: Bearer "
+        + "a" * 64
+        + "\n"
+    ).encode()
+    factory, state = make_client(tmp_path, monkeypatch, result=fail, log=raw)
+    client = factory()
+    if not during_request:
+        state.code = 17
+    # query.py treats this exact phrase as a hard stop, so the message must keep it.
+    with pytest.raises(ModelError, match="owned llama server exited") as caught:
+        generate(client)
+    client.close()
+    tail = client.diagnostics()["server_failure_log_tail"]
+    assert runtime_line in tail and "Bearer [REDACTED]" in tail
+    assert len(tail.encode()) <= llama.DIAGNOSTIC_LOG_BYTES
+    assert tail in str(caught.value)
+    assert caught.value.diagnostics["server_failure_log_tail"] == tail
+    assert "private" not in str(caught.value)
+    assert "private" not in json.dumps(caught.value.diagnostics)
+    assert "a" * 64 not in str(caught.value)
+    assert client.diagnostics()["exit_code_before_termination"] == 17
+    assert state.requests.count("/completion") == int(during_request)
+    assert not state.signals
+
+
+def test_exit_log_failure_does_not_hide_server_exit(tmp_path, monkeypatch):
+    factory, state = make_client(tmp_path, monkeypatch)
+    client = factory()
+    client._log.close()
+    state.code = 17
+    with pytest.raises(ModelError, match="exited") as caught:
+        generate(client)
+    assert caught.value.diagnostics["server_failure_log_tail"] == ""
+    client.close()
+    assert client.diagnostics()["closed"]
+
+
 @pytest.mark.parametrize(
     "kind,category,status,error",
     [
@@ -346,7 +397,7 @@ def test_opt_in_log_is_redacted_byte_bounded_and_retained_after_cleanup(tmp_path
     client.close()
     snapshot = client.diagnostics(include_log=True)
     tail = snapshot["server_log_tail"]
-    assert len(tail.encode("utf-8")) <= 8192
+    assert len(tail.encode("utf-8")) <= llama.DIAGNOSTIC_LOG_BYTES
     assert "private backend log" in tail
     assert "Bearer [REDACTED]" in tail
     assert token not in json.dumps(snapshot)
@@ -370,13 +421,17 @@ def test_real_log_tail_read_does_not_move_the_server_file_offset(tmp_path, monke
 def test_redaction_handles_a_key_crossing_the_tail_boundary(tmp_path, monkeypatch):
     token = "a" * 64
     # Later redactions shorten the tail, so a partial key at its start must be removed too.
-    raw = token.encode() + b"x" * 8008 + ("Bearer " + token + "\n").encode() * 3
+    raw = (
+        token.encode()
+        + b"x" * (llama.DIAGNOSTIC_LOG_BYTES - 184)
+        + ("Bearer " + token + "\n").encode() * 3
+    )
     factory, _ = make_client(tmp_path, monkeypatch, log=raw)
     client = factory()
     client.close()
     tail = client.diagnostics(include_log=True)["server_log_tail"]
     assert "a" * 20 not in tail
-    assert len(tail.encode("utf-8")) <= 8192
+    assert len(tail.encode("utf-8")) <= llama.DIAGNOSTIC_LOG_BYTES
 
 
 def test_redaction_handles_an_incomplete_key_at_log_tail_end(tmp_path, monkeypatch):
