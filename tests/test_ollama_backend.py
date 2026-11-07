@@ -56,6 +56,7 @@ def make_ollama(
     )
 
     def launch(*args, **kwargs):
+        lifecycle["env"] = kwargs["env"]
         if exit_on_start:
             kwargs["stdout"].write(
                 b'time=now level=ERROR source=server.go:1 msg="runner startup failed"\n'
@@ -133,6 +134,7 @@ def test_ollama_serves_the_pinned_blob_with_the_rendered_raw_prompt(tmp_path, mo
         assert result.budget.method == ollama_backend.OLLAMA_BUDGET_VERSION
     assert result.value.answer == "not significant"
     assert result.stats.prompt_eval_count == 30
+    assert lifecycle["env"]["OLLAMA_NO_CLOUD"] == "1"
     request = [payload for path, payload in calls if path == "/api/generate"][-1]
     schema = Output.model_json_schema()
     assert request["prompt"] == llama.render_prompt(MESSAGES, schema)

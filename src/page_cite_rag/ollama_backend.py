@@ -126,6 +126,8 @@ class OllamaGgufClient(LlamaModelClient):
                 "OLLAMA_KEEP_ALIVE": "-1",
                 "OLLAMA_FLASH_ATTENTION": "0",
                 "OLLAMA_NOPRUNE": "1",
+                # No cloud models, model recommendations or ollama.com lookups.
+                "OLLAMA_NO_CLOUD": "1",
                 "OLLAMA_CONTEXT_LENGTH": str(self.config.num_ctx),
                 "OMP_NUM_THREADS": str(self.config.num_thread),
                 "CUDA_VISIBLE_DEVICES": self.config.gpu_uuid or "-1",

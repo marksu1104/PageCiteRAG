@@ -67,6 +67,7 @@ def main() -> None:
             "OLLAMA_HOST": f"127.0.0.1:{port}",
             "OLLAMA_MODELS": str(models),
             "OLLAMA_NOPRUNE": "1",
+            "OLLAMA_NO_CLOUD": "1",
             "CUDA_VISIBLE_DEVICES": "-1",
         }
         modelfile = Path(temporary) / "Modelfile"
