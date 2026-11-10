@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
+import time
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -10,7 +12,7 @@ import pytest
 from pydantic import BaseModel
 
 from page_cite_rag import llama, ollama_backend
-from page_cite_rag.generation import ChatMessage, ContextBudgetError, ModelError
+from page_cite_rag.generation import ChatMessage, ContextBudgetError, ModelError, ModelTimeoutError
 
 MESSAGES = (
     ChatMessage(role="system", content="Answer from the source."),
@@ -25,13 +27,25 @@ class Output(BaseModel):
 
 
 def make_ollama(
-    tmp_path, monkeypatch, *, blob_sha=None, ps=None, generated=None, tokens=30, exit_on_start=False
+    tmp_path,
+    monkeypatch,
+    *,
+    blob_sha=None,
+    ps=None,
+    generated=None,
+    tokens=30,
+    exit_on_start=False,
+    first_version_delay=0.0,
+    version_ready=True,
+    startup_seconds=60.0,
 ):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "fake-model").write_bytes(b"fake weights")
     (bundle / "manifest.json").write_text("{}")
-    monkeypatch.setattr(llama, "verify_bundle", lambda *_: {"files": {"fake-model": "test"}})
+    monkeypatch.setattr(
+        ollama_backend, "verify_bundle", lambda *_: {"files": {"fake-model": "test"}}
+    )
     runtime = tmp_path / "runtime"
     (runtime / "bin").mkdir(parents=True)
     (runtime / "bin" / "ollama").write_bytes(b"fake ollama")
@@ -82,6 +96,10 @@ def make_ollama(
         payload = json.loads(request.content) if request.content else None
         calls.append((request.url.path, payload))
         if request.url.path == "/api/version":
+            if sum(path == "/api/version" for path, _ in calls) == 1:
+                time.sleep(first_version_delay)
+            if not version_ready:
+                return httpx.Response(503, json={"error": "initializing"})
             return httpx.Response(200, json={"version": "0.35.0"})
         if request.url.path == "/api/show":
             return httpx.Response(200, json={"modelfile": f"# generated\nFROM {blob}\n"})
@@ -113,7 +131,7 @@ def make_ollama(
             )
         raise AssertionError("unexpected endpoint")
 
-    config = llama.LlamaConfig(bundle_dir=bundle, device="cpu")
+    config = llama.LlamaConfig(bundle_dir=bundle, device="cpu", startup_seconds=startup_seconds)
     client = ollama_backend.OllamaGgufClient(
         config,
         runtime_dir=runtime,
@@ -122,6 +140,46 @@ def make_ollama(
         budget_policy="exact",
     )
     return client, calls, lifecycle
+
+
+def test_ollama_client_starts_from_model_only_bundle_without_llama_server(monkeypatch, tmp_path):
+    weights = b"pinned local gguf"
+    spec = {
+        "repo": "example/qwen35-9b",
+        "revision": "e" * 40,
+        "file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "bytes": len(weights),
+        "sha256": hashlib.sha256(weights).hexdigest(),
+        "layers": 32,
+    }
+    bundle = tmp_path / "model-only"
+    bundle.mkdir()
+    (bundle / spec["file"]).write_bytes(weights)
+    (bundle / "model-manifest.json").write_text(
+        json.dumps(
+            {
+                "format": 1,
+                "model_repo": spec["repo"],
+                "model_revision": spec["revision"],
+                "model_sha256": spec["sha256"],
+                "files": {spec["file"]: spec["sha256"]},
+            }
+        )
+    )
+    monkeypatch.setattr(llama, "model_spec", lambda _size: spec)
+    monkeypatch.setattr(llama.LlamaModelClient, "_capture_process_status", lambda _self: None)
+
+    def start(self, *, transport=None):
+        self._runtime_sha256 = "pinned-runtime-test"
+        self._tokenizer_name = "qwen35-test"
+        self._process = SimpleNamespace(pid=123, poll=lambda: 0)
+
+    monkeypatch.setattr(ollama_backend.OllamaGgufClient, "_start", start)
+    client = ollama_backend.OllamaGgufClient(llama.LlamaConfig(bundle_dir=bundle, device="cpu"))
+
+    assert client.identity["model_sha256"] == spec["sha256"]
+    assert set(client._fingerprints) == {spec["file"], "model-manifest.json"}
+    assert not (bundle / "bin" / "llama-server").exists()
 
 
 def test_ollama_serves_the_pinned_blob_with_the_rendered_raw_prompt(tmp_path, monkeypatch):
@@ -153,25 +211,58 @@ def test_ollama_serves_the_pinned_blob_with_the_rendered_raw_prompt(tmp_path, mo
     assert lifecycle["stops"] == 1
 
 
+def test_slow_startup_probe_keeps_the_same_owned_server_alive(tmp_path, monkeypatch):
+    client, calls, lifecycle = make_ollama(tmp_path, monkeypatch, first_version_delay=2.2)
+    try:
+        assert lifecycle["stops"] == 0
+        assert client.diagnostics()["startup_probe_timeouts"] == 1
+        assert sum(path == "/api/version" for path, _ in calls) == 2
+        assert sum(path == "/api/generate" for path, _ in calls) == 1
+        assert all(payload is None or not payload.get("prompt") for _, payload in calls)
+    finally:
+        client.close()
+    assert lifecycle["stops"] == 1
+
+
+def test_unready_ollama_still_stops_at_the_startup_deadline(tmp_path, monkeypatch):
+    with pytest.raises(ModelTimeoutError, match="startup exceeded its budget") as caught:
+        make_ollama(tmp_path, monkeypatch, version_ready=False, startup_seconds=0.05)
+    assert caught.value.diagnostics["closed"] is True
+    assert caught.value.diagnostics["exit_code_after_termination"] == 0
+
+
 def test_ollama_refuses_a_model_that_is_not_the_pinned_blob(tmp_path, monkeypatch):
     with pytest.raises(ModelError, match="not the pinned GGUF"):
         make_ollama(tmp_path, monkeypatch, blob_sha="0" * 64)
 
 
-def test_ollama_server_prompt_count_must_equal_the_gguf_count(tmp_path, monkeypatch):
+@pytest.mark.parametrize("server_count", [28, 31, 14000])
+def test_ollama_server_prompt_count_is_authoritative_within_budget(
+    tmp_path, monkeypatch, server_count
+):
     generated = {
         "model": NAME,
         "response": '{"answer":"x"}',
         "done": True,
         "done_reason": "stop",
-        "prompt_eval_count": 31,
+        "prompt_eval_count": server_count,
         "eval_count": 3,
         "prompt_eval_duration": 1,
         "eval_duration": 1,
     }
     client, _calls, _lifecycle = make_ollama(tmp_path, monkeypatch, generated=generated)
-    with client, pytest.raises(ContextBudgetError, match="token counts"):
-        client.generate(MESSAGES, Output)
+    with client:
+        if server_count == 14000:
+            with pytest.raises(ContextBudgetError, match="token counts"):
+                client.generate(MESSAGES, Output)
+        else:
+            result = client.generate(MESSAGES, Output)
+            assert result.stats.prompt_eval_count == server_count
+            assert client.diagnostics()["last_completion"]["prompt_token_counts"] == {
+                "local": 30,
+                "server": server_count,
+                "server_minus_local": server_count - 30,
+            }
 
 
 def test_ollama_cpu_configuration_rejects_gpu_offload(tmp_path, monkeypatch):

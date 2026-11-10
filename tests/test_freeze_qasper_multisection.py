@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from page_cite_rag.qasper import Annotation, Paper, Passage, Question
+from page_cite_rag.qasper import Annotation, Paper, Passage, Question, source_url
 
 _path = Path(__file__).parents[1] / "scripts" / "freeze_qasper_multisection.py"
 _spec = importlib.util.spec_from_file_location("freeze_qasper_multisection", _path)
@@ -30,6 +30,15 @@ def paper(paper_id: str, *questions: tuple[str, tuple[str, ...]]) -> Paper:
 
 TWO_SECTIONS = ("Intro says the model uses attention.", "Results report an F1 of 80.")
 ONE_SECTION = ("Intro says the model uses attention.", "Intro also states the dataset size.")
+
+
+@pytest.mark.parametrize(
+    ("split", "filename"),
+    [("train", "qasper-train.parquet"), ("validation", "qasper-validation.parquet")],
+)
+def test_source_url_matches_the_selected_qasper_split(split: str, filename: str):
+    assert freeze.source_url(split) == source_url(split)
+    assert freeze.source_url(split).endswith(f"/qasper/{filename}")
 
 
 def test_selection_keeps_multi_section_evidence_once_per_unseen_unreserved_paper():
@@ -84,3 +93,36 @@ def test_no_answer_selection_keeps_only_questions_every_annotator_found_unanswer
         exposure="exposed",
     )
     assert seen[0][2].question_id == "q4"
+
+
+def test_answerable_selection_requires_annotator_consensus_but_keeps_unaligned_evidence():
+    def question(qid, *annotations):
+        return Question(qid, "What?", tuple(annotations))
+
+    passages = (Passage("x-a", 0, 0, "Text."),)
+    papers = [
+        Paper(
+            "p1",
+            passages,
+            (
+                question("q1", Annotation(False, ("Text.",)), Annotation(False, ("Text.",))),
+                question("q2", Annotation(False, ("Text.",)), Annotation(True, ())),
+            ),
+        ),
+        Paper("p2", passages, (question("q3", Annotation(False, ("FLOAT SELECTED: 1",))),)),
+    ]
+
+    selected, eligible_questions, eligible_papers = freeze.select_cases(
+        papers,
+        exposed=set(),
+        reserved=frozenset(),
+        count=2,
+        seed="42",
+        stratum="answerable",
+    )
+
+    assert eligible_questions == 2 and eligible_papers == 2
+    by_question = {item[2].question_id: item for item in selected}
+    assert set(by_question) == {"q1", "q3"}
+    assert by_question["q1"][3].gold_passage_ids == ("x-a",)
+    assert by_question["q3"][3].gold_passage_ids == ()

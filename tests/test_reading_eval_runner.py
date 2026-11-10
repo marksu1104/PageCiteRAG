@@ -39,6 +39,18 @@ def _write_frozen_fixture(root, case_ids, row_ids=None):
     return manifest, rows
 
 
+def test_run_case_slice_preserves_frozen_order_and_rejects_invalid_ids():
+    inputs = [{"case_id": case_id} for case_id in ("a", "b", "c")]
+
+    selected = run_reading_eval._select_run_cases(inputs, case_id=None, run_case_ids=["c", "a"])
+
+    assert [case["case_id"] for case in selected] == ["a", "c"]
+    with pytest.raises(ValueError, match="unique"):
+        run_reading_eval._select_run_cases(inputs, case_id=None, run_case_ids=["a", "a"])
+    with pytest.raises(ValueError, match="manifest"):
+        run_reading_eval._select_run_cases(inputs, case_id=None, run_case_ids=["missing"])
+
+
 def test_diagnostics_preserve_dispatch_wait_and_guard_snapshot():
     value = {
         "dispatch_wait_seconds_total": 12.5,
@@ -172,6 +184,42 @@ def test_product_file_source_rejects_changed_bytes_and_path_escape(tmp_path, mon
     case["source"]["relative_path"] = "../outside.txt"
     with pytest.raises(ValueError, match="project-relative"):
         run_reading_eval._case_document(store, case)
+
+
+def test_preparation_converts_each_identical_source_only_once(monkeypatch):
+    source = {"format": "file", "relative_path": "source.pdf", "sha256": "a" * 64}
+    cases = [
+        {
+            "case_id": "question-one",
+            "dataset": "product-functional",
+            "source_id": "paper-one",
+            "source": source,
+        },
+        {
+            "case_id": "question-two",
+            "dataset": "product-functional",
+            "source_id": "paper-one",
+            "source": dict(source),
+        },
+        {
+            "case_id": "question-three",
+            "dataset": "product-functional",
+            "source_id": "paper-two",
+            "source": {**source, "sha256": "b" * 64},
+        },
+    ]
+    converted = []
+
+    def convert(_store, case, *, chunker=None):
+        converted.append(case["case_id"])
+        return case["source_id"], {}
+
+    monkeypatch.setattr(run_reading_eval, "_case_document", convert)
+    documents = run_reading_eval._prepare_case_documents(object(), cases)
+
+    assert converted == ["question-one", "question-three"]
+    assert documents["question-one"] is documents["question-two"]
+    assert documents["question-three"] == ("paper-two", {})
 
 
 def test_selected_reranker_is_shared_with_agent_initial_context():
@@ -742,6 +790,7 @@ def test_longbench_v2_answer_extraction_requires_official_phrase():
         ("longbench-v2-single-document-qa", "multiple_choice"),
         ("xrag-zh-mono-crosslingual", "short_answer"),
         ("derived-crosslingual", "short_answer"),
+        ("product-functional", "general"),
     ],
 )
 def test_benchmark_dataset_uses_its_scoring_answer_format(dataset, expected):
@@ -1169,18 +1218,20 @@ def test_declared_batch_budget_uses_its_own_approved_phase_ledger(tmp_path):
     batch_root = tmp_path / "gap-batch"
     batch_root.mkdir(parents=True)
     limits = {
+        "protocol": 40,
         "development": 123,
-        "regression_planners": 72,
-        "regression_answers": 864,
-        "new_diagnostics": 240,
-        "total": 1299,
+        "holdout": 240,
+        "cpu_smoke": 1,
+        "total": 404,
     }
     _open_batch(batch_root, "gap-batch", limits)
     development_run = batch_root / "development" / "agent-six"
     ledger, total_limit = run_reading_eval._global_generation_budget(
         development_run, {"reading_plan": None}
     )
-    phase = run_reading_eval._global_generation_phase(development_run, "run")
+    phase = run_reading_eval._global_generation_phase(
+        development_run, "run", batch_phase="development"
+    )
     wrapper = run_reading_eval._CountingModelClient(
         object(),
         global_call_ledger=ledger,
@@ -1190,20 +1241,23 @@ def test_declared_batch_budget_uses_its_own_approved_phase_ledger(tmp_path):
 
     assert run_reading_eval._generation_batch_root(development_run) == batch_root
     assert ledger == batch_root / "global-model-calls.jsonl"
-    assert total_limit == 1299
+    assert total_limit == 404
     assert phase == "development"
     assert wrapper._reserve_global_call(Schema) == 1
     updated = json.loads((batch_root / "progress.json").read_text(encoding="utf-8"))
     assert updated["counters"]["generation_dispatches_by_phase"]["development"] == 1
 
-    regression_plan = batch_root / "regression" / "plan"
-    assert run_reading_eval._global_generation_phase(regression_plan, "plan") == (
-        "regression_planners"
-    )
+    holdout_run = batch_root / "holdout" / "reference"
     assert (
-        run_reading_eval._global_generation_phase(batch_root / "regression" / "answers", "run")
-        == "regression_answers"
+        run_reading_eval._global_generation_phase(holdout_run, "run", batch_phase="holdout")
+        == "holdout"
     )
+    with pytest.raises(ValueError, match="require --batch-phase"):
+        run_reading_eval._global_generation_phase(development_run, "run")
+    with pytest.raises(ValueError, match="not declared"):
+        run_reading_eval._global_generation_phase(development_run, "run", batch_phase="invalid")
+    with pytest.raises(ValueError, match="does not match"):
+        run_reading_eval._global_generation_phase(development_run, "run", batch_phase="holdout")
 
 
 def _open_batch(batch_root, revision, limits):
@@ -1381,7 +1435,7 @@ def test_prompt_comparison_is_frozen_against_the_current_fixed_rag(tmp_path):
     }
     assert static["answer"]["contracts_by_arm"] == {
         arms[0]: PROMPT_VERSION,
-        arms[1]: "complete-cited-answer-v5-task-aligned",
+        arms[1]: "complete-cited-answer-v10-task-aligned-receive-normalization",
     }
 
 
@@ -1667,6 +1721,7 @@ def test_embedding_budget_is_checked_before_dispatch():
         "valid",
         "valid_lower_embedding_budget",
         "valid_reranker_disabled",
+        "valid_ollama_runtime_change",
         "over_embedding_budget",
         "wrong_model",
         "corrupt_vectors",
@@ -1777,6 +1832,15 @@ def test_prepared_checkpoint_reuses_only_verified_artifacts(
         "agent": {"architecture": "old-navigation", "call_limit": 8},
         "answer_call_budget": {"total_worst_case": 9},
     }
+    if checkpoint_state == "valid_ollama_runtime_change":
+        static["source_code_sha256"] = {
+            **static["source_code_sha256"],
+            "src/page_cite_rag/ollama_backend.py": "new-runtime-validation",
+        }
+        previous["source_code_sha256"] = {
+            **previous["source_code_sha256"],
+            "src/page_cite_rag/ollama_backend.py": "old-runtime-validation",
+        }
     previous.pop("auxiliary_metrics")
     if checkpoint_state == "valid_reranker_disabled":
         # Reranking consumes the frozen base candidate pool; the reusable
@@ -1842,6 +1906,7 @@ def test_prepared_checkpoint_reuses_only_verified_artifacts(
         "valid",
         "valid_lower_embedding_budget",
         "valid_reranker_disabled",
+        "valid_ollama_runtime_change",
     }:
         ready = run_reading_eval._prepare(
             tmp_path, run_root, {}, cases, static, reuse_from=source_root
@@ -1939,7 +2004,9 @@ def test_reading_planner_records_failures_and_never_retries_failed_cases(
                     raw_model_output="{}",
                 )
             plan = ReadingPlan(
-                requirements=(ReadingNeed(need="Find the requested fact", queries=("fact",)),)
+                requirements=(
+                    ReadingNeed(task="lookup", need="Find the requested fact", queries=("fact",)),
+                )
             )
             stats = SimpleNamespace(
                 model_dump=lambda **_kwargs: {"prompt_eval_count": 5, "eval_count": 2}
@@ -2566,6 +2633,9 @@ def test_official_longbench_keeps_healthy_client_but_stops_on_fatal_failure(
     assert Model.calls == (2 if failure_kind == "output_limit" else 1)
     assert result["stopped"] == (None if failure_kind == "output_limit" else "model_client_failed")
     assert result["remaining_slots"] == (0 if failure_kind == "output_limit" else 1)
+    failed = json.loads((tmp_path / arm / "first.json").read_text())
+    assert failed["failure"]["error_message"]
+    assert failed["failure"]["failure_stage"] == "generation"
 
 
 @pytest.mark.parametrize("arms", [("fixed-rag",), ("fixed-rag", "decomposition-agent")])
@@ -2734,11 +2804,16 @@ def test_routed_comparison_freezes_the_scoped_planner_and_routes_per_plan(tmp_pa
     routed = run_reading_eval.static_configuration(
         tmp_path, manifest, selected_arms=list(run_reading_eval.ROUTED_ARMS)
     )
+    routed_only = run_reading_eval.static_configuration(
+        tmp_path, manifest, selected_arms=["routed-reading"]
+    )
     outline = run_reading_eval.static_configuration(
         tmp_path, manifest, selected_arms=list(run_reading_eval.AGENT_OUTLINE_ARMS)
     )
 
     assert routed["reading_plan"]["scope_routing"] is True
+    assert routed_only["reading_plan"]["scope_routing"] is True
+    assert routed_only["run_selection"]["arms"] == ["routed-reading"]
     assert routed["reading_plan"]["schema_sha256"] == run_reading_eval.canonical_hash(
         ScopedReadingPlan.model_json_schema()
     )
@@ -2751,7 +2826,16 @@ def test_routed_comparison_freezes_the_scoped_planner_and_routes_per_plan(tmp_pa
     assert run_reading_eval._plan_model(outline) is ReadingPlan
 
     def row(scope, status="complete"):
-        plan = {"requirements": [{"need": "n", "queries": ["q"]}], "scope": scope}
+        plan = {
+            "requirements": [
+                {
+                    "need": "n",
+                    "task": "lookup" if scope == "lookup" else "inventory",
+                    "queries": ["q"],
+                }
+            ],
+            "scope": scope,
+        }
         return {"status": status, "plan": plan}
 
     behavior = run_reading_eval._behavior_arm
@@ -2761,3 +2845,53 @@ def test_routed_comparison_freezes_the_scoped_planner_and_routes_per_plan(tmp_pa
     assert behavior("routed-reading", row("whole_document", "failed")) == "fixed-rag"
     assert behavior("routed-reading", None) == "fixed-rag"
     assert behavior("fixed-rag", row("whole_document")) == "fixed-rag"
+
+
+def test_failure_diagnostics_bound_messages_and_redact_document_text():
+    from page_cite_rag.agent import AgentRunFailure
+    from page_cite_rag.generation import ModelError
+
+    source = "Confidential document passage."
+    try:
+        try:
+            raise ModelError("invalid reading: " + source)
+        except ModelError as cause:
+            raise AgentRunFailure("ModelError", {"failure_stage": "read_section"}) from cause
+    except AgentRunFailure as exc:
+        details = run_reading_eval._failure_details(exc, "read_section", [source])
+    assert details["failure_stage"] == "read_section"
+    assert source not in details["error_message"]
+    assert "redacted" in details["error_message"]
+    # Short blocks such as headings do not redact ordinary diagnostics.
+    short = run_reading_eval._failure_details(ModelError("server exited"), "writer", ["server"])
+    assert short["error_message"] == "server exited"
+    assert (
+        len(run_reading_eval._failure_details(ModelError("x" * 1000), "writer")["error_message"])
+        == 500
+    )
+
+
+def test_runner_counts_server_usage_without_unknown_on_token_difference(tmp_path):
+    from page_cite_rag.generation import ChatMessage, GenerationResult
+    from tests.test_gap_agent import _stats
+
+    class Schema(BaseModel):
+        answer: str
+
+    class Model:
+        def generate(self, *args, **kwargs):
+            budget = SimpleNamespace(exact_input_tokens=100)
+            return GenerationResult(Schema(answer="ok"), _stats(98, 20), budget, '{"answer":"ok"}')
+
+    ledger = tmp_path / "calls.jsonl"
+    wrapper = run_reading_eval._CountingModelClient(
+        Model(), global_call_ledger=ledger, global_call_limit=1
+    )
+    wrapper.begin_case(call_context={"phase": "answer", "arm": "fixed-rag", "case_id": "c1"})
+    wrapper.generate((ChatMessage(role="user", content="question"),), Schema)
+    usage = run_reading_eval._structured_usage(wrapper.records)
+    assert usage["input_tokens_lower_bound"] == 98
+    assert usage["usage_unknown"] is False
+    actual = run_reading_eval.read_jsonl(ledger)[-1]
+    assert actual["input_tokens"] == 98 and actual["usage_unknown"] is False
+    assert wrapper.records[-1]["local_input_tokens"] == 100

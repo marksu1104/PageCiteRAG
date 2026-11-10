@@ -124,6 +124,7 @@ class VerifiedCitation(BaseModel):
 class VerifiedClaim(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
+    claim_id: str | None = None
     text: str = Field(min_length=1, max_length=4000)
     citations: tuple[VerifiedCitation, ...] = Field(min_length=1, max_length=8)
 

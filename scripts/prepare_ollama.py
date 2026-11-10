@@ -1,9 +1,10 @@
-"""Import a pinned Qwen3.5 GGUF from its llama bundle into the private Ollama store.
+"""Import a pinned Qwen3.5 GGUF into the private Ollama store.
 
 Nothing is downloaded: Ollama copies the local file into a blob named by its SHA-256,
 which must equal the pinned model hash. A temporary CPU-only server is started for the
 import and stopped afterwards. Run before any evaluation that uses ``--generator-backend
-ollama``; the evaluation itself never imports or pulls models.
+ollama``; the evaluation itself never imports or pulls models. ``--source-model`` can
+select the model-only artifact created by ``prepare_llama.py --gguf-only``.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from page_cite_rag.llama import LLAMA_COMMIT, model_spec  # noqa: E402
+from page_cite_rag.llama import LLAMA_COMMIT, model_spec, sha256  # noqa: E402
 from page_cite_rag.ollama_backend import (  # noqa: E402
     DEFAULT_OLLAMA_MODELS,
     DEFAULT_OLLAMA_RUNTIME,
@@ -33,8 +34,28 @@ from page_cite_rag.ollama_backend import (  # noqa: E402
 )
 
 
-def bundle_gguf(model_size: str) -> Path:
+def bundle_gguf(model_size: str, source_model: Path | None = None) -> Path:
     spec = model_spec(model_size)
+    if source_model is not None:
+        candidate = Path(source_model).expanduser()
+        model_root = ROOT / "models"
+        if model_root.is_symlink() or candidate.is_symlink():
+            raise SystemExit("source model must be the pinned GGUF inside this checkout's models")
+        try:
+            model_root = model_root.resolve(strict=True)
+            path = candidate.resolve(strict=True)
+            inside_models = path.is_relative_to(model_root)
+        except (OSError, RuntimeError):
+            inside_models = False
+            path = candidate
+        if (
+            not inside_models
+            or not path.is_file()
+            or path.stat().st_size != spec["bytes"]
+            or sha256(path) != spec["sha256"]
+        ):
+            raise SystemExit("source model must be the pinned GGUF inside this checkout's models")
+        return path
     bundle = (
         ROOT
         / "models"
@@ -47,12 +68,26 @@ def bundle_gguf(model_size: str) -> Path:
     return path
 
 
+def modelfile_contents(source: Path) -> str:
+    """Render an absolute, quoted GGUF path for Ollama's Modelfile parser."""
+    resolved = Path(source).resolve(strict=True)
+    value = str(resolved)
+    if "\n" in value or "\r" in value:
+        raise ValueError("model path cannot contain a newline")
+    return f"FROM {json.dumps(value, ensure_ascii=False)}\n"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-size", choices=["4b", "9b", "27b"], required=True)
+    parser.add_argument(
+        "--source-model",
+        type=Path,
+        help="verified local GGUF under models/ (for example, the CPU-only preparation route)",
+    )
     args = parser.parse_args()
     spec = model_spec(args.model_size)
-    source = bundle_gguf(args.model_size)
+    source = bundle_gguf(args.model_size, args.source_model)
     name = ollama_model_name(args.model_size)
     runtime = ROOT / DEFAULT_OLLAMA_RUNTIME
     models = ROOT / DEFAULT_OLLAMA_MODELS
@@ -71,7 +106,7 @@ def main() -> None:
             "CUDA_VISIBLE_DEVICES": "-1",
         }
         modelfile = Path(temporary) / "Modelfile"
-        modelfile.write_text(f"FROM {source}\n")
+        modelfile.write_text(modelfile_contents(source))
         log = open(Path(temporary) / "server.log", "wb")
         server = subprocess.Popen(
             [str(runtime / "bin" / "ollama"), "serve"],

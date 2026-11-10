@@ -4,7 +4,6 @@ import json
 
 import pytest
 from pydantic import ValidationError
-from tests.reading_fixtures import _Retriever, _setup
 
 from page_cite_rag.agent import _spans
 from page_cite_rag.application import ask_with_agent
@@ -16,6 +15,7 @@ from page_cite_rag.generation import (
     StructuredOutputError,
 )
 from page_cite_rag.retrieval import SearchHit, SearchResult
+from tests.reading_fixtures import _Retriever, _setup
 
 
 def _stats(prompt=120, output=30):
@@ -43,6 +43,7 @@ class _ScriptedModel:
         self.gap_payloads: list[dict] = []
         self.writer_payloads: list[dict] = []
         self.writer_systems: list[str] = []
+        self.writer_schemas: list[dict] = []
         self.writer_citations: list = []  # per writer call: source IDs or an exception
         self.evidence_limit: int | None = None
 
@@ -77,15 +78,42 @@ class _ScriptedModel:
             reply = self.gap_replies.pop(0)
             if isinstance(reply, Exception):
                 raise reply
-            value = response_model.model_validate(reply(payload) if callable(reply) else reply)
+            reply = reply(payload) if callable(reply) else reply
+            if (
+                response_model.__name__ in {"OutlineSelection", "FollowUpSelection"}
+                and "selections" not in reply
+            ):
+                reply = {
+                    "selections": [
+                        {"need_id": need["need_id"], "section_ids": reply.get("section_ids", [])}
+                        for need in payload["needs"]
+                    ]
+                }
+            if response_model.__name__ == "SectionPoints":
+                reply = {
+                    "points": [
+                        {"need_id": payload["needs"][0]["need_id"], **point}
+                        for point in reply.get("points", [])
+                    ]
+                }
+            try:
+                value = response_model.model_validate(reply)
+            except ValidationError as exc:
+                raise StructuredOutputError("scripted structured response rejected") from exc
             return GenerationResult(value, _stats(), self._budget(), value.model_dump_json())
         self.writer_payloads.append(payload)
         self.writer_systems.append(messages[0].content)
+        self.writer_schemas.append(response_model.model_json_schema())
         cited = self.writer_citations.pop(0) if self.writer_citations else [self.cite_source_id]
         if isinstance(cited, Exception):
             raise cited
         claims = tuple(
-            {"text": f"ok {n}", "citations": ({"source_id": source_id},)}
+            {
+                "claim_id": f"C{n + 1}",
+                "support": "direct",
+                "text": f"ok {n}",
+                "citations": ({"source_id": source_id},),
+            }
             for n, source_id in enumerate(cited)
         )
         value = response_model.model_validate(
@@ -94,6 +122,21 @@ class _ScriptedModel:
                 "answer_claims": claims[:3],
                 "detail_claims": claims[3:],
                 "limitations": (),
+                **(
+                    {
+                        "requirement_coverage": tuple(
+                            {
+                                "need_id": need["need_id"],
+                                "status": "answered",
+                                "claim_ids": ("C1",),
+                                "gap": "",
+                            }
+                            for need in payload["reading_plan"]
+                        )
+                    }
+                    if response_model.__name__ == "CoveredFullAnswerDraft"
+                    else {}
+                ),
             }
         )
         return GenerationResult(value, _stats(100, 20), self._budget(), value.model_dump_json())
@@ -324,7 +367,9 @@ def test_outline_reading_hands_writer_the_sources_marked_in_chosen_sections(tmp_
         return {"points": [{"point": "The result.", "source_ids": [source, source]}]}
 
     def follow_up(payload):
-        assert payload["points"] == [{"section": "Results", "point": "The result."}]
+        assert payload["points"][0]["section"] == "Results"
+        assert payload["points"][0]["point"] == "The result."
+        assert payload["points"][0]["need_id"] == "need-01"
         assert "Results" not in [e["title"] for e in payload["unread_outline"]]
         return {"section_ids": []}
 
@@ -346,15 +391,23 @@ def test_outline_reading_hands_writer_the_sources_marked_in_chosen_sections(tmp_
     assert read_event["sources_marked"] == 1 and read_event["points"] == 1
     writer = model.writer_payloads[0]
     assert target_source in [item["source_id"] for item in writer["evidence"]]
-    # The note travels as an unverified checklist entry next to its original.
-    assert writer["navigation_handoff"]["reading_report"]["requirements"] == [
-        {"need": "Results", "observation": "The result.", "source_ids": [target_source]}
-    ]
-    assert "reading note" in model.writer_systems[0]
+    # The writer gets the need/source index and original passage, not reader prose.
+    requirement = writer["navigation_handoff"]["reading_report"]["requirements"][0]
+    assert requirement == {
+        "need_id": "need-01",
+        "need": result.query,
+        "source_ids": [target_source],
+    }
+    assert "observation" not in requirement
+    assert any(item["source_id"] == target_source for item in writer["evidence"])
+    schema = json.dumps(model.writer_schemas[0])
+    assert '"requirement_coverage"' in schema and '"need-01"' in schema
+    assert "reading note" not in model.writer_systems[0]
+    assert trace["reading_points"][0]["point"] == "The result."
     assert blocks[1].block_id not in trace["initial_answer_block_ids"]
     assert trace["follow_up_section_ids"] == []
     assert trace["point_coverage"]["uncovered"] == 0
-    assert answer.result.prompt_version == "agentic-reading-v3"
+    assert answer.result.prompt_version == "agentic-reading-v11-incremental-follow-up"
     assert [e["chosen_by"] for e in trace["tool_trace"] if e.get("mode") == "section"] == [
         "model_section_selection",
         "retrieval_seed",
@@ -471,7 +524,7 @@ def test_long_outline_is_judged_in_parts_and_small_sections_share_one_read(tmp_p
 
     model = _ScriptedModel(
         workflow,
-        [choose, choose, read, {"points": []}, {"section_ids": []}],
+        [choose, choose, read, {"points": []}, {"section_ids": []}, {"section_ids": []}],
         next(iter(_spans((late,)))),
     )
     workflow._model = model
@@ -592,7 +645,12 @@ def test_scoped_plan_adds_the_routing_field_only_when_asked():
     assert scoped[0].content.endswith(SCOPE_INSTRUCTION)
     assert "scope" not in ReadingPlan.model_json_schema()["properties"]
     plan = ScopedReadingPlan.model_validate_json(
-        json.dumps({"requirements": [{"need": "n", "queries": ["q"]}], "scope": "whole_document"})
+        json.dumps(
+            {
+                "requirements": [{"need": "n", "task": "inventory", "queries": ["q"]}],
+                "scope": "whole_document",
+            }
+        )
     )
     assert plan.scope == "whole_document"
     assert ScopedReadingPlan.model_json_schema()["required"] == ["requirements", "scope"]
@@ -609,11 +667,11 @@ def test_general_answers_allow_more_detail_claims_than_benchmark_formats():
     assert ShortBenchmarkAnswerDraft.model_fields["detail_claims"].metadata[-1].max_length == 9
 
     def draft(details: int) -> dict:
-        claim = {"text": "item", "citations": [{"source_id": "S1"}]}
+        claim = {"support": "direct", "text": "item", "citations": [{"source_id": "S1"}]}
         return {
             "status": "answered",
-            "answer_claims": [claim] * 3,
-            "detail_claims": [claim] * details,
+            "answer_claims": [{**claim, "claim_id": f"C{i}"} for i in range(1, 4)],
+            "detail_claims": [{**claim, "claim_id": f"C{i}"} for i in range(4, 4 + details)],
             "limitations": [],
         }
 
@@ -632,6 +690,21 @@ def test_a_full_list_of_eighteen_claims_passes_writer_and_citation_checks(tmp_pa
 
     assert answer.result.status == "answered"
     assert (len(answer.result.answer_claims), len(answer.result.detail_claims)) == (3, 15)
+    assert [claim.claim_id for claim in answer.result.claims] == [f"C{i}" for i in range(1, 19)]
+    assert answer.trace["agent"]["claim_ids"] == [f"C{i}" for i in range(1, 19)]
+    result_type = type(answer.result)
+    valid = {**answer.result.model_dump(), "budget": answer.result.budget}
+    assert result_type.model_validate(valid) == answer.result
+    invalid = {**answer.result.model_dump(), "budget": answer.result.budget}
+    invalid["answer_claims"][1]["claim_id"] = "C1"
+    with pytest.raises(ValidationError, match="unique and sequential"):
+        result_type.model_validate(invalid)
+    invalid = {**answer.result.model_dump(), "budget": answer.result.budget}
+    invalid["requirement_coverage"] = (
+        {"need_id": "need-01", "status": "answered", "claim_ids": ("C99",), "gap": ""},
+    )
+    with pytest.raises(ValidationError, match="refer to delivered claims"):
+        result_type.model_validate(invalid)
 
 
 def test_notes_the_answer_leaves_uncited_are_recorded_without_another_call(tmp_path):
@@ -656,7 +729,11 @@ def test_the_single_entry_routes_by_the_scoped_plan_as_validated(tmp_path, monke
     workflow, question, result, first, (s1, _s2), replies = _two_part_reading(tmp_path)
 
     def plan(scope):
-        need = ReadingNeed(need="every finding", queries=("finding", "Quels sont les résultats"))
+        need = ReadingNeed(
+            task="lookup" if scope == "lookup" else "inventory",
+            need="every finding",
+            queries=("finding", "Quels sont les résultats"),
+        )
         return lambda *_a, **_k: ScopedReadingPlan(requirements=(need,), scope=scope)
 
     def broken(*_a, **_k):
@@ -691,7 +768,26 @@ def test_the_single_entry_routes_by_the_scoped_plan_as_validated(tmp_path, monke
     assert summary["notes"] == 2 and summary["notes_not_in_answer"] == 1
     # scoped planner + select + one packed read + follow-up check + writer
     assert summary["model_calls"] == 5
-    assert whole.result.prompt_version == "agentic-reading-v3"
+    assert whole.result.prompt_version == "agentic-reading-v11-incremental-follow-up"
+
+    # The question-level route must survive decomposition into localized lookups.
+    monkeypatch.setattr(
+        application,
+        "plan_document_question",
+        lambda *_a, **_k: ScopedReadingPlan(
+            requirements=(
+                ReadingNeed(
+                    task="lookup",
+                    need="Compare the findings across all parts",
+                    queries=("findings",),
+                ),
+            ),
+            scope="whole_document",
+        ),
+    )
+    broad, _model = ask(gap_replies=replies)
+    assert broad.trace["route"] == "whole_document"
+    assert broad.trace["plan"]["scope"] == "whole_document"
 
     monkeypatch.setattr(application, "plan_document_question", broken)
     fallback, _model = ask()
@@ -737,14 +833,14 @@ def test_read_limit_records_every_remaining_window_and_reaches_the_summary(tmp_p
         "## Part 1",
     )
     monkeypatch.setattr(gap_agent, "MAX_SECTION_READ_CALLS", 1)
-    monkeypatch.setattr(gap_agent, "MAX_SECTION_WINDOW_CHARS", 1)
+    monkeypatch.setattr(gap_agent, "MAX_WINDOW_SOURCES", 1)
     monkeypatch.setattr(application, "_is_hybrid_retriever", lambda _: True)
     monkeypatch.setattr(application, "search_with_reading_plan", lambda *_: (result, (first,), {}))
     monkeypatch.setattr(
         application,
         "plan_document_question",
         lambda *a, **k: ScopedReadingPlan(
-            requirements=(ReadingNeed(need="findings", queries=("findings",)),),
+            requirements=(ReadingNeed(task="inventory", need="findings", queries=("findings",)),),
             scope="whole_document",
         ),
     )
@@ -769,7 +865,7 @@ def test_read_limit_records_every_remaining_window_and_reaches_the_summary(tmp_p
     assert answer.trace["reading_summary"]["sources_skipped_for_read_limit"] == 3
     assert len(model.gap_payloads) == 2  # selection and one read, without continuation
     assert len(model.writer_payloads) == 1
-    assert answer.result.prompt_version == "agentic-reading-v3"
+    assert answer.result.prompt_version == "agentic-reading-v11-incremental-follow-up"
 
 
 def test_answers_say_when_evidence_had_chat_markers_and_quote_the_original(tmp_path):
@@ -784,3 +880,161 @@ def test_answers_say_when_evidence_had_chat_markers_and_quote_the_original(tmp_p
     answer = workflow.ask(question, language="en")
     assert any("chat-template markers" in note for note in answer.limitations)
     assert "<|im_end|>" in answer.answer_claims[0].citations[0].quote
+
+
+@pytest.mark.parametrize("step", ["read", "followup"])
+@pytest.mark.parametrize("kind", ["structured", "budget", "output", "gpu", "deadline", "exit"])
+def test_outline_step_failure_isolated_but_resource_errors_stop(tmp_path, step, kind):
+    from page_cite_rag.generation import (
+        ModelError,
+        ModelTimeoutError,
+        OutputFailureAccounting,
+        OutputValidationError,
+    )
+
+    workflow, result, blocks, target = _prepare(tmp_path)
+    target_source = next(iter(_spans((target,))))
+    errors = {
+        "structured": StructuredOutputError("invalid selection"),
+        "budget": ContextBudgetError("prompt budget exceeded"),
+        "output": OutputValidationError(
+            "output_limit",
+            OutputFailureAccounting(
+                prompt_eval_count=98,
+                eval_count=10,
+                elapsed_ms=1,
+                stop_type="limit",
+            ),
+        ),
+        "gpu": ModelError("GPU guard stopped own server"),
+        "deadline": ModelTimeoutError("deadline exceeded"),
+        "exit": ModelError("server exited"),
+    }
+
+    def choose(payload):
+        return {
+            "section_ids": [e["section_id"] for e in payload["outline"] if "Result" in e["title"]]
+        }
+
+    def read(payload):
+        sid = next(
+            s["source_id"]
+            for part in payload["sections"]
+            for s in part["sources"]
+            if "Result paragraph" in s["text"]
+        )
+        return {"points": [{"point": "Result", "source_ids": [sid]}]}
+
+    replies = (
+        [choose, errors[kind], {"points": []}, {}]
+        if step == "read"
+        else [
+            choose,
+            read,
+            {"points": []},
+            errors[kind],
+        ]
+    )
+    model = _ScriptedModel(workflow, replies, target_source)
+    workflow._model = model
+
+    def run():
+        return ask_with_agent(
+            workflow,
+            result.query,
+            language="en",
+            initial_search=result,
+            initial_blocks=(blocks[1],),
+            strategy="outline",
+        )
+
+    if kind in {"gpu", "deadline", "exit"}:
+        with pytest.raises(ModelError):
+            run()
+        assert not model.writer_payloads
+    else:
+        answer = run()
+        assert len(model.writer_payloads) == 1
+        assert target_source in [e["source_id"] for e in model.writer_payloads[0]["evidence"]]
+        assert any(
+            e.get("error_type") == type(errors[kind]).__name__
+            or e.get("status") == "invalid"
+            or e.get("status") == "skipped_prompt_budget"
+            for e in answer.trace["agent"]["tool_trace"]
+        )
+
+
+def test_agent_accounts_server_counts_when_writer_differs_from_local(tmp_path):
+    workflow, result, blocks, _ = _prepare(tmp_path)
+    source = next(iter(_spans((blocks[1],))))
+
+    class Model(_ScriptedModel):
+        def generate(self, messages, response_model):
+            generated = super().generate(messages, response_model)
+            if self.writer_payloads:
+                return GenerationResult(
+                    generated.value, _stats(98, 20), generated.budget, generated.raw_model_output
+                )
+            return generated
+
+    model = Model(
+        workflow,
+        [{"needs": [{"need_id": "need-01", "status": "supported", "source_ids": [source]}]}],
+        source,
+    )
+    workflow._model = model
+    answer = ask_with_agent(
+        workflow,
+        result.query,
+        language="en",
+        initial_search=result,
+        initial_blocks=(blocks[1],),
+        strategy="gap",
+    )
+    usage = answer.result.agent_usage
+    assert usage.final_input_tokens == 98
+    assert usage.input_tokens == 120 + 98
+    assert usage.output_usage_complete
+    assert answer.trace["agent"]["writer_call"]["input_tokens_local"] == 100
+    type(answer.result).model_validate(
+        {**answer.result.model_dump(), "budget": answer.result.budget}
+    )
+
+
+@pytest.mark.parametrize("repeats", [2, 100])
+def test_repeated_followup_selection_still_calls_writer(tmp_path, repeats):
+    workflow, result, blocks, target = _prepare(tmp_path)
+    target_source = next(iter(_spans((target,))))
+
+    def choose(payload):
+        return {
+            "section_ids": [e["section_id"] for e in payload["outline"] if "Result" in e["title"]]
+        }
+
+    def read(payload):
+        sid = next(
+            s["source_id"]
+            for part in payload["sections"]
+            for s in part["sources"]
+            if "Result paragraph" in s["text"]
+        )
+        return {"points": [{"point": "Result", "source_ids": [sid]}]}
+
+    def followup(payload):
+        return {"section_ids": [payload["unread_outline"][0]["section_id"]] * repeats}
+
+    model = _ScriptedModel(
+        workflow, [choose, read, {"points": []}, followup, {"points": []}], target_source
+    )
+    workflow._model = model
+    answer = ask_with_agent(
+        workflow,
+        result.query,
+        language="en",
+        initial_search=result,
+        initial_blocks=(blocks[1],),
+        strategy="outline",
+    )
+    assert len(model.writer_payloads) == 1
+    assert len(answer.trace["agent"]["follow_up_section_ids"]) == (1 if repeats == 2 else 0)
+    assert target_source in [e["source_id"] for e in model.writer_payloads[0]["evidence"]]

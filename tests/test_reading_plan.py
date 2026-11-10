@@ -23,6 +23,7 @@ def test_reading_plan_is_bounded_and_contains_no_answer_fields():
                 "requirements": [
                     {
                         "need": "Explain the method and its limitation",
+                        "task": "lookup",
                         "queries": ["method limitation", "方法 限制"],
                     }
                 ]
@@ -42,7 +43,11 @@ def test_reading_plan_normalizes_duplicate_queries_and_accepts_long_query():
         json.dumps(
             {
                 "requirements": [
-                    {"need": "need", "queries": ["  same query  ", "SAME QUERY", long_query]}
+                    {
+                        "need": "need",
+                        "task": "lookup",
+                        "queries": ["  same query  ", "SAME QUERY", long_query],
+                    }
                 ]
             }
         ),
@@ -55,21 +60,25 @@ def test_reading_plan_normalizes_duplicate_queries_and_accepts_long_query():
 @pytest.mark.parametrize(
     "payload",
     [
-        {"requirements": [{"need": "", "queries": ["x"]}]},
-        {"requirements": [{"need": "need", "queries": [" "]}]},
+        {"requirements": [{"need": "", "task": "lookup", "queries": ["x"]}]},
+        {"requirements": [{"need": "need", "task": "lookup", "queries": [" "]}]},
         {
             "requirements": [
-                {"need": "same need", "queries": ["first"]},
-                {"need": "same   need", "queries": ["second"]},
+                {"need": "same need", "task": "lookup", "queries": ["first"]},
+                {"need": "same   need", "task": "lookup", "queries": ["second"]},
             ]
         },
         {
             "requirements": [
-                {"need": f"need {index}", "queries": ["query"]}
+                {"need": f"need {index}", "task": "lookup", "queries": ["query"]}
                 for index in range(MAX_READING_REQUIREMENTS + 1)
             ]
         },
-        {"requirements": [{"need": "need", "queries": ["query"], "answer": "fact"}]},
+        {
+            "requirements": [
+                {"need": "need", "task": "lookup", "queries": ["query"], "answer": "fact"}
+            ]
+        },
     ],
 )
 def test_invalid_or_answer_leaking_plans_are_rejected(payload):
@@ -109,8 +118,12 @@ def test_planned_queries_keep_original_separate_and_deduplicate_per_need():
     plan = ReadingPlan.model_validate(
         {
             "requirements": (
-                {"need": "first", "queries": ("Original question", "  Amount query  ")},
-                {"need": "second", "queries": ("Second query",)},
+                {
+                    "need": "first",
+                    "task": "lookup",
+                    "queries": ("Original question", "  Amount query  "),
+                },
+                {"need": "second", "task": "lookup", "queries": ("Second query",)},
             )
         }
     )
@@ -206,8 +219,16 @@ def test_product_planned_hybrid_uses_original_and_deduplicated_need_routes():
     plan = ReadingPlan.model_validate(
         {
             "requirements": (
-                {"need": "method", "queries": ("What changed?", "method setting")},
-                {"need": "comparison", "queries": ("method setting", "comparison outcome")},
+                {
+                    "need": "method",
+                    "task": "lookup",
+                    "queries": ("What changed?", "method setting"),
+                },
+                {
+                    "need": "comparison",
+                    "task": "lookup",
+                    "queries": ("method setting", "comparison outcome"),
+                },
             )
         }
     )
@@ -322,6 +343,7 @@ def test_third_language_planner_queries_are_dropped_but_the_question_stays():
                 "requirements": [
                     {
                         "need": "How Country C was built",
+                        "task": "lookup",
                         "queries": [
                             "Country C construction",
                             "Commentaire sur la construction de Country C",

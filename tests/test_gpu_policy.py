@@ -15,7 +15,7 @@ from page_cite_rag.gpu_processes import (
     transient_sw_thermal_flag,
     wait_for_gpu_dispatch,
 )
-from test_llama import make_client
+from tests.test_llama import make_client
 
 UUID = "GPU-" + "0" * 36
 THERMAL = "GPU Max Operating Temp : 93 C\nGPU Target Temperature : 84 C\n"

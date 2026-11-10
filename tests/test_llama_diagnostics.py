@@ -43,7 +43,11 @@ def make_client(tmp_path, monkeypatch, *, result=None, log=b"", startup_failure=
     bundle.mkdir()
     (bundle / "fake-model").write_bytes(b"synthetic weights")
     (bundle / "manifest.json").write_text("{}")
-    monkeypatch.setattr(llama, "verify_bundle", lambda _: {"files": {"fake-model": "test"}})
+    monkeypatch.setattr(
+        llama,
+        "verify_bundle",
+        lambda _, model_size="9b": {"files": {"fake-model": "test"}},
+    )
     state = SimpleNamespace(code=None, signals=[], created=None, requests=[])
 
     def handler(request):
@@ -483,3 +487,22 @@ def test_startup_failure_retains_diagnostics_after_cleanup(tmp_path, monkeypatch
     assert snapshot["exit_code_after_termination"] == -signal.SIGTERM
     assert snapshot["server_log_tail"] == "startup details"
     assert "startup details" not in str(caught.value)
+
+
+def test_server_prompt_count_difference_is_diagnostic_not_failure(tmp_path, monkeypatch):
+    factory, _ = make_client(tmp_path, monkeypatch, result=completion() | {"tokens_evaluated": 28})
+    with factory() as client:
+        result = generate(client)
+        assert result.stats.prompt_eval_count == 28
+        assert client.diagnostics()["last_completion"]["prompt_token_counts"] == {
+            "local": 30,
+            "server": 28,
+            "server_minus_local": -2,
+        }
+
+
+@pytest.mark.parametrize("counts", [{"tokens_evaluated": 14000}, {"tokens_predicted": 1025}])
+def test_server_counts_still_enforce_budget(tmp_path, monkeypatch, counts):
+    factory, _ = make_client(tmp_path, monkeypatch, result=completion() | counts)
+    with factory() as client, pytest.raises(ContextBudgetError, match="runtime token counts"):
+        generate(client)

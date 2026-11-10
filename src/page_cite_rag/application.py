@@ -329,6 +329,7 @@ def prepare_agent_question(
         blocks,
         {
             "plan": plan.model_dump(mode="json"),
+            "plan_deviations": list(getattr(plan, "_deviations", ())),
             "retrieval": retrieval_trace,
         },
     )
@@ -366,7 +367,13 @@ def answer_question(
         raise ValueError("route must be auto, fixed or whole-document")
     language = resolve_answer_language(question, language)
     started = perf_counter()
-    trace: dict = {"version": "routed-answer/v1", "requested_route": route}
+    from page_cite_rag.reading_plan import READING_PLAN_VERSION
+
+    trace: dict = {
+        "version": "routed-answer/v2",
+        "reading_plan_version": READING_PLAN_VERSION,
+        "requested_route": route,
+    }
     if route == "fixed":
         result = ask_document(workflow, question, language=language)
         trace.update(route="fixed", reason="requested")
@@ -409,6 +416,7 @@ def answer_question(
         trace.update(route="fixed", reason="planner_failed", planner_error=type(error).__name__)
         return AgentAnswer(result, trace)
     trace["plan"] = plan.model_dump(mode="json")
+    trace["plan_deviations"] = list(getattr(plan, "_deviations", ()))
     from page_cite_rag.reading_plan import is_foreign_language_query
 
     trace["dropped_foreign_queries"] = [
@@ -446,9 +454,18 @@ def answer_question(
             "sections_chosen": named("selected_section_ids"),
             "sections_from_search": named("seed_section_ids"),
             "sections_followed_up": named("follow_up_section_ids"),
+            "sections_read": named("read_section_ids"),
             "notes": agent.get("reading_point_count", 0),
+            "notes_handed_to_writer": agent.get(
+                "writer_reading_point_count", agent.get("reading_point_count", 0)
+            ),
+            "notes_rejected_for_scope": sum(
+                p["reason"] == "requirement_scope" for p in agent.get("reader_rejected_points", ())
+            ),
             "notes_not_in_answer": coverage.get("uncovered", 0),
             "sources_skipped_for_read_limit": agent.get("sources_skipped_for_read_limit", 0),
+            "sources_skipped_for_budget": agent.get("sources_skipped_for_budget", 0),
+            "notes_omitted_for_writer_budget": agent.get("writer_omitted_point_count", 0),
             # The scoped planner call plus every reading and writer call.
             "model_calls": 1 + (agent.get("model_calls_attempted") or 0),
             "navigation_degraded": agent.get("navigation_degraded", False),
@@ -486,7 +503,12 @@ def ask_with_agent(
         _AgentBudgetStop,
         _spans,
     )
-    from page_cite_rag.gap_agent import run_focus_reading, run_gap_reading, run_outline_reading
+    from page_cite_rag.gap_agent import (
+        READING_VERSION,
+        run_focus_reading,
+        run_gap_reading,
+        run_outline_reading,
+    )
 
     if (initial_search is None) != (initial_blocks is None):
         raise ValueError("initial search and source blocks must be supplied together")
@@ -507,10 +529,27 @@ def ask_with_agent(
 
     def navigation_cooldown() -> float:
         remaining_timeout = getattr(model, "remaining_request_timeout_seconds", None)
+        wait_for_headroom = getattr(model, "wait_for_gpu_headroom", None)
+        # A navigation call must afford its bounded GPU wait without spending the
+        # writer's reservation. Recheck after waiting: cooling is wall time too.
+        wait_limit = 120.0
+        gpu_wait = (
+            wait_limit
+            if callable(wait_for_headroom)
+            and getattr(getattr(model, "config", None), "device", None) != "cpu"
+            else 0.0
+        )
+        if (
+            callable(remaining_timeout)
+            and remaining_timeout() <= AGENT_WRITER_RESERVE_SECONDS + gpu_wait
+        ):
+            raise _AgentBudgetStop("writer_reserve_deadline")
+        waited = (
+            wait_for_headroom(timeout_seconds=wait_limit) if callable(wait_for_headroom) else 0.0
+        )
         if callable(remaining_timeout) and remaining_timeout() <= AGENT_WRITER_RESERVE_SECONDS:
             raise _AgentBudgetStop("writer_reserve_deadline")
-        wait_for_headroom = getattr(model, "wait_for_gpu_headroom", None)
-        return wait_for_headroom() if callable(wait_for_headroom) else 0.0
+        return waited
 
     output_limit = min(MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS, workflow._budget_config.num_predict)
     if max_model_calls is not None and (type(max_model_calls) is not int or max_model_calls < 1):
@@ -554,7 +593,12 @@ def ask_with_agent(
         need = event.get("information_need")
         need_id = event.get("need_id")
         source_ids = []
-        if event.get("tool") == "read_source" and event.get("status") in {"ok", "partial"}:
+        if event.get("tool") == "read_source" and event.get("status") in {
+            "ok",
+            "partial",
+            "invalid",
+            "skipped_prompt_budget",
+        }:
             source_ids = [
                 value for value in event.get("returned_block_ids", ()) if isinstance(value, str)
             ]
@@ -591,7 +635,8 @@ def ask_with_agent(
                         for event in reading.trace.get("tool_trace", ())
                         if isinstance(event, dict)
                         and event.get("tool") == "read_source"
-                        and event.get("status") in {"ok", "partial"}
+                        and event.get("status")
+                        in {"ok", "partial", "invalid", "skipped_prompt_budget"}
                         for block_id in event.get("returned_block_ids", ())
                         if isinstance(block_id, str)
                     ),
@@ -658,6 +703,15 @@ def ask_with_agent(
     for source_id, span in spans.items():
         source_ids_by_block.setdefault(span.block_id, []).append(source_id)
     initial_ids = set(initial_writer_ids)
+    for finding in report.requirements:
+        available = {
+            source_id
+            for block_id in finding.source_ids
+            for source_id in source_ids_by_block[block_id]
+        }
+        if finding.source_span_ids and not set(finding.source_span_ids).issubset(available):
+            # T4 H14 hard: reader spans and inference citations must belong to document originals.
+            raise ValueError("reader span handles do not belong to its handed-off originals")
     handoff = {
         "version": "navigation-handoff/v2",
         "status": "unverified",
@@ -669,7 +723,8 @@ def ask_with_agent(
                     "need_id": finding.need_id,
                     "need": finding.need,
                     "observation": finding.observation,
-                    "source_ids": [
+                    "source_ids": finding.source_span_ids
+                    or [
                         source_id
                         for block_id in finding.source_ids
                         for source_id in source_ids_by_block[block_id]
@@ -735,8 +790,11 @@ def ask_with_agent(
             on_model_call(dict(writer_call))
 
     def after_writer(stats) -> None:
+        ledger.input_tokens += stats.prompt_eval_count - writer_call["input_tokens_exact"]
         ledger.complete(stats.eval_count)
         writer_call.update(
+            input_tokens_local=writer_call["input_tokens_exact"],
+            input_tokens_exact=stats.prompt_eval_count,
             output_tokens_observed=stats.eval_count,
             elapsed_ms=stats.elapsed_ms,
             status="completed",
@@ -744,9 +802,11 @@ def ask_with_agent(
         if on_model_call is not None:
             on_model_call(dict(writer_call))
 
-    # Outline reading hands over section notes; the writer sees them as an unverified
-    # checklist next to the originals they cite.
-    writer_workflow = workflow.with_reader_observations(True) if strategy == "outline" else workflow
+    # Preserve need coverage while the writer reasons from the original evidence;
+    # free-text reader notes remain available in the trace only.
+    writer_workflow = (
+        workflow.with_requirement_coverage(True) if strategy == "outline" else workflow
+    )
     try:
         if writer_blocks:
             result = writer_workflow.answer_from_agent_context(
@@ -762,14 +822,24 @@ def ask_with_agent(
         else:
             result = workflow.answer_from_context(question, (), language=language)
         if reading.trace.get("navigation_report_partial"):
-            limitation = (
-                "Agent 未能完成結構化閱讀報告；本回答僅依可驗證原文生成，內容可能不完整。"
-                if language == "zh-Hant"
-                else (
-                    "The Agent could not complete its structured reading report; this answer "
-                    "uses verified originals and may be incomplete."
+            if reading.trace.get("navigation_failure_type") == "writer_reserve_deadline":
+                limitation = (
+                    "為保留作答時間，閱讀已提前結束；本回答依已讀原文生成，可能未涵蓋全部內容。"
+                    if language == "zh-Hant"
+                    else (
+                        "Reading ended early to reserve time for the answer; this answer "
+                        "uses the sources already read and may be incomplete."
+                    )
                 )
-            )
+            else:
+                limitation = (
+                    "Agent 未能完成結構化閱讀報告；本回答僅依可驗證原文生成，內容可能不完整。"
+                    if language == "zh-Hant"
+                    else (
+                        "The Agent could not complete its structured reading report; this answer "
+                        "uses verified originals and may be incomplete."
+                    )
+                )
             # Keep the writer's own status; degradation is a separate trace field.
             result = result.model_copy(update={"limitations": (*result.limitations, limitation)})
         result = result.model_copy(
@@ -801,7 +871,7 @@ def ask_with_agent(
     # Plan 5.13: a code check of which reading notes reached the answer. Recorded only; a
     # one-shot rewrite (5.13) and an add-only supplement call (5.15) by the same 9B writer
     # both failed their development checks.
-    points = reading.trace.get("reading_points") or ()
+    points = reading.trace.get("writer_reading_points", reading.trace.get("reading_points")) or ()
     coverage = (
         _point_coverage(result, points)
         if strategy == "outline" and writer_call["status"] == "completed" and points
@@ -824,7 +894,7 @@ def ask_with_agent(
             update={
                 "agent_usage": usage,
                 "prompt_version": (
-                    "agentic-reading-v3" if strategy == "outline" else "agentic-reading-v2"
+                    READING_VERSION if strategy == "outline" else "agentic-reading-v2"
                 ),
             }
         )
@@ -847,6 +917,12 @@ def ask_with_agent(
             "agent_output_tokens_unobserved_reserved": ledger.output_reserved_tokens,
             "writer_call": writer_call,
             "point_coverage": coverage,
+            "claim_ids": [claim.claim_id for claim in result.claims],
+            "requirement_coverage": [
+                item.model_dump(mode="json") for item in result.requirement_coverage
+            ],
+            "claim_duplicates_removed": result.claim_duplicates_removed,
+            "output_deviations": list(result.output_deviations),
             "writer_source_block_ids": [block.block_id for block in writer_blocks],
             "writer_context_group_ids": [group.chunk_index for group in writer_context_groups],
             "navigation_handoff": handoff,

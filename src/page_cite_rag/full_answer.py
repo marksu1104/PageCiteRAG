@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from collections.abc import Callable
 from copy import copy
@@ -14,6 +15,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     TypeAdapter,
     ValidationError,
     create_model,
@@ -31,7 +33,7 @@ from page_cite_rag.generation import (
     budget_for_model,
 )
 from page_cite_rag.models import Block
-from page_cite_rag.reading_plan import ReadingPlan
+from page_cite_rag.reading_plan import ReadingPlan, RequirementCoverage
 from page_cite_rag.retrieval import SearchContextGroup, SearchResult
 from page_cite_rag.span_citations import (
     SpanAnswerDraft,
@@ -50,7 +52,7 @@ from page_cite_rag.workflows import (
     resolve_answer_language,
 )
 
-PROMPT_VERSION = "complete-cited-answer-v10-source-backed-absence"
+PROMPT_VERSION = "complete-cited-answer-v18-original-evidence-handoff"
 # General answers list one item per claim; 3 + 9 claims cut off whole-document lists (plan
 # 5.13 development: inventory answers filled all 12 with reading notes left). Benchmark
 # short-answer and multiple-choice contracts keep 9 detail claims.
@@ -63,7 +65,8 @@ class _VerifiedAnswerSpanDraft(SpanAnswerDraft):
     claims: tuple[SpanClaimDraft, ...] = Field(default=(), max_length=3 + MAX_GENERAL_DETAIL_CLAIMS)
 
 
-TASK_ALIGNED_PROMPT_VERSION = "complete-cited-answer-v5-task-aligned"
+TASK_ALIGNED_PROMPT_VERSION = "complete-cited-answer-v10-task-aligned-receive-normalization"
+WRITER_BUDGET_VERSION = "writer-support-fields/v2"
 EVIDENCE_SELECTION_PROMPT_VERSION = "evidence-selection/v1"
 # Retrieved Docling chunks reach the writer as heading paths plus each source text once
 # (v1 sent the chunk text and its sources, so every source appeared at least twice).
@@ -174,7 +177,10 @@ _TASK_SYSTEMS = {
 
 _HANDOFF_INSTRUCTIONS = (
     " The navigation handoff is an unverified question-to-source index, not evidence "
-    "or established conclusions. Check each requested part against its original sources. "
+    "or established conclusions. Its need IDs and source IDs identify what the reader inspected; "
+    "reader prose is not passed as answer evidence. Check each requested part against its "
+    "original sources. A heading can establish its title only, never the content that follows "
+    "or that the document omits information. "
     "Follow the actual question if a reader overstates it. Explain intermediate operations "
     "and relationships, preserving conditions and attribution. Distinguish this study from "
     "related work. State remaining gaps."
@@ -187,6 +193,42 @@ _NOTES_INSTRUCTIONS = (
     "the same item may share one claim. Correct or drop a note the original does not support. "
     "Content found in the sources belongs in claims, never in limitations; use limitations "
     "only for what the supplied sources do not answer."
+)
+_SUPPORT_INSTRUCTIONS = (
+    " Assign every claim a unique string claim_id, sequentially C1, C2, and so on: "
+    "direct answer claims first, then detail_claims. For short_answer use claim_id C1; "
+    "for multiple choice use choice_claim_id C1; details then start at C2. "
+    " For each claim label support as direct (the original states the requested relation) "
+    "or limited_inference (the conclusion necessarily follows from cited premises). "
+    "For limited_inference provide inference_basis with the premises and bounded inference; "
+    "the claim citations must also support this basis. For a choice use choice_support and "
+    "choice_inference_basis. Keep benchmark short_answer/choice concise. "
+    "Check the logical scope: one documented "
+    "counterexample refutes an 'all/only' assertion; some examples cannot establish 'all'. "
+    "Do not infer absence from silence, causation from association, a category from a name, "
+    "or a recommendation from a related technique. Missing evidence is different from a "
+    "supported negative. If evidence settles a requested part, answer that part; uncertainty "
+    "about a different part belongs in its gap. A refusal must identify the unknown relation, "
+    "rather than place an established answer in limitations."
+)
+_COVERAGE_INSTRUCTIONS = (
+    " Report coverage once per supplied need_id. Use claim_ids to reference the explicit "
+    "claim_id values on answer and detail claims. Mark answered only if those cited claims cover "
+    "the requested scope, partial for supported parts plus a specific gap, or missing with "
+    "no claim IDs. These are your judgments, not proof of completeness. For enumeration "
+    "or comparison, use the combined answer and detail slots for distinct items/aspects; "
+    "do not spend detail slots restating the first items. Treat every reader note as a "
+    "proposal to check, preserving the original subject, relation and restrictions."
+)
+_MULTI_ITEM_EXAMPLE = (
+    " Fictional example: a workshop report says S1: trial A used a hand pump, S2: trial B "
+    "used a motor, S3: trial C was cancelled. Asked to list completed trials and their power "
+    "sources, write two distinct cited items: claim_id C1, A—hand pump [S1]; "
+    'claim_id C2, B—motor [S2]. Coverage claim_ids: ["C1", "C2"]. C is outside '
+    "the requested condition. Asked whether every completed trial used a hand pump, answer "
+    "No, citing B as the counterexample, and explain that bounded inference. Asked how long "
+    "B ran, report the missing duration; do not invent it from the motor's presence. "
+    "Example source IDs are fictional and must never be used for the actual answer."
 )
 _READING_EXAMPLES = (
     "Worked examples below use fictional documents. They illustrate faithful "
@@ -243,11 +285,16 @@ class _StatusDiscriminatedDraft(BaseModel):
         if not variants:
             return super().model_validate_json(json_data, **kwargs)
         parsed = cls._schema_adapter().validate_json(json_data, strict=kwargs.get("strict"))
-        return cls.model_validate(
-            parsed.model_dump(),
+        result = cls.model_validate(
+            {name: getattr(parsed, name) for name in type(parsed).model_fields},
             strict=kwargs.get("strict"),
             context=kwargs.get("context"),
         )
+        # Keep receive-time evidence when reconstructing the status-specific model.
+        for deviation in getattr(parsed, "_deviations", ()):
+            if deviation not in result._deviations:
+                result._deviations.append(deviation)
+        return result
 
 
 @dataclass(frozen=True)
@@ -275,10 +322,39 @@ class ShortCitationDraft(BaseModel):
 
 
 class FullClaimDraft(ClaimDraft):
+    _deviations: list[dict] = PrivateAttr(default_factory=list)
+    claim_id: str
     citations: tuple[ShortCitationDraft, ...] = Field(min_length=1, max_length=8)
+    support: Literal["direct", "limited_inference"]
+    inference_basis: str | None = Field(default=None, min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_support(self) -> FullClaimDraft:
+        _validate_support(self.support, self.inference_basis)
+        if self.support == "direct" and self.inference_basis is not None:
+            # T4 N06 normalize: preserve reasoning and label it inference in every answer format.
+            self._deviations.append({"type": "support_with_basis", "count": 1})
+            object.__setattr__(self, "support", "limited_inference")
+        return self
+
+
+def _validate_support(support, basis):
+    # T4 H07 hard: inference premises and choice/support metadata need their required content.
+    if support == "limited_inference" and (basis is None or not basis.strip()):
+        raise ValueError("limited inference requires a nonblank inference_basis")
+
+
+def _validate_claim_ids(claim_ids: Sequence[str]) -> None:
+    # T4 H08 hard: duplicate/malformed claim identities make coverage links ambiguous or unusable.
+    if any(
+        not isinstance(cid, str) or not re.fullmatch(r"C[1-9][0-9]*", cid) for cid in claim_ids
+    ) or len(set(claim_ids)) != len(claim_ids):
+        raise ValueError("claim IDs must be unique and nonblank")
+    # T4 N04 normalize: claim order is advisory; verification renumbers IDs and remaps every link.
 
 
 class FullAnswerDraft(_StatusDiscriminatedDraft):
+    _deviations: list[dict] = PrivateAttr(default_factory=list)
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     status: Literal["answered", "partial", "insufficient_evidence"]
@@ -287,6 +363,7 @@ class FullAnswerDraft(_StatusDiscriminatedDraft):
         default=(), max_length=MAX_GENERAL_DETAIL_CLAIMS
     )
     limitations: tuple[LimitationText, ...] = Field(default=(), max_length=8)
+    requirement_coverage: tuple[RequirementCoverage, ...] = Field(default=(), max_length=12)
 
     @field_validator("limitations")
     @classmethod
@@ -306,6 +383,95 @@ class FullAnswerDraft(_StatusDiscriminatedDraft):
             raise ValueError("partial output must identify the missing requested information")
         if self.status == "insufficient_evidence" and total:
             raise ValueError("insufficient-evidence output must not contain answer claims")
+        claim_ids = [claim.claim_id for claim in (*self.answer_claims, *self.detail_claims)]
+        regular = re.compile(r"C[1-9][0-9]*")
+        repeated = {cid for cid in claim_ids if claim_ids.count(cid) > 1}
+        irregular = {cid for cid in claim_ids if not regular.fullmatch(cid)} - repeated
+        relinked: dict[str, str] = {}
+        if repeated or irregular:
+            # T4 N11 normalize: the schema allows any string ID. Keep every claim under a
+            # fresh C-number; unique irregular IDs are relinked, repeated IDs are ambiguous.
+            next_number = 1 + max(
+                (int(cid[1:]) for cid in claim_ids if regular.fullmatch(cid)), default=0
+            )
+            kept: set[str] = set()
+
+            def regular_id(claim):
+                nonlocal next_number
+                cid = claim.claim_id
+                if regular.fullmatch(cid) and cid not in kept:
+                    kept.add(cid)
+                    return claim
+                fresh = f"C{next_number}"
+                next_number += 1
+                if cid in irregular:
+                    relinked[cid] = fresh
+                return claim.model_copy(update={"claim_id": fresh})
+
+            object.__setattr__(
+                self, "answer_claims", tuple(regular_id(c) for c in self.answer_claims)
+            )
+            object.__setattr__(
+                self, "detail_claims", tuple(regular_id(c) for c in self.detail_claims)
+            )
+            if repeated:
+                self._deviations.append(
+                    {"type": "duplicate_claim_id", "count": len(claim_ids) - len(set(claim_ids))}
+                )
+            if irregular:
+                self._deviations.append({"type": "irregular_claim_id", "count": len(irregular)})
+            claim_ids = [claim.claim_id for claim in (*self.answer_claims, *self.detail_claims)]
+        _validate_claim_ids(claim_ids)
+        unique_coverage = {}
+        conflicted = set()
+        for item in self.requirement_coverage:
+            if repeated.intersection(item.claim_ids):
+                self._deviations.append({"type": "coverage_ambiguous_claim", "count": 1})
+                continue
+            if relinked.keys() & set(item.claim_ids):
+                item = item.model_copy(
+                    update={"claim_ids": tuple(relinked.get(cid, cid) for cid in item.claim_ids)}
+                )
+            if any(
+                d["type"] in {"coverage_claim_status_mismatch", "coverage_missing_gap"}
+                for d in item._deviations
+            ):
+                self._deviations.extend(item._deviations)
+                continue
+            if any(cid not in claim_ids for cid in item.claim_ids):
+                self._deviations.append({"type": "coverage_absent_claim", "count": 1})
+                continue
+            if item.need_id in conflicted:
+                continue
+            if item.need_id in unique_coverage:
+                if item.model_dump() != unique_coverage[item.need_id].model_dump():
+                    self._deviations.append({"type": "conflicting_need_coverage", "count": 1})
+                    del unique_coverage[item.need_id]
+                    conflicted.add(item.need_id)
+                else:
+                    self._deviations.append({"type": "duplicate_need_coverage", "count": 1})
+            else:
+                unique_coverage[item.need_id] = item
+        object.__setattr__(self, "requirement_coverage", tuple(unique_coverage.values()))
+        # T4 N10 normalize: adjust status metadata, preserving claims, limitations and gaps.
+        if self.requirement_coverage:
+            expected = (
+                "insufficient_evidence"
+                if all(item.status == "missing" for item in self.requirement_coverage)
+                else "answered"
+                if all(item.status == "answered" for item in self.requirement_coverage)
+                else "partial"
+            )
+            if self.status != expected:
+                deviation = {"type": "coverage_status_mismatch", "count": 1}
+                if deviation not in self._deviations:
+                    self._deviations.append(deviation)
+                status = "partial" if expected != "answered" or self.limitations else "answered"
+                object.__setattr__(self, "status", status)
+                if status == "partial" and not self.limitations:
+                    # All gaps stay in coverage; repeat one as the required answer limitation.
+                    gaps = [item.gap for item in self.requirement_coverage if item.gap.strip()]
+                    object.__setattr__(self, "limitations", (gaps[0],))
         return self
 
 
@@ -327,6 +493,15 @@ class ShortBenchmarkAnswerDraft(_StatusDiscriminatedDraft):
             raise ValueError("partial benchmark output must identify missing information")
         if self.status == "insufficient_evidence" and has_claims:
             raise ValueError("insufficient benchmark output cannot contain claims")
+        _validate_claim_ids(
+            [
+                claim.claim_id
+                for claim in (
+                    *((self.short_answer,) if self.short_answer is not None else ()),
+                    *self.detail_claims,
+                )
+            ]
+        )
         return self
 
 
@@ -335,13 +510,28 @@ class MultipleChoiceBenchmarkAnswerDraft(_StatusDiscriminatedDraft):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     status: Literal["answered", "partial", "insufficient_evidence"]
+    _deviations: list[dict] = PrivateAttr(default_factory=list)
     choice: Literal["A", "B", "C", "D"] | None = None
+    choice_claim_id: str | None = None
     choice_citations: tuple[ShortCitationDraft, ...] = Field(default=(), max_length=8)
+    choice_support: Literal["direct", "limited_inference"] | None = None
+    choice_inference_basis: str | None = Field(default=None, min_length=1, max_length=1000)
     detail_claims: tuple[FullClaimDraft, ...] = Field(default=(), max_length=9)
     limitations: tuple[LimitationText, ...] = Field(default=(), max_length=8)
 
     @model_validator(mode="after")
     def validate_task_contract(self) -> MultipleChoiceBenchmarkAnswerDraft:
+        if self.choice is not None:
+            if self.choice_support is None:
+                raise ValueError("a choice requires explicit choice_support")
+            _validate_support(self.choice_support, self.choice_inference_basis)
+            if self.choice_support == "direct" and self.choice_inference_basis is not None:
+                # Normalize: retain choice reasoning and use the conservative support label.
+                self._deviations.append({"type": "support_with_basis", "count": 1})
+                object.__setattr__(self, "choice_support", "limited_inference")
+        # Hard: support/identity without a choice has no claim to attach to.
+        elif self.choice_support is not None or self.choice_inference_basis is not None:
+            raise ValueError("absent choice cannot have support or an inference basis")
         if self.status in ("answered", "partial") and (
             self.choice is None or not self.choice_citations
         ):
@@ -352,6 +542,14 @@ class MultipleChoiceBenchmarkAnswerDraft(_StatusDiscriminatedDraft):
             self.choice is not None or self.choice_citations or self.detail_claims
         ):
             raise ValueError("insufficient multiple-choice output cannot contain claims")
+        if self.choice is None and self.choice_claim_id is not None:
+            raise ValueError("absent choice cannot have a claim ID")
+        _validate_claim_ids(
+            [
+                *((self.choice_claim_id,) if self.choice is not None else ()),
+                *(claim.claim_id for claim in self.detail_claims),
+            ]
+        )
         return self
 
 
@@ -424,9 +622,10 @@ class FullAnswerWorkflow(AnswerWorkflow):
         self.answer_format = answer_format
         self._navigation_handoff: dict | None = None
         self._reading_plan: list[dict[str, object]] | None = None
-        # Index-only handoff by default: the navigator's free-text notes were
-        # copied by the writer even when wrong. Enable only for an explicit ablation.
+        # Keep reader prose and requirement coverage independent: an unverified
+        # paraphrase is useful in the trace, but must not become writer evidence.
         self._reader_observations = False
+        self._reader_coverage = False
         self.prompt_revision = prompt_revision
         self.prompt_version = {
             "contract-consistent": PROMPT_VERSION,
@@ -461,11 +660,20 @@ class FullAnswerWorkflow(AnswerWorkflow):
         return workflow
 
     def with_reader_observations(self, enabled: bool) -> FullAnswerWorkflow:
-        """Select the source-fact handoff or index-only writer ablation."""
+        """Enable reader prose and its legacy coverage contract together."""
         if type(enabled) is not bool:
             raise ValueError("reader observation mode must be a boolean")
         workflow = copy(self)
         workflow._reader_observations = enabled
+        workflow._reader_coverage = enabled
+        return workflow
+
+    def with_requirement_coverage(self, enabled: bool) -> FullAnswerWorkflow:
+        """Validate need coverage without passing free-text reader observations."""
+        if type(enabled) is not bool:
+            raise ValueError("requirement coverage mode must be a boolean")
+        workflow = copy(self)
+        workflow._reader_coverage = enabled
         return workflow
 
     def answer_from_agent_context(
@@ -636,6 +844,49 @@ class FullAnswerWorkflow(AnswerWorkflow):
             ),
         )
         response.__schema_variants__ = (answered, partial, insufficient)
+        if getattr(self, "_reader_coverage", False):
+            need_ids = tuple(item["need_id"] for item in self._reading_plan or ()) or ("need-01",)
+            coverage = create_model(
+                "ProvidedRequirementCoverage",
+                __base__=RequirementCoverage,
+                # Same schema as Literal[need_ids]; foreign IDs become deviations on receipt.
+                need_id=(
+                    str,
+                    Field(
+                        json_schema_extra={"const": need_ids[0]}
+                        if len(need_ids) == 1
+                        else {"enum": list(need_ids)}
+                    ),
+                ),
+            )
+            fields = {
+                "requirement_coverage": (
+                    tuple[coverage, ...],
+                    # The grammar still asks for one entry per need; receive validation
+                    # tolerates entries later dropped as inconsistent (output_deviations).
+                    Field(max_length=12, json_schema_extra={"minItems": len(need_ids)}),
+                )
+            }
+            response = create_model("CoveredFullAnswerDraft", __base__=response, **fields)
+            response.__schema_variants__ = tuple(
+                create_model("Covered" + variant.__name__, __base__=variant, **fields)
+                for variant in (answered, partial, insufficient)
+            )
+        else:
+            # Coverage is an internal checklist only when the writer receives reader
+            # observations. Without it, an unsolicited model-generated need ID can pass
+            # Ollama's schema and then fail the stricter Pydantic receive validator.
+            fields = {
+                "requirement_coverage": (
+                    tuple[RequirementCoverage, ...],
+                    Field(default=(), max_length=0),
+                )
+            }
+            response = create_model("NoCoverageFullAnswerDraft", __base__=response, **fields)
+            response.__schema_variants__ = tuple(
+                create_model("NoCoverage" + variant.__name__, __base__=variant, **fields)
+                for variant in (answered, partial, insufficient)
+            )
         return response
 
     @staticmethod
@@ -744,6 +995,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
             __base__=MultipleChoiceBenchmarkAnswerDraft,
             status=(Literal["answered"], ...),
             choice=(Literal["A", "B", "C", "D"], ...),
+            choice_support=(Literal["direct", "limited_inference"], ...),
             choice_citations=(tuple[citation, ...], Field(min_length=1, max_length=8)),
             detail_claims=(tuple[claim, ...], Field(default=(), max_length=9)),
             limitations=(tuple[LimitationText, ...], Field(default=(), max_length=8)),
@@ -753,6 +1005,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
             __base__=MultipleChoiceBenchmarkAnswerDraft,
             status=(Literal["partial"], ...),
             choice=(Literal["A", "B", "C", "D"], ...),
+            choice_support=(Literal["direct", "limited_inference"], ...),
             choice_citations=(tuple[citation, ...], Field(min_length=1, max_length=8)),
             detail_claims=(tuple[claim, ...], Field(default=(), max_length=9)),
             limitations=(tuple[LimitationText, ...], Field(min_length=1, max_length=8)),
@@ -805,9 +1058,20 @@ class FullAnswerWorkflow(AnswerWorkflow):
             "task": "explain" if mode == "explain" else "ask",
             "question": question,
             "requested_output_language": language,
+            "output_budget": {
+                "version": WRITER_BUDGET_VERSION,
+                "tokens": self._budget_config.num_predict,
+                "includes": (
+                    "all JSON fields, citations, support, inference_basis and requirement coverage"
+                    if self._reader_coverage and self.answer_format == "general"
+                    else "all JSON fields, citations, support and inference_basis"
+                ),
+            },
         }
         if self._reading_plan is not None:
             payload["reading_plan"] = self._reading_plan
+        elif self._reader_coverage:
+            payload["reading_plan"] = [{"need_id": "need-01", "need": question}]
         if self._navigation_handoff is not None:
             handoff = self._navigation_handoff
             # Keep the reader's source-linked findings for the writer to verify.
@@ -879,6 +1143,11 @@ class FullAnswerWorkflow(AnswerWorkflow):
             "preserve names, URLs, quotations, and numerical values as needed. "
             "Return the specific entity or relation asked for, not just its general category."
         )
+        system_content += _SUPPORT_INSTRUCTIONS
+        if self._reader_coverage and self.answer_format == "general":
+            system_content += _COVERAGE_INSTRUCTIONS
+        elif self.answer_format == "general":
+            system_content += " Do not add requirement_coverage; it is not requested."
         if self._navigation_handoff is not None:
             system_content += _HANDOFF_INSTRUCTIONS
             if self._reader_observations:
@@ -891,7 +1160,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
                 "supplied originals do not support a need, state that gap."
             )
         if self.prompt_revision == "contract-consistent" and self.answer_format == "general":
-            system_content += " " + _READING_EXAMPLES
+            system_content += " " + _READING_EXAMPLES + _MULTI_ITEM_EXAMPLE
         return (
             ChatMessage(
                 role="system",
@@ -1330,10 +1599,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
             ) from None
         if (
             stats.eval_count > self._budget_config.num_predict
-            or (
-                budget.exact_input_tokens is not None
-                and stats.prompt_eval_count != budget.exact_input_tokens
-            )
+            or stats.prompt_eval_count > budget.input_upper_estimate
             or stats.prompt_eval_count + stats.eval_count > self._budget_config.num_ctx
         ):
             raise WorkflowError("evidence selection exceeded the explicit generation budget")
@@ -1341,6 +1607,14 @@ class FullAnswerWorkflow(AnswerWorkflow):
 
     def _verify_output(self, draft, blocks, *, language: Language = "zh-Hant"):
         available = _spans(blocks)
+        deviations = list(getattr(draft, "_deviations", ()))
+        for item in (
+            *getattr(draft, "answer_claims", ()),
+            *getattr(draft, "detail_claims", ()),
+            *getattr(draft, "requirement_coverage", ()),
+            *((draft.short_answer,) if getattr(draft, "short_answer", None) is not None else ()),
+        ):
+            deviations.extend(getattr(item, "_deviations", ()))
         try:
             if self.answer_format == "short_answer":
                 benchmark_draft = ShortBenchmarkAnswerDraft.model_validate(
@@ -1367,6 +1641,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
                 answer_claims = (
                     (
                         FullClaimDraft(
+                            claim_id=benchmark_draft.choice_claim_id,
                             text=(
                                 f"正確答案為 ({benchmark_draft.choice})。"
                                 if language == "zh-Hant"
@@ -1375,6 +1650,8 @@ class FullAnswerWorkflow(AnswerWorkflow):
                                 else f"({benchmark_draft.choice})"
                             ),
                             citations=benchmark_draft.choice_citations,
+                            support=benchmark_draft.choice_support,
+                            inference_basis=benchmark_draft.choice_inference_basis,
                         ),
                     )
                     if benchmark_draft.choice is not None
@@ -1390,12 +1667,70 @@ class FullAnswerWorkflow(AnswerWorkflow):
                     strict=True,
                 )
             draft = FullAnswerDraft.model_validate(draft.model_dump(warnings=False), strict=True)
+            # Missing or foreign checklist entries do not invalidate cited claims.
+            if self.answer_format == "general" and self._reader_coverage:
+                expected = {item["need_id"] for item in self._reading_plan or ()} or {"need-01"}
+                if {item.need_id for item in draft.requirement_coverage} != expected:
+                    deviations.append({"type": "coverage_need_mismatch", "count": 1})
+                    object.__setattr__(
+                        draft,
+                        "requirement_coverage",
+                        tuple(
+                            item for item in draft.requirement_coverage if item.need_id in expected
+                        ),
+                    )
+            ids = [claim.claim_id for claim in (*draft.answer_claims, *draft.detail_claims)]
+            out_of_order = sum(cid != f"C{i}" for i, cid in enumerate(ids, 1))
+            if out_of_order:
+                deviations.append({"type": "claim_id_order", "count": out_of_order})
             removed = 0
+            duplicate_claims = 0
+            unique: dict[tuple, str] = {}
+            remapped: dict[str, str] = {}
+            direct, details, support = [], [], []
+            for index, claim in enumerate((*draft.answer_claims, *draft.detail_claims), 1):
+                key = (
+                    re.sub(r"\s+", " ", claim.text).strip(),
+                    tuple(sorted({citation.source_id for citation in claim.citations})),
+                    claim.support,
+                    claim.inference_basis,
+                )
+                if key in unique:
+                    duplicate_claims += 1
+                    remapped[claim.claim_id] = unique[key]
+                    continue
+                unique[key] = f"C{len(unique) + 1}"
+                remapped[claim.claim_id] = unique[key]
+                (direct if index <= len(draft.answer_claims) else details).append(
+                    claim.model_copy(update={"claim_id": unique[key]})
+                )
+                support.append(claim.support)
+            coverage = tuple(
+                item.model_copy(
+                    update={
+                        "claim_ids": tuple(dict.fromkeys(remapped[cid] for cid in item.claim_ids))
+                    }
+                )
+                for item in draft.requirement_coverage
+            )
 
-            def span_claim(claim):
+            # model_copy does not validate: rerun the full contract after remapping.
+            draft = FullAnswerDraft.model_validate(
+                {
+                    **draft.model_dump(),
+                    "answer_claims": tuple(direct),
+                    "detail_claims": tuple(details),
+                    "requirement_coverage": tuple(item.model_dump() for item in coverage),
+                },
+                strict=True,
+            )
+            coverage = draft.requirement_coverage
+
+            def span_claim(claim, *, count_duplicates=True):
                 nonlocal removed
                 source_ids = list(dict.fromkeys(citation.source_id for citation in claim.citations))
-                removed += len(claim.citations) - len(source_ids)
+                if count_duplicates:
+                    removed += len(claim.citations) - len(source_ids)
                 return SpanClaimDraft(
                     text=claim.text,
                     citations=tuple(
@@ -1404,9 +1739,17 @@ class FullAnswerWorkflow(AnswerWorkflow):
                     ),
                 )
 
-            answer_claims = tuple(span_claim(claim) for claim in draft.answer_claims)
-            detail_claims = tuple(span_claim(claim) for claim in draft.detail_claims)
+            answer_claims = tuple(span_claim(claim) for claim in direct)
+            detail_claims = tuple(span_claim(claim) for claim in details)
             claims = answer_claims + detail_claims
+            bases = tuple(
+                span_claim(
+                    claim.model_copy(update={"text": claim.inference_basis}), count_duplicates=False
+                )
+                if claim.inference_basis is not None
+                else None
+                for claim in (*direct, *details)
+            )
             mapped = _VerifiedAnswerSpanDraft(
                 status="answered" if claims else "insufficient_evidence",
                 claims=claims,
@@ -1422,9 +1765,33 @@ class FullAnswerWorkflow(AnswerWorkflow):
         except (KeyError, AttributeError, ValueError):
             raise CitationError("citation span was not provided in the context") from None
         verified = validate_span_claims(self._store, self.document_id, mapped, blocks)
+        verified_bases = iter(
+            validate_span_claims(
+                self._store,
+                self.document_id,
+                _VerifiedAnswerSpanDraft(
+                    status="answered" if any(bases) else "insufficient_evidence",
+                    claims=tuple(basis for basis in bases if basis is not None),
+                    limitations=(),
+                ),
+                blocks,
+            )
+        )
+        verified = tuple(
+            claim.model_copy(update={"claim_id": draft_claim.claim_id})
+            for claim, draft_claim in zip(verified, (*direct, *details), strict=True)
+        )
         answer_count = len(answer_claims)
         return verified, {
             "answer_claims": verified[:answer_count],
             "detail_claims": verified[answer_count:],
             "citation_duplicates_removed": removed,
+            "claim_duplicates_removed": duplicate_claims,
+            "output_deviations": tuple(deviations),
+            "requirement_coverage": coverage,
+            "writer_budget_version": WRITER_BUDGET_VERSION,
+            "claim_support": tuple(support),
+            "claim_inference_basis": tuple(
+                next(verified_bases) if basis is not None else None for basis in bases
+            ),
         }

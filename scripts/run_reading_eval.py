@@ -11,6 +11,7 @@ import random
 import re
 import shutil
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -20,22 +21,62 @@ from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
-from page_cite_rag.agent import (
+
+def _bootstrap_implementation_root(argv: list[str]) -> Path | None:
+    """Select an isolated package snapshot before importing PageCiteRAG modules."""
+    values = []
+    index = 0
+    while index < len(argv):
+        value = argv[index]
+        if value == "--implementation-root":
+            if index + 1 >= len(argv):
+                raise SystemExit("--implementation-root requires a directory")
+            values.append(argv[index + 1])
+            index += 2
+            continue
+        if value.startswith("--implementation-root="):
+            values.append(value.partition("=")[2])
+        index += 1
+    if not values:
+        return None
+    if len(values) != 1:
+        raise SystemExit("--implementation-root may be supplied only once")
+    implementation_root = Path(values[0]).expanduser().resolve()
+    source_root = implementation_root / "src"
+    if not (source_root / "page_cite_rag" / "__init__.py").is_file():
+        raise SystemExit("implementation root must contain src/page_cite_rag/__init__.py")
+    sys.path.insert(0, str(source_root))
+    return implementation_root
+
+
+BOOTSTRAPPED_IMPLEMENTATION_ROOT = _bootstrap_implementation_root(sys.argv[1:])
+
+import page_cite_rag  # noqa: E402
+from page_cite_rag import reading_plan as _reading_plan  # noqa: E402
+from page_cite_rag.agent import (  # noqa: E402
     MAX_INTEGRATED_AGENT_CALL_INPUT_TOKENS,
     MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
 )
-from page_cite_rag.answer_metrics import AnswerPrediction, AnswerReference, score_prediction
-from page_cite_rag.dense import DenseRetriever, build_dense_index, dense_index_kind
-from page_cite_rag.embedding import DEFAULT_MODEL_DIR
-from page_cite_rag.embedding_native import NativeEmbeddingEncoder
-from page_cite_rag.embedding_server import DEFAULT_GGUF_PATH, NativeEmbeddingServer
-from page_cite_rag.gap_agent import quote_is_verbatim
-from page_cite_rag.generation import ContextBudgetError, ModelError, OutputValidationError
-from page_cite_rag.gpu_processes import MAX_GPU_MEMORY_MIB
-from page_cite_rag.gpu_retrieval import StagedGpuSearch
-from page_cite_rag.hybrid import reciprocal_rank_fusion
-from page_cite_rag.ingest import prepare_source
-from page_cite_rag.llama import (
+from page_cite_rag.answer_metrics import (  # noqa: E402
+    AnswerPrediction,
+    AnswerReference,
+    score_prediction,
+)
+from page_cite_rag.dense import DenseRetriever, build_dense_index, dense_index_kind  # noqa: E402
+from page_cite_rag.embedding import DEFAULT_MODEL_DIR  # noqa: E402
+from page_cite_rag.embedding_native import NativeEmbeddingEncoder  # noqa: E402
+from page_cite_rag.embedding_server import DEFAULT_GGUF_PATH, NativeEmbeddingServer  # noqa: E402
+from page_cite_rag.gap_agent import quote_is_verbatim  # noqa: E402
+from page_cite_rag.generation import (  # noqa: E402
+    ContextBudgetError,
+    ModelError,
+    OutputValidationError,
+)
+from page_cite_rag.gpu_processes import MAX_GPU_MEMORY_MIB  # noqa: E402
+from page_cite_rag.gpu_retrieval import StagedGpuSearch  # noqa: E402
+from page_cite_rag.hybrid import reciprocal_rank_fusion  # noqa: E402
+from page_cite_rag.ingest import prepare_source  # noqa: E402
+from page_cite_rag.llama import (  # noqa: E402
     DEFAULT_BUNDLE,
     LLAMA_COMMIT,
     MAX_EXACT_INPUT_TOKENS,
@@ -43,25 +84,28 @@ from page_cite_rag.llama import (
     LlamaModelClient,
     model_spec,
 )
-from page_cite_rag.models import DocumentMetadata, ParsedUnit
-from page_cite_rag.qasper import Paper, Passage, ingest_paper
-from page_cite_rag.reading_plan import (
+from page_cite_rag.models import DocumentMetadata, ParsedUnit  # noqa: E402
+from page_cite_rag.qasper import Paper, Passage, ingest_paper  # noqa: E402
+from page_cite_rag.reading_plan import (  # noqa: E402
     MAX_QUERIES_PER_REQUIREMENT,
     MAX_READING_REQUIREMENTS,
     ReadingPlan,
     ScopedReadingPlan,
     reading_plan_messages,
 )
-from page_cite_rag.retrieval import (
+from page_cite_rag.retrieval import (  # noqa: E402
     BM25Retriever,
     SearchContextGroup,
     SearchHit,
     SearchResult,
     build_bm25_index,
 )
-from page_cite_rag.retrieval_profile import FORMAL_RETRIEVAL, MAX_CONTEXT_GROUPS
-from page_cite_rag.store import SQLiteDocumentStore
+from page_cite_rag.retrieval_profile import FORMAL_RETRIEVAL, MAX_CONTEXT_GROUPS  # noqa: E402
+from page_cite_rag.store import SQLiteDocumentStore  # noqa: E402
 
+READING_PLAN_VERSION = getattr(
+    _reading_plan, "READING_PLAN_VERSION", "neutral-needs-source-language-query/v1"
+)
 ROOT = Path(__file__).resolve().parents[1]
 FROZEN_ROOT = ROOT / "outputs/reading-eval-20261020-v3"
 DOCLING_ARTIFACTS = ROOT / "models/docling-pinned"
@@ -102,9 +146,15 @@ AGENT_OUTLINE_ARMS = ("fixed-rag", "decomposition-fixed-rag", "decomposition-out
 # Plan 5.13: fixed RAG against the routed product path. The scoped planner sends
 # whole-document questions to section reading and every other question to the fixed path.
 ROUTED_ARMS = ("fixed-rag", "routed-reading")
-READING_PLAN_ARM_SETS = (QUALITY_V1_ARMS, AGENT_FOCUS_ARMS, AGENT_OUTLINE_ARMS, ROUTED_ARMS)
+READING_PLAN_ARM_SETS = (
+    QUALITY_V1_ARMS,
+    AGENT_FOCUS_ARMS,
+    AGENT_OUTLINE_ARMS,
+    ROUTED_ARMS,
+    ("routed-reading",),
+)
 DEFAULT_ARMS = ROUTED_ARMS
-READING_PLAN_CASE_CEILING = 160
+READING_PLAN_CASE_CEILING = 400
 PROMPT_COMPARISON_ARMS = {
     "fixed-rag-prompt-task-aligned": "task-aligned-v5",
 }
@@ -142,7 +192,7 @@ ARM_ARCHITECTURES = {
     "fixed-rag-reranked": "fixed_hybrid_retrieval_then_one_structured_answer",
     LONG_BENCH_OFFICIAL_ARM: "official_longbench_prompt_over_fixed_retrieval_context",
 }
-RUNNER_VERSION = "frozen-reading-eval-v31-batch-declared"
+RUNNER_VERSION = "frozen-reading-eval-v32-source-deduplicated"
 MAX_RERANKER_PAIR_TOKENS = 200_000_000
 QUALITY_RERANKER_PAIR_LIMIT = 7_200
 QUALITY_RERANKER_PAIR_TOKEN_LIMIT = 30_000_000
@@ -210,6 +260,7 @@ def _answer_format_for(case: dict) -> str:
         "longbench-v2-single-document-qa": "multiple_choice",
         "xrag-zh-mono-crosslingual": "short_answer",
         "derived-crosslingual": "short_answer",
+        "product-functional": "general",
         **{dataset: "general" for dataset in SUMMARY_DATASETS},
     }
     try:
@@ -481,6 +532,7 @@ def _validate_stopped_grid_configuration(run_root: Path, current: dict) -> dict:
     allowed = {
         "scripts/run_reading_eval.py",
         "src/page_cite_rag/cli.py",
+        "src/page_cite_rag/citations.py",
         "src/page_cite_rag/service.py",
     }
     if not changed <= allowed:
@@ -699,6 +751,26 @@ def _case_document(
     return document.document_id, {}
 
 
+def _prepare_case_documents(
+    store: SQLiteDocumentStore, inputs: list[dict], *, chunker=None
+) -> dict[str, tuple[str, dict[str, str]]]:
+    """Import identical frozen sources once, then map each case to that document."""
+    documents: dict[str, tuple[str, dict[str, str]]] = {}
+    by_source: dict[str, tuple[str, dict[str, str]]] = {}
+    for case in inputs:
+        source_key = canonical_hash(
+            {
+                "dataset": case.get("dataset"),
+                "source_id": case.get("source_id"),
+                "source": case.get("source"),
+            }
+        )
+        if source_key not in by_source:
+            by_source[source_key] = _case_document(store, case, chunker=chunker)
+        documents[case["case_id"]] = by_source[source_key]
+    return documents
+
+
 def _xrag_block_article_map(
     store: SQLiteDocumentStore, document_id: str, source: dict
 ) -> dict[str, str]:
@@ -876,16 +948,27 @@ def _preparation_embedding_session(run_root: Path, static: dict, progress: dict)
         raise
 
 
-def _source_code_hashes() -> dict[str, str]:
-    package_files = sorted((ROOT / "src/page_cite_rag").glob("*.py"))
+def _source_code_hashes(implementation_root: Path | None = None) -> dict[str, str]:
+    package_root = (implementation_root or ROOT) / "src/page_cite_rag"
+    package_files = sorted(package_root.glob("*.py"))
+    if not package_files or any(path.is_symlink() for path in package_files):
+        raise ValueError("implementation snapshot is missing or contains symlinked modules")
     paths = [
         ROOT / "scripts/prepare_reading_eval.py",
         ROOT / "scripts/run_reading_eval.py",
-        *package_files,
+        *[(package_root / "__init__.py"), *package_files],
         ROOT / "pyproject.toml",
         ROOT / "uv.lock",
     ]
-    return {path.relative_to(ROOT).as_posix(): sha256(path) for path in paths}
+    hashes = {}
+    for path in dict.fromkeys(paths):
+        relative = (
+            Path("src/page_cite_rag") / path.name
+            if path.parent == package_root
+            else path.relative_to(ROOT)
+        )
+        hashes[relative.as_posix()] = sha256(path)
+    return hashes
 
 
 def static_configuration(
@@ -900,6 +983,7 @@ def static_configuration(
     retrieval_grid: bool = False,
     shared_initial_reranker: bool = False,
     generator_backend: str = "llama-cpp",
+    implementation_root: Path | None = None,
 ) -> dict:
     from page_cite_rag.embedding_native import GGUF_REVISION, GGUF_SHA256
     from page_cite_rag.full_answer import (
@@ -958,7 +1042,7 @@ def static_configuration(
         "routed-reading": None,
     }
     reading_plan_comparison = tuple(arms) in READING_PLAN_ARM_SETS
-    scope_routing = tuple(arms) == ROUTED_ARMS
+    scope_routing = tuple(arms) in (ROUTED_ARMS, ("routed-reading",))
     if shared_initial_reranker and not reading_plan_comparison:
         raise ValueError("shared initial reranking is reserved for the four reading-plan arms")
     answer_call_budget = None
@@ -993,8 +1077,8 @@ def static_configuration(
         },
         "reading_plan": (
             {
-                "protocol": "question-needs-and-bilingual-query-plan/v2",
-                "prompt_revision": "neutral-needs-source-language-query/v1",
+                "protocol": "question-needs-and-bilingual-query-plan/v3",
+                "prompt_revision": READING_PLAN_VERSION,
                 "schema_sha256": canonical_hash(
                     (ScopedReadingPlan if scope_routing else ReadingPlan).model_json_schema()
                 ),
@@ -1015,7 +1099,7 @@ def static_configuration(
             else None
         ),
         "reading_plan_call_budget": reading_plan_budget,
-        "source_code_sha256": _source_code_hashes(),
+        "source_code_sha256": _source_code_hashes(implementation_root),
         "models": {
             "generator": {
                 "name": generator_spec["file"].removesuffix(".gguf"),
@@ -1129,6 +1213,7 @@ def static_configuration(
                 "longbench-v1-multifieldqa-zh": "short_answer",
                 "longbench-v2-single-document-qa": "multiple_choice",
                 "xrag-zh-mono-crosslingual": "short_answer",
+                "product-functional": "general",
                 **{dataset: "general" for dataset in SUMMARY_DATASETS},
             },
             "task_format_override": "validated frozen case task_format, when supplied",
@@ -1429,10 +1514,13 @@ def _copy_preparation_checkpoint(run_root: Path, source_root: Path, static: dict
         "src/page_cite_rag/docling_source.py",
         "src/page_cite_rag/embedding_server.py",
         "src/page_cite_rag/full_answer.py",
+        "src/page_cite_rag/gap_agent.py",
         "src/page_cite_rag/gpu_processes.py",
         "src/page_cite_rag/gpu_retrieval.py",
         "src/page_cite_rag/hybrid.py",
         "src/page_cite_rag/llama.py",
+        # Backend asset validation changes affect model startup, not source parsing or indexes.
+        "src/page_cite_rag/ollama_backend.py",
         "src/page_cite_rag/query.py",
         "src/page_cite_rag/reading_plan.py",
         "src/page_cite_rag/retrieval_profile.py",
@@ -1577,10 +1665,7 @@ def _prepare(
         from page_cite_rag.text import TokenBlockFactory
 
         chunker = TokenBlockFactory(DEFAULT_MODEL_DIR)
-    documents: dict[str, tuple[str, dict[str, str]]] = {}
-    for case in inputs:
-        if case["case_id"] not in documents:
-            documents[case["case_id"]] = _case_document(store, case, chunker=chunker)
+    documents = _prepare_case_documents(store, inputs, chunker=chunker)
     unique_documents = _unique_document_passages(documents)
     article_mappings = {
         case["case_id"]: _xrag_block_article_map(
@@ -1966,30 +2051,36 @@ def _generation_batch_root(path: Path) -> Path | None:
     )
 
 
-def _global_generation_phase(run_root: Path, operation: str) -> str | None:
-    """Map a frozen experiment directory to its approved dispatch phase."""
+def _global_generation_phase(
+    run_root: Path, operation: str, batch_phase: str | None = None
+) -> str | None:
+    """Require an explicitly declared phase for a model call inside a quality batch."""
     batch_root = _generation_batch_root(run_root)
     if batch_root is None:
         return None
-    relative_parts = run_root.resolve().relative_to(batch_root).parts
     if operation not in {"plan", "run"}:
         raise ValueError("unexpected generation operation")
-    joined = "/".join(part.casefold().replace("_", "-") for part in relative_parts)
-    if "protocol" in joined:
-        return "protocol"
-    if "development" in joined:
-        return "development"
-    if "regression" in joined:
-        return "regression_planners" if operation == "plan" else "regression_answers"
-    if "new-diagnostic" in joined:
-        return "new_diagnostics"
-    raise ValueError("quality generation run root must name its frozen phase")
+    if batch_phase is None:
+        raise ValueError("model calls in a declared batch require --batch-phase")
+    limits = _batch_declaration(batch_root)["generation_dispatch_limits"]
+    if batch_phase not in limits or batch_phase == "total":
+        raise ValueError("--batch-phase is not declared in the batch dispatch limits")
+    expected_directory = batch_phase.replace("_", "-")
+    relative_parts = {
+        part.casefold().replace("_", "-")
+        for part in run_root.resolve().relative_to(batch_root).parts
+    }
+    if expected_directory not in relative_parts:
+        raise ValueError("--batch-phase does not match the run root")
+    return batch_phase
 
 
-def _run_reading_plans(run_root: Path, static: dict, inputs: list[dict]) -> dict:
+def _run_reading_plans(
+    run_root: Path, static: dict, inputs: list[dict], *, batch_phase: str | None = None
+) -> dict:
     """Generate one bounded, answer-free plan per case and preserve failed attempts."""
     if static.get("reading_plan") is None:
-        raise ValueError("select all four reading-plan comparison arms before planning")
+        raise ValueError("select a registered reading-plan arm before planning")
     _ensure_run_config(run_root, static)
     store, retrieval = _load_prepared(run_root, static)
     directory = run_root / "reading-plans"
@@ -2013,7 +2104,7 @@ def _run_reading_plans(run_root: Path, static: dict, inputs: list[dict]) -> dict
     started = time.monotonic()
     terminal_error = None
     global_call_ledger, global_call_limit = _global_generation_budget(run_root, static)
-    global_call_phase = _global_generation_phase(run_root, "plan")
+    global_call_phase = _global_generation_phase(run_root, "plan", batch_phase)
     with _generator_client(
         static,
         _llama_config(static, num_predict=static["reading_plan"]["num_predict"]),
@@ -6255,7 +6346,7 @@ def _preflight_reading_plan(run_root: Path, static: dict, inputs: list[dict]) ->
         diagnostics = _safe_model_diagnostics(model)
     result = {
         "state": "preflight_complete_no_generation",
-        "protocol": "question-needs-and-bilingual-query-plan/v2",
+        "protocol": "question-needs-and-bilingual-query-plan/v3",
         "static_configuration_sha256": canonical_hash(static),
         "generator_identity": identity,
         "planning_results_sha256": sha256(run_root / "reading-plans/results.jsonl"),
@@ -6830,7 +6921,7 @@ def _run_longbench_official_arm(
             except Exception as exc:
                 failure = {
                     "error_type": type(exc).__name__,
-                    "message": str(exc)[:300],
+                    **_failure_details(exc, "generation", (context,)),
                     "reason": getattr(exc, "reason", None),
                 }
                 raw_output = getattr(exc, "raw_model_output", None)
@@ -7281,6 +7372,8 @@ class _CountingModelClient:
         record.update(
             status="completed",
             stats=result.stats.model_dump(mode="json"),
+            # Local tokenizer count beside the server count, for the stage-2 delta report.
+            local_input_tokens=getattr(getattr(result, "budget", None), "exact_input_tokens", None),
             raw_model_output=result.raw_model_output,
             structured_value=result.value.model_dump(mode="json"),
         )
@@ -7348,12 +7441,65 @@ def _structured_usage(records: list[dict]) -> dict:
     }
 
 
+def _select_run_cases(
+    inputs: list[dict], *, case_id: str | None, run_case_ids: list[str] | None
+) -> list[dict]:
+    available_case_ids = {case["case_id"] for case in inputs}
+    if case_id is not None and run_case_ids is not None:
+        raise ValueError("--case-id and --run-case-ids cannot be combined")
+    if run_case_ids is not None:
+        if not run_case_ids or len(set(run_case_ids)) != len(run_case_ids):
+            raise ValueError("run case IDs must be a nonempty unique selection")
+        requested_case_ids = set(run_case_ids)
+        if not requested_case_ids.issubset(available_case_ids):
+            raise ValueError("run case ID is not in the frozen input manifest")
+    elif case_id is not None:
+        requested_case_ids = {case_id}
+        if not requested_case_ids.issubset(available_case_ids):
+            raise ValueError("requested case ID is not in the frozen input manifest")
+    else:
+        requested_case_ids = available_case_ids
+    selected = [case for case in inputs if case["case_id"] in requested_case_ids]
+    if not selected:
+        raise ValueError("run selection contains no frozen input cases")
+    return selected
+
+
+def _failure_details(exc: Exception, stage: str, source_texts=()) -> dict:
+    """Bound exception diagnostics and redact source echoes before saving results."""
+    from pydantic import ValidationError
+
+    from page_cite_rag.agent import AgentRunFailure
+
+    cause = exc.__cause__ if isinstance(exc, AgentRunFailure) and exc.__cause__ else exc
+    # Pydantic's string representation includes rejected input. Keep only error kinds.
+    if isinstance(cause, ValidationError):
+        message = "; ".join(e["type"] for e in cause.errors(include_input=False))
+    else:
+        message = str(cause)
+    normalized = " ".join(message.split())
+    # Any 12-character run of a source block counts as a document echo; shorter
+    # blocks (titles, numbers) would redact ordinary diagnostics by coincidence.
+    width = 12
+    for source in source_texts:
+        source = " ".join(source.split())
+        if len(source) >= width and any(
+            source[i : i + width] in normalized for i in range(len(source) - width + 1)
+        ):
+            normalized = "[redacted: exception message contains document text]"
+            break
+    return {"error_message": normalized[:500], "failure_stage": stage}
+
+
 def _run_arm(
     run_root: Path,
     static: dict,
     inputs: list[dict],
     arm: str,
     case_id: str | None,
+    *,
+    batch_phase: str | None = None,
+    run_case_ids: list[str] | None = None,
 ) -> dict:
     if arm not in ARMS:
         raise ValueError("unknown evaluation arm")
@@ -7375,9 +7521,7 @@ def _run_arm(
         plan_rows = _load_reading_plans(run_root, static, inputs)
         if static["retrieval"].get("shared_initial_reranker"):
             planned_reranks = _load_planned_initial_reranks(run_root, static, inputs)
-    selected = [case for case in inputs if case_id is None or case["case_id"] == case_id]
-    if not selected or (case_id is not None and selected[0]["case_id"] != case_id):
-        raise ValueError("requested case ID is not in the frozen input manifest")
+    selected = _select_run_cases(inputs, case_id=case_id, run_case_ids=run_case_ids)
 
     from page_cite_rag.agent import AgentRunFailure, ReadingReport, _admit
     from page_cite_rag.application import FrozenSearchRetriever, ask_with_agent, document_workflow
@@ -7392,12 +7536,12 @@ def _run_arm(
     completed = 0
     stopped = None
     global_call_ledger, global_call_limit = _global_generation_budget(run_root, static)
-    global_call_phase = _global_generation_phase(run_root, "run")
+    global_call_phase = _global_generation_phase(run_root, "run", batch_phase)
     with _generator_client(
         static,
         _llama_config(static),
         budget_policy="exact",
-        recover_output_errors=False,
+        recover_output_errors=True,
         sampling_profile=static["answer"]["sampling_profile"],
         sampling_seed=42,
     ) as model:
@@ -7427,7 +7571,9 @@ def _run_arm(
                         "dataset": case["dataset"],
                         "execution": "failed",
                         "failure": {
-                            "error_type": preflight_case.get("status", "preflight_not_ready")
+                            "error_type": preflight_case.get("status", "preflight_not_ready"),
+                            "error_message": "preflight did not admit this case",
+                            "failure_stage": "preflight",
                         },
                         "result": None,
                         "completion_calls_attempted": 0,
@@ -7594,14 +7740,22 @@ def _run_arm(
             exact_preflight = preflight_case
             common_ids = exact_preflight["admitted_block_ids"]
             common_set = set(common_ids)
-            common_blocks = tuple(block for block in blocks if block.block_id in common_set)
+            blocks_by_id = {block.block_id: block for block in blocks}
+            if (
+                len(common_set) != len(common_ids)
+                or len(blocks_by_id) != len(blocks)
+                or not common_set.issubset(blocks_by_id)
+            ):
+                raise ValueError("runtime context differs from frozen common evidence")
+            # Admission can omit an early Docling group while a later group reuses
+            # some of its source blocks. Rebuild the frozen subset in the exact
+            # preflight order instead of relying on first occurrence in retrieval order.
+            common_blocks = tuple(blocks_by_id[block_id] for block_id in common_ids)
             common_groups = tuple(
                 group
                 for group in search.context_groups
                 if set(group.source_block_ids).issubset(common_set)
             )
-            if [block.block_id for block in common_blocks] != common_ids:
-                raise ValueError("runtime context differs from frozen common evidence")
             try:
                 context = _admit(
                     workflow,
@@ -7912,6 +8066,12 @@ def _run_arm(
                             "error_type": exc.error_type
                             if isinstance(exc, AgentRunFailure)
                             else type(exc).__name__,
+                            **_failure_details(
+                                exc,
+                                (getattr(exc, "trace", None) or {}).get("failure_stage")
+                                or ("final_answer" if final_attempted else "reading"),
+                                (b.text for b in store.get_blocks(workflow.document_id)),
+                            ),
                             "agent_trace": exc.trace if isinstance(exc, AgentRunFailure) else None,
                             "reading_trace": reading_trace,
                             "final_answer_attempted": final_attempted,
@@ -7935,7 +8095,7 @@ def _run_arm(
                             if (
                                 "accounting" not in failure
                                 and returned.stats.prompt_eval_count
-                                == exact_preflight["exact_final_input_tokens"]
+                                <= returned.budget.input_upper_estimate
                                 and returned.stats.eval_count <= model.config.num_predict
                             ):
                                 failure["accounting"] = {
@@ -7964,6 +8124,8 @@ def _run_arm(
                         **(failure or {}),
                         "underlying_error_type": (failure or {}).get("error_type"),
                         "error_type": "CaseDeadlineExceeded",
+                        "error_message": "case deadline exceeded",
+                        "failure_stage": "deadline",
                         "deadline_seconds": MAX_CASE_WALL_SECONDS,
                     }
                 else:
@@ -7971,6 +8133,8 @@ def _run_arm(
                         **(failure or {}),
                         "underlying_error_type": (failure or {}).get("error_type"),
                         "error_type": "CaseDeadlineExceeded",
+                        "error_message": "case deadline exceeded",
+                        "failure_stage": "deadline",
                         "deadline_seconds": MAX_CASE_WALL_SECONDS,
                     }
 
@@ -9056,6 +9220,16 @@ def main() -> int:
     parser.add_argument("--frozen-root", type=Path, default=FROZEN_ROOT)
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
     parser.add_argument(
+        "--implementation-root",
+        type=Path,
+        help="isolated code snapshot containing src/page_cite_rag",
+    )
+    parser.add_argument(
+        "--batch-phase",
+        choices=("protocol", "development", "holdout", "cpu_smoke"),
+        help="explicit dispatch budget phase required for model calls in a declared batch",
+    )
+    parser.add_argument(
         "--resume-grid-after-stop",
         action="store_true",
         help="continue unstarted grid cases after a recorded stop; never retry failures",
@@ -9089,6 +9263,11 @@ def main() -> int:
         "--case-ids",
         nargs="+",
         help="freeze a selected case slice for prepare, preflight, run, and score",
+    )
+    parser.add_argument(
+        "--run-case-ids",
+        nargs="+",
+        help="limit one run invocation to already frozen cases without changing the run config",
     )
     parser.add_argument(
         "--compare-arms",
@@ -9130,6 +9309,26 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
+        implementation_root = (
+            args.implementation_root.expanduser().resolve()
+            if args.implementation_root is not None
+            else None
+        )
+        if implementation_root != BOOTSTRAPPED_IMPLEMENTATION_ROOT:
+            raise ValueError(
+                "implementation root changed after module import; restart with one "
+                "--implementation-root value"
+            )
+        if implementation_root is not None:
+            imported_root = Path(page_cite_rag.__file__).resolve().parent
+            if imported_root != implementation_root / "src/page_cite_rag":
+                raise ValueError("imported PageCiteRAG package differs from the requested snapshot")
+        resolved_run_root = args.run_root.expanduser().resolve()
+        batch_root = _generation_batch_root(resolved_run_root)
+        if batch_root is not None and args.phase in ("plan", "run") and args.batch_phase is None:
+            raise ValueError("model calls in a declared batch require --batch-phase")
+        if batch_root is None and args.batch_phase is not None:
+            raise ValueError("--batch-phase requires a declared batch.json")
         if args.phase not in ("score", "retrieval-score", "reranker-score") and not GPU_UUID:
             raise ValueError("set PAGE_CITE_RAG_GPU_UUID to an explicit GPU UUID")
         if (
@@ -9176,6 +9375,17 @@ def main() -> int:
         selected_inputs = [input_by_id[case_id] for case_id in selected_case_ids]
         if args.case_id is not None and args.case_id not in selected_case_ids:
             raise ValueError("run case ID must be included in the selected case slice")
+        if args.run_case_ids is not None:
+            if args.phase != "run":
+                raise ValueError("--run-case-ids is valid only with --phase run")
+            if args.case_id is not None:
+                raise ValueError("--case-id and --run-case-ids cannot be combined")
+            if args.arm == LONG_BENCH_OFFICIAL_ARM:
+                raise ValueError("--run-case-ids is not supported for the LongBench official arm")
+            if len(set(args.run_case_ids)) != len(args.run_case_ids):
+                raise ValueError("run case IDs must be unique")
+            if not set(args.run_case_ids).issubset(selected_case_ids):
+                raise ValueError("run case ID must be included in the frozen case selection")
         if args.phase == "run" and args.arm is None:
             raise ValueError("--phase run requires --arm")
         if args.phase == "run" and args.arm not in args.compare_arms:
@@ -9194,6 +9404,7 @@ def main() -> int:
             query_embedding_token_limit=args.query_embedding_token_limit,
             retrieval_grid=args.retrieval_grid,
             shared_initial_reranker=args.shared_initial_reranker,
+            implementation_root=implementation_root,
         )
         if args.resume_grid_after_stop:
             current = static
@@ -9237,7 +9448,9 @@ def main() -> int:
                 reuse_from=args.reuse_preparation_from,
             )
         elif args.phase == "plan":
-            result = _run_reading_plans(run_root, static, selected_inputs)
+            result = _run_reading_plans(
+                run_root, static, selected_inputs, batch_phase=args.batch_phase
+            )
         elif args.phase == "planned-retrieval":
             result = _run_planned_retrieval(run_root, static, selected_inputs)
         elif args.phase == "rerank":
@@ -9250,7 +9463,15 @@ def main() -> int:
             result = (
                 _run_longbench_official_arm(run_root, static, selected_inputs, args.case_id)
                 if args.arm == LONG_BENCH_OFFICIAL_ARM
-                else _run_arm(run_root, static, selected_inputs, args.arm, args.case_id)
+                else _run_arm(
+                    run_root,
+                    static,
+                    selected_inputs,
+                    args.arm,
+                    args.case_id,
+                    batch_phase=args.batch_phase,
+                    run_case_ids=args.run_case_ids,
+                )
             )
         elif args.phase == "retrieval-grid":
             result = _run_retrieval_grid(

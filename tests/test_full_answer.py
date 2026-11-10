@@ -108,6 +108,8 @@ class _Model:
                 "status": "partial",
                 "answer_claims": [
                     {
+                        "claim_id": "C1",
+                        "support": "direct",
                         "text": "The result rose by 42%.",
                         "citations": [{"source_id": evidence[0]["source_id"]}],
                     }
@@ -120,6 +122,8 @@ class _Model:
                 "status": "answered",
                 "answer_claims": [
                     {
+                        "claim_id": "C1",
+                        "support": "direct",
                         "text": "The result rose by 42% only under condition A.",
                         "citations": [
                             {"source_id": item["source_id"]}
@@ -133,6 +137,8 @@ class _Model:
                 ],
                 "detail_claims": [
                     {
+                        "claim_id": "C2",
+                        "support": "direct",
                         "text": "Condition A limits when the reported 42% increase applies.",
                         "citations": [{"source_id": item["source_id"]} for item in evidence[:2]],
                     },
@@ -292,7 +298,11 @@ def test_reading_plan_is_passed_as_unverified_checklist_not_evidence(tmp_path):
     plan = ReadingPlan.model_validate(
         {
             "requirements": (
-                {"need": "State the direction and amount", "queries": ("increase amount",)},
+                {
+                    "need": "State the direction and amount",
+                    "task": "lookup",
+                    "queries": ("increase amount",),
+                },
             )
         }
     )
@@ -305,6 +315,7 @@ def test_reading_plan_is_passed_as_unverified_checklist_not_evidence(tmp_path):
         {
             "need_id": "need-01",
             "need": "State the direction and amount",
+            "task": "lookup",
             "queries": ["increase amount"],
         }
     ]
@@ -334,7 +345,12 @@ def test_request_schema_enforces_status_claim_and_source_id_contract(tmp_path):
     assert schema["discriminator"]["propertyName"] == "status"
     assert schema["$defs"]["ProvidedShortCitationDraft"]["properties"]["source_id"]["const"] == "S1"
 
-    claim = {"text": "The result rose by 42%.", "citations": [{"source_id": "S1"}]}
+    claim = {
+        "claim_id": "C1",
+        "support": "direct",
+        "text": "The result rose by 42%.",
+        "citations": [{"source_id": "S1"}],
+    }
     with pytest.raises(ValidationError):
         response_model.model_validate_json(
             json.dumps(
@@ -364,6 +380,8 @@ def test_request_schema_enforces_status_claim_and_source_id_contract(tmp_path):
                     "status": "answered",
                     "answer_claims": [
                         {
+                            "claim_id": "C1",
+                            "support": "direct",
                             "text": "The result rose by 42%.",
                             "citations": [{"source_id": "S999"}],
                         }
@@ -406,6 +424,8 @@ def test_request_schema_enforces_status_claim_and_source_id_contract(tmp_path):
             {
                 "status": "answered",
                 "short_answer": {
+                    "claim_id": "C1",
+                    "support": "direct",
                     "text": "42% under condition A",
                     "citations": [{"source_id": "S1"}],
                 },
@@ -417,6 +437,8 @@ def test_request_schema_enforces_status_claim_and_source_id_contract(tmp_path):
         (
             "multiple_choice",
             {
+                "choice_claim_id": "C1",
+                "choice_support": "direct",
                 "status": "answered",
                 "choice": "C",
                 "choice_citations": [{"source_id": "S1"}],
@@ -452,6 +474,8 @@ def test_benchmark_answer_formats_are_schema_constrained_and_normalized(
                 draft = {
                     "status": "answered",
                     "short_answer": {
+                        "claim_id": "C1",
+                        "support": "direct",
                         "text": expected_answer,
                         "citations": [{"source_id": source_id}],
                     },
@@ -460,6 +484,8 @@ def test_benchmark_answer_formats_are_schema_constrained_and_normalized(
                 }
             else:
                 draft = {
+                    "choice_claim_id": "C1",
+                    "choice_support": "direct",
                     "status": "answered",
                     "choice": "C",
                     "choice_citations": [{"source_id": source_id}],
@@ -896,9 +922,16 @@ def test_completed_answer_can_include_a_scope_note_without_changing_status(answe
     }
     citation = {"source_id": "S1"}
     if answer_format == "short_answer":
-        draft["short_answer"] = {"text": "The Table of the House", "citations": [citation]}
+        draft["short_answer"] = {
+            "claim_id": "C1",
+            "support": "direct",
+            "text": "The Table of the House",
+            "citations": [citation],
+        }
     else:
-        draft.update(choice="B", choice_citations=[citation])
+        draft.update(
+            choice_claim_id="C1", choice="B", choice_citations=[citation], choice_support="direct"
+        )
     model = workflow.agent_response_model()
     parsed = model.model_validate_json(json.dumps(draft))
     assert parsed.status == "answered"

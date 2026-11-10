@@ -146,6 +146,40 @@ def verify_bundle(directory: Path, model_size: Literal["9b", "4b", "27b"] = "9b"
         raise ModelError("local llama bundle is missing or changed; prepare explicitly") from None
 
 
+def verify_gguf_only(directory: Path, spec: dict | None = None) -> dict:
+    """Verify the pinned 9B GGUF-only artifact used by CPU Ollama installs."""
+    spec = spec or model_spec("9b")
+    manifest_name = "model-manifest.json"
+    try:
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("missing model-only directory")
+        if any(path.is_symlink() for path in directory.rglob("*")):
+            raise ValueError("model-only files must not be symlinks")
+        manifest_path = directory / manifest_name
+        model_path = directory / spec["file"]
+        if manifest_path.stat().st_size > 65536:
+            raise ValueError("invalid model-only manifest")
+        manifest = json.loads(manifest_path.read_text())
+        actual_files = {
+            str(path.relative_to(directory)) for path in directory.rglob("*") if path.is_file()
+        }
+        if (
+            manifest.get("format") != 1
+            or manifest.get("model_repo") != spec["repo"]
+            or manifest.get("model_revision") != spec["revision"]
+            or manifest.get("model_sha256") != spec["sha256"]
+            or manifest.get("files") != {spec["file"]: spec["sha256"]}
+            or actual_files != {manifest_name, spec["file"]}
+            or not model_path.is_file()
+            or model_path.stat().st_size != spec["bytes"]
+            or sha256(model_path) != spec["sha256"]
+        ):
+            raise ValueError("model-only artifact differs from the pinned GGUF")
+        return {**manifest, "manifest_name": manifest_name}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        raise ModelError("local pinned GGUF-only model is missing or changed") from None
+
+
 class LlamaConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -267,6 +301,7 @@ class LlamaModelClient:
             "exit_code_before_termination": None,
             "exit_code_after_termination": None,
             "termination_requested": False,
+            "startup_probe_timeouts": 0,
             "last_request": None,
             "last_completion": None,
             "guard_error": None,
@@ -285,11 +320,7 @@ class LlamaModelClient:
         self._gpu_temperature_limits = None
         try:
             self._model_spec = model_spec(config.model_size)
-            manifest = (
-                verify_bundle(config.bundle_dir)
-                if config.model_size == "9b"
-                else verify_bundle(config.bundle_dir, config.model_size)
-            )
+            manifest = self._verify_bundle_assets(config.bundle_dir)
             self._bundle = config.bundle_dir.resolve()
             self._fingerprints = self._file_state(manifest)
             self._start(transport=transport)
@@ -325,11 +356,34 @@ class LlamaModelClient:
             raise
 
     def _file_state(self, manifest: dict) -> dict:
+        manifest_name = manifest.get("manifest_name", "manifest.json")
         return {
             name: (p.stat().st_ino, p.stat().st_size, p.stat().st_mtime_ns)
-            for name in (*manifest["files"], "manifest.json")
+            for name in (*manifest["files"], manifest_name)
             for p in [self._bundle / name]
         }
+
+    def _verify_bundle_assets(self, directory: Path) -> dict:
+        """Verify assets required by this backend before starting its server."""
+        return verify_bundle(directory, self.config.model_size)
+
+    def _verify_assets_unchanged(self) -> None:
+        for name, expected in self._fingerprints.items():
+            path = self._bundle / name
+            try:
+                unchanged = (
+                    not path.is_symlink()
+                    and (
+                        path.stat().st_ino,
+                        path.stat().st_size,
+                        path.stat().st_mtime_ns,
+                    )
+                    == expected
+                )
+            except OSError:
+                unchanged = False
+            if not unchanged:
+                raise ModelError("prepared runtime/model changed during this session")
 
     def _gpu_snapshot(self) -> dict:
         try:
@@ -703,7 +757,13 @@ class LlamaModelClient:
 
         def cancel_owned_computation():
             expired.set()
-            self._stop_owned_process()
+            if allow_loading and payload is None and path in {"/health", "/api/version"}:
+                # Readiness polling has no submitted inference to cancel. Keep
+                # initialization alive until the enclosing startup deadline.
+                with self._diagnostic_lock:
+                    self._diagnostic["startup_probe_timeouts"] += 1
+            else:
+                self._stop_owned_process()
 
         watchdog = threading.Timer(budget, cancel_owned_computation)
         watchdog.daemon = True
@@ -796,13 +856,7 @@ class LlamaModelClient:
 
     def _tokenized_prompt(self, prompt):
         self._ensure_running()
-        for name, expected in self._fingerprints.items():
-            path = self._bundle / name
-            if (
-                path.is_symlink()
-                or (path.stat().st_ino, path.stat().st_size, path.stat().st_mtime_ns) != expected
-            ):
-                raise ModelError("prepared runtime/model changed during this session")
+        self._verify_assets_unchanged()
         props = self._request("/props")
         if props.get("default_generation_settings", {}).get("n_ctx") != self.config.num_ctx:
             raise ContextBudgetError("resident server context changed")
@@ -1132,9 +1186,18 @@ class LlamaModelClient:
                 )
             except (ValidationError, KeyError, TypeError, ValueError, OverflowError):
                 raise StructuredOutputError("llama runtime metrics violate the schema") from None
+            if stats.prompt_eval_count != len(tokens):
+                with self._diagnostic_lock:
+                    # Diagnostics are best effort; a missing record must not fail generation.
+                    recorded = self._diagnostic.get("last_completion")
+                    if isinstance(recorded, dict):
+                        recorded["prompt_token_counts"] = {
+                            "local": len(tokens),
+                            "server": stats.prompt_eval_count,
+                            "server_minus_local": stats.prompt_eval_count - len(tokens),
+                        }
             if (
-                stats.prompt_eval_count != len(tokens)
-                or stats.prompt_eval_count > budget.input_upper_estimate
+                stats.prompt_eval_count > budget.input_upper_estimate
                 or stats.eval_count > self.config.num_predict
             ):
                 raise ContextBudgetError("runtime token counts violate the configured budget")

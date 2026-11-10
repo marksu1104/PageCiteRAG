@@ -141,6 +141,8 @@ class FakeClient:
                         "status": "answered",
                         "answer_claims": [
                             {
+                                "claim_id": "C1",
+                                "support": "direct",
                                 "text": (
                                     "结果并不显著，除非 n > 64；儿童被排除。"
                                     if "Traditional Chinese" in messages[0].content
@@ -655,7 +657,7 @@ def test_auto_route_cli_answers_through_the_shared_entry_and_reports_it(
 ):
     from page_cite_rag import application
     from page_cite_rag.dense import build_dense_index
-    from test_dense import FakeEncoder
+    from tests.test_dense import FakeEncoder
 
     store, document_id, _ = document
     build_bm25_index(store, document_id)

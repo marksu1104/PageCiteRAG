@@ -14,7 +14,7 @@ from page_cite_rag.source_outline import OUTLINE_KIND, SourceOutline
 from page_cite_rag.span_citations import source_spans
 from page_cite_rag.store import SQLiteDocumentStore, StoreError
 from page_cite_rag.workflows import AnswerWorkflow, WorkflowError
-from test_workflows import FakeModel
+from tests.test_workflows import FakeModel
 
 
 def _workflow(store, document_id):

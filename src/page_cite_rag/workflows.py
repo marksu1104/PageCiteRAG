@@ -32,6 +32,7 @@ from page_cite_rag.generation import (
 )
 from page_cite_rag.hybrid import Retriever
 from page_cite_rag.models import Block, ParsedUnit, UnitSummary
+from page_cite_rag.reading_plan import RequirementCoverage
 from page_cite_rag.retrieval import SearchBranchTrace, SearchContextGroup, SearchResult
 from page_cite_rag.retrieval_profile import MAX_CONTEXT_GROUPS
 from page_cite_rag.source_outline import (
@@ -253,6 +254,12 @@ class AnswerResult(BaseModel):
     # Exact repeats of one source within one claim, dropped before citation checks; the
     # claim's support is unchanged, so one repeated reference no longer voids the answer.
     citation_duplicates_removed: int = Field(default=0, ge=0)
+    output_deviations: tuple[dict, ...] = ()
+    claim_duplicates_removed: int = Field(default=0, ge=0)
+    requirement_coverage: tuple[RequirementCoverage, ...] = ()
+    claim_support: tuple[Literal["direct", "limited_inference"], ...] = ()
+    claim_inference_basis: tuple[VerifiedClaim | None, ...] = ()
+    writer_budget_version: str | None = None
     model_identity: dict
     prompt_version: Literal[
         "complete-cited-answer-v1",
@@ -260,14 +267,30 @@ class AnswerResult(BaseModel):
         "complete-cited-answer-v3",
         "complete-cited-answer-v4",
         "complete-cited-answer-v5-task-aligned",
+        "complete-cited-answer-v6-task-aligned-scoped-support",
         "complete-cited-answer-v5-source-facts-first",
         "complete-cited-answer-v6-contract-consistent",
         "complete-cited-answer-v7-answer-evidence-alignment",
         "complete-cited-answer-v9-requirement-examples",
         "complete-cited-answer-v10-source-backed-absence",
+        "complete-cited-answer-v12-scoped-support",
+        "complete-cited-answer-v13-explicit-support",
+        "complete-cited-answer-v14-head-schema",
+        "complete-cited-answer-v15-claim-ids",
+        "complete-cited-answer-v17-no-unsolicited-coverage",
+        "complete-cited-answer-v18-original-evidence-handoff",
+        "complete-cited-answer-v7-task-aligned-explicit-support",
+        "complete-cited-answer-v8-task-aligned-head-schema",
+        "complete-cited-answer-v9-task-aligned-claim-ids",
+        "complete-cited-answer-v10-task-aligned-receive-normalization",
         "integrated-reading-agent/v1",
         "agentic-reading-v2",
         "agentic-reading-v3",
+        "agentic-reading-v5-scoped-evidence",
+        "agentic-reading-v6-output-budget",
+        "agentic-reading-v7-head-schema",
+        "agentic-reading-v10-need-aware-windows",
+        "agentic-reading-v11-incremental-follow-up",
         "source-backed-claims-v1",
     ] = PROMPT_VERSION
     budget: PromptBudget
@@ -298,10 +321,18 @@ class AnswerResult(BaseModel):
                     and self.budget.exact_input_tokens == self.agent_usage.final_input_tokens
                     and self.budget.output_reserved == self.agent_usage.final_output_limit
                 )
-            elif self.prompt_version in ("agentic-reading-v2", "agentic-reading-v3"):
+            elif self.prompt_version in (
+                "agentic-reading-v2",
+                "agentic-reading-v3",
+                "agentic-reading-v5-scoped-evidence",
+                "agentic-reading-v6-output-budget",
+                "agentic-reading-v7-head-schema",
+                "agentic-reading-v10-need-aware-windows",
+                "agentic-reading-v11-incremental-follow-up",
+            ):
                 valid_usage = (
                     self.generation_stats is not None
-                    and self.budget.exact_input_tokens == self.agent_usage.final_input_tokens
+                    and self.agent_usage.final_input_tokens <= self.budget.input_upper_estimate
                     and self.budget.output_reserved == self.agent_usage.final_output_limit
                     and self.generation_stats.prompt_eval_count
                     == self.agent_usage.final_input_tokens
@@ -315,12 +346,38 @@ class AnswerResult(BaseModel):
             "integrated-reading-agent/v1",
             "agentic-reading-v2",
             "agentic-reading-v3",
+            "agentic-reading-v5-scoped-evidence",
+            "agentic-reading-v6-output-budget",
+            "agentic-reading-v7-head-schema",
+            "agentic-reading-v10-need-aware-windows",
+            "agentic-reading-v11-incremental-follow-up",
         ):
             raise ValueError("integrated-agent results require their full agent usage ledger")
         if len(set(self.included_block_ids)) != len(self.included_block_ids):
             raise ValueError("included source block IDs must be unique")
         if set(self.included_block_ids) & set(self.omitted_block_ids):
             raise ValueError("included and omitted blocks must be disjoint")
+        # T4 H15 hard: delivered support, bases and canonical IDs must align with verified claims.
+        claim_count = len(answer_claims) + len(detail_claims)
+        if self.claim_support and len(self.claim_support) != claim_count:
+            raise ValueError("claim support labels must match the delivered claims")
+        if self.claim_inference_basis or "limited_inference" in self.claim_support:
+            if (
+                len(self.claim_inference_basis) != claim_count
+                or len(self.claim_support) != claim_count
+            ):
+                raise ValueError("inference bases must match the delivered claims")
+            for support, basis in zip(self.claim_support, self.claim_inference_basis, strict=True):
+                if (support == "limited_inference") != (basis is not None):
+                    raise ValueError("inference bases contradict support labels")
+        claim_ids = [claim.claim_id for claim in (*answer_claims, *detail_claims)]
+        if self.writer_budget_version is not None or self.requirement_coverage or any(claim_ids):
+            if claim_ids != [f"C{i}" for i in range(1, claim_count + 1)]:
+                raise ValueError("delivered claim IDs must be unique and sequential from C1")
+        if any(
+            cid not in claim_ids for item in self.requirement_coverage for cid in item.claim_ids
+        ):
+            raise ValueError("requirement coverage must refer to delivered claims")
         return self
 
     @property
@@ -894,10 +951,7 @@ class AnswerWorkflow:
             after_generation(generation_stats)
         if (
             generation_stats.eval_count > self._budget_config.num_predict
-            or (
-                budget.exact_input_tokens is not None
-                and generation_stats.prompt_eval_count != budget.exact_input_tokens
-            )
+            or generation_stats.prompt_eval_count > budget.input_upper_estimate
             or generation_stats.prompt_eval_count + generation_stats.eval_count
             > self._budget_config.num_ctx
         ):

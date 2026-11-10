@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -73,6 +74,7 @@ def join_table_line_breaks(document) -> int:
 # splits a word ("失 溫"); those scripts put no spaces between characters, so a single space
 # between two such characters is removed from saved text and search chunks alike.
 CJK_JOIN_VERSION = "cjk-line-break-join/v1"
+CJK_COMPATIBILITY_VERSION = "cjk-compat/v1"
 _CJK = (
     "\u2e80-\u2fff\u3000-\u303f\u3040-\u30ff\u3100-\u312f\u3200-\u32ff\u3400-\u4dbf"
     "\u4e00-\u9fff\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef"
@@ -101,6 +103,52 @@ def join_cjk_line_breaks(document) -> int:
             if cell.text:
                 cell.text = join(cell.text)
     return joins
+
+
+def normalize_cjk_compatibility_chars(document) -> int:
+    """Normalize extracted CJK radicals/compatibility glyphs to their unified forms.
+
+    This is deliberately narrower than applying NFKC to all text: ordinary full-width
+    punctuation, superscripts, and other compatibility characters remain untouched.
+    The selected mappings are one code point to one code point, so stored character
+    offsets remain stable. The original PDF and its hash remain the citation authority.
+    """
+    normalized = 0
+
+    def normalize(text: str) -> str:
+        nonlocal normalized
+        output = []
+        for char in text:
+            codepoint = ord(char)
+            if not (0x2E80 <= codepoint <= 0x2FDF or 0xF900 <= codepoint <= 0xFAFF):
+                output.append(char)
+                continue
+            name = unicodedata.name(char, "")
+            if "RADICAL" not in name and "CJK COMPATIBILITY IDEOGRAPH" not in name:
+                output.append(char)
+                continue
+            candidate = unicodedata.normalize("NFKC", char)
+            if (
+                len(candidate) == 1
+                and unicodedata.category(candidate) == "Lo"
+                and 0x3400 <= ord(candidate) <= 0x9FFF
+            ):
+                output.append(candidate)
+                normalized += 1
+            else:
+                output.append(char)
+        return "".join(output)
+
+    for item in document.texts:
+        if item.text:
+            item.text = normalize(item.text)
+        if isinstance(getattr(item, "orig", None), str):
+            item.orig = normalize(item.orig)
+    for table in document.tables:
+        for cell in table.data.table_cells:
+            if cell.text:
+                cell.text = normalize(cell.text)
+    return normalized
 
 
 _SOURCE_VERSION = "docling-native-document/v2"
@@ -343,7 +391,11 @@ def bundle_from_native(
         **(
             {
                 key: normalization[key]
-                for key in ("table_cell_line_break_joins", "cjk_line_break_joins")
+                for key in (
+                    "table_cell_line_break_joins",
+                    "cjk_line_break_joins",
+                    "cjk_compatibility_normalizations",
+                )
                 if key in normalization
             }
             if isinstance(normalization := document.get(NORMALIZATION_KEY), dict)
@@ -643,6 +695,7 @@ def convert_pdf(
     # Before chunking, so search chunks and stored table blocks carry the same text.
     table_joins = join_table_line_breaks(result.document)
     cjk_joins = join_cjk_line_breaks(result.document)
+    cjk_compatibility_normalizations = normalize_cjk_compatibility_chars(result.document)
     page_count = len(result.document.pages)
     if page_count < 1 or _sha256_file(path) != source_sha256:
         raise DoclingDocumentError("PDF changed during conversion or has no pages")
@@ -667,9 +720,10 @@ def convert_pdf(
         )
     document = result.document.export_to_dict()
     document[NORMALIZATION_KEY] = {
-        "version": f"{TABLE_JOIN_VERSION};{CJK_JOIN_VERSION}",
+        "version": f"{TABLE_JOIN_VERSION};{CJK_JOIN_VERSION};{CJK_COMPATIBILITY_VERSION}",
         "table_cell_line_break_joins": table_joins,
         "cjk_line_break_joins": cjk_joins,
+        "cjk_compatibility_normalizations": cjk_compatibility_normalizations,
     }
     _recover_omitted_items(document, chunks, page_count=page_count, tokenizer=tokenizer)
     if not chunks:
@@ -677,7 +731,7 @@ def convert_pdf(
     parser_version = (
         f"docling-{versions['docling']};core-{versions['docling-core']};"
         f"hybrid-496;tok-{tokenizer_sha256[:16]};{ADAPTER_VERSION};{TABLE_JOIN_VERSION};"
-        f"{CJK_JOIN_VERSION}"
+        f"{CJK_JOIN_VERSION};{CJK_COMPATIBILITY_VERSION}"
     )
     return bundle_from_native(
         document,

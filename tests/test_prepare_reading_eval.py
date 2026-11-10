@@ -306,7 +306,7 @@ def test_exposure_scan_does_not_skip_completed_run_named_reading_eval(tmp_path):
     assert skipped == 0
 
 
-def _write_product_freeze_fixture(tmp_path, monkeypatch, *, valid_source_hash=True):
+def _write_product_freeze_fixture(tmp_path, monkeypatch, *, valid_source_hash=True, case_count=12):
     import hashlib
 
     monkeypatch.setattr(prepare_reading_eval, "ROOT", tmp_path)
@@ -338,7 +338,7 @@ def _write_product_freeze_fixture(tmp_path, monkeypatch, *, valid_source_hash=Tr
         source_hash = "0" * 64
     cases = []
     gold = []
-    for index in range(12):
+    for index in range(case_count):
         case_id = f"product-{index:02d}"
         cases.append(
             {
@@ -402,6 +402,18 @@ def test_product_freeze_combines_existing_benchmark_and_separate_gold(tmp_path, 
     assert manifest["product_case_scope"]["all_cases_previously_exposed"] is True
     assert (output.stat().st_mode & 0o777) == 0o700
     assert (output / "gold.jsonl").stat().st_mode & 0o777 == 0o600
+
+
+def test_product_freeze_accepts_ninety_cases(tmp_path, monkeypatch):
+    benchmark, cases_path, gold_path = _write_product_freeze_fixture(
+        tmp_path, monkeypatch, case_count=90
+    )
+
+    manifest = prepare_reading_eval.freeze_product_combination(
+        benchmark, cases_path, gold_path, tmp_path / "combined"
+    )
+
+    assert manifest["product_case_scope"]["case_count"] == 90
 
 
 def test_product_freeze_rejects_source_hash_mismatch_without_writing_output(tmp_path, monkeypatch):

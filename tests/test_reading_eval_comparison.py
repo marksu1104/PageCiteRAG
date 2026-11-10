@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -122,6 +123,187 @@ def test_case_id_join_is_order_independent() -> None:
 def test_case_id_join_rejects_missing_duplicate_and_unexpected_ids(rows) -> None:
     with pytest.raises(ValueError):
         comparison._rows_by_case_id(rows, ["case-a", "case-b"], "test")
+
+
+def test_paired_run_builder_creates_blinded_source_linked_review(tmp_path, monkeypatch, capsys):
+    frozen = tmp_path / "frozen"
+    reference_root = tmp_path / "reference"
+    candidate_root = tmp_path / "candidate"
+    for root in (frozen, reference_root / "routed-reading", candidate_root / "routed-reading"):
+        root.mkdir(parents=True)
+    case_id = "paper-case"
+    case = {
+        "case_id": case_id,
+        "dataset": "product-functional",
+        "source_id": "paper-1",
+        "source_sha256": "a" * 64,
+    }
+    input_row = {
+        **case,
+        "question": "What result did the paper report?",
+        "source": {"format": "file", "relative_path": "papers/paper.pdf"},
+    }
+    gold_row = {
+        "case_id": case_id,
+        "necessary_atoms": [{"atom_id": "a1", "text": "The result is 42."}],
+    }
+    inputs_payload = (json.dumps(input_row) + "\n").encode()
+    gold_payload = (json.dumps(gold_row) + "\n").encode()
+    (frozen / "inputs.jsonl").write_bytes(inputs_payload)
+    (frozen / "gold.jsonl").write_bytes(gold_payload)
+    (frozen / "manifest.json").write_text(
+        json.dumps(
+            {
+                "cases": [case],
+                "files": {
+                    "inputs.jsonl": {
+                        "bytes": len(inputs_payload),
+                        "sha256": hashlib.sha256(inputs_payload).hexdigest(),
+                    },
+                    "gold.jsonl": {
+                        "bytes": len(gold_payload),
+                        "sha256": hashlib.sha256(gold_payload).hexdigest(),
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    shared_static = {
+        "models": {"generator": "pinned-model"},
+        "retrieval": {"method": "hybrid"},
+        "embedding_input": {"max_tokens": 512},
+        "gpu": {"uuid": "gpu"},
+        "preparation_budget": {"documents": 10_000_000},
+        "frozen_inputs_sha256": "b" * 64,
+        "dataset_manifest_sha256": "c" * 64,
+        "run_selection": {"arms": ["routed-reading"], "case_ids": [case_id]},
+    }
+
+    def write_run(root, item_coverage, answer):
+        scores = {
+            "state": "scored_complete",
+            "evaluation_scope": {"arms": ["routed-reading"], "case_ids": [case_id]},
+            "arms": {
+                "routed-reading": {
+                    "datasets": {
+                        "product-functional": {
+                            "per_case": [{"case_id": case_id, "item_coverage": item_coverage}]
+                        }
+                    },
+                    "generation_calls_attempted": 1,
+                    "input_tokens_lower_bound": 20,
+                    "output_tokens_lower_bound": 5,
+                    "rows_with_unknown_output_usage": 0,
+                    "case_elapsed_ms_p50": 100,
+                    "case_elapsed_ms_p95": 100,
+                }
+            },
+        }
+        (root / "scores.json").write_text(json.dumps(scores), encoding="utf-8")
+        (root / "configuration.json").write_text(
+            json.dumps({"static": shared_static}), encoding="utf-8"
+        )
+        raw = {
+            "execution": "ok",
+            "block_to_passage_id": {"block-1": "passage-1"},
+            "result": {
+                "status": "answered",
+                "answer": answer,
+                "answer_claims": [
+                    {
+                        "text": answer,
+                        "citations": [
+                            {
+                                "block_id": "block-1",
+                                "page_number": 2,
+                                "quote": "The result is 42.",
+                            }
+                        ],
+                    }
+                ],
+                "detail_claims": [],
+                "limitations": [],
+            },
+        }
+        (root / "routed-reading" / f"{case_id}.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    write_run(reference_root, 0.5, "The result was 40.")
+    write_run(candidate_root, 1.0, "The result is 42.")
+
+    report, review_rows, review_key = comparison.build_paired_run_comparison(
+        reference_root, candidate_root, frozen, seed=7, replicates=100
+    )
+
+    metric = report["datasets"]["product-functional"]["metrics"]["item_coverage"]
+    assert metric["mean_delta_right_minus_left"] == pytest.approx(0.5)
+    assert report["method"]["independent_human_review"] is False
+    assert "review_key" not in report
+    assert review_rows[0]["review"]["atom_verdicts"][0]["verdict"] is None
+    assert review_rows[0]["source_reference"]["relative_path"] == "papers/paper.pdf"
+    assert "passage_id" in review_rows[0]["submission_1"]["claims"][0]["citations"][0]
+    assert set(review_key[case_id]) == {"submission_1", "submission_2"}
+
+    output = tmp_path / "paired.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "compare_reading_eval.py",
+            str(reference_root),
+            "--candidate-run-root",
+            str(candidate_root),
+            "--frozen-root",
+            str(frozen),
+            "--output",
+            str(output),
+        ],
+    )
+    assert comparison.main() == 0
+    assert json.loads(output.read_text(encoding="utf-8"))["case_count"] == 1
+    review_path = output.with_name("semantic-review.jsonl")
+    key_path = output.with_name("semantic-review-key.json")
+    assert len(review_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert json.loads(key_path.read_text(encoding="utf-8"))[case_id] == review_key[case_id]
+    assert "review_key" not in json.loads(output.read_text(encoding="utf-8"))
+    assert capsys.readouterr().out
+
+
+def test_paired_run_builder_rejects_incomplete_or_mismatched_case_runs(tmp_path):
+    frozen = tmp_path / "frozen"
+    reference_root = tmp_path / "reference"
+    candidate_root = tmp_path / "candidate"
+    frozen.mkdir()
+    reference_root.mkdir()
+    candidate_root.mkdir()
+    (frozen / "manifest.json").write_text(json.dumps({"cases": [{"case_id": "a"}]}))
+    (frozen / "inputs.jsonl").write_text("{}\n")
+    (frozen / "gold.jsonl").write_text("{}\n")
+    for root in (reference_root, candidate_root):
+        shared_static = {
+            "models": {"generator": "pinned-model"},
+            "retrieval": {"method": "hybrid"},
+            "embedding_input": {"max_tokens": 512},
+            "gpu": {"uuid": "gpu"},
+            "preparation_budget": {"documents": 10_000_000},
+            "frozen_inputs_sha256": "b" * 64,
+            "dataset_manifest_sha256": "c" * 64,
+            "run_selection": {"arms": ["routed-reading"], "case_ids": ["other"]},
+        }
+        (root / "configuration.json").write_text(
+            json.dumps({"static": shared_static}), encoding="utf-8"
+        )
+        (root / "scores.json").write_text(
+            json.dumps(
+                {
+                    "state": "scored_complete",
+                    "evaluation_scope": {"arms": ["routed-reading"], "case_ids": ["other"]},
+                    "arms": {"routed-reading": {"datasets": {}}},
+                }
+            )
+        )
+
+    with pytest.raises(ValueError, match="same cases"):
+        comparison.build_paired_run_comparison(reference_root, candidate_root, frozen)
 
 
 @pytest.mark.parametrize(

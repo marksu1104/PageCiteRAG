@@ -917,8 +917,8 @@ def freeze_product_combination(
     if product_sources_path.is_symlink() or not product_sources_path.is_file():
         raise ValueError("product source attribution manifest is missing")
     product_sources = json.loads(product_sources_path.read_text(encoding="utf-8"))
-    if len(product_inputs) != 12 or len(product_gold) != 12:
-        raise ValueError("the product evaluation requires exactly twelve frozen cases")
+    if not product_inputs or len(product_inputs) != len(product_gold):
+        raise ValueError("product inputs and gold must contain the same non-zero case count")
     product_ids = [row.get("case_id") for row in product_inputs]
     if any(not isinstance(value, str) or not value for value in product_ids):
         raise ValueError("product cases require non-empty stable case IDs")

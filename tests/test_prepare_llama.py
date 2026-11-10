@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import sys
@@ -9,6 +10,13 @@ _PREPARE_PATH = Path(__file__).resolve().parents[1] / "scripts/prepare_llama.py"
 _PREPARE_SPEC = importlib.util.spec_from_file_location("prepare_llama", _PREPARE_PATH)
 prepare_llama = importlib.util.module_from_spec(_PREPARE_SPEC)
 _PREPARE_SPEC.loader.exec_module(prepare_llama)
+
+_OLLAMA_PREPARE_PATH = Path(__file__).resolve().parents[1] / "scripts/prepare_ollama.py"
+_OLLAMA_PREPARE_SPEC = importlib.util.spec_from_file_location(
+    "prepare_ollama", _OLLAMA_PREPARE_PATH
+)
+prepare_ollama = importlib.util.module_from_spec(_OLLAMA_PREPARE_SPEC)
+_OLLAMA_PREPARE_SPEC.loader.exec_module(prepare_ollama)
 
 
 def _fake_runtime(tmp_path):
@@ -191,3 +199,188 @@ def test_27b_preparation_rejects_unverified_weights_before_publishing(monkeypatc
     assert not target.exists() and not output.exists()
     assert source.read_bytes() == b"bad weights"
     assert (runtime / "original-9b.gguf").read_bytes() == b"original weights"
+
+
+def test_9b_gguf_only_preparation_downloads_without_runtime_or_compiler(monkeypatch, tmp_path):
+    weights = b"pinned 9B weights"
+    spec = {
+        "repo": "example/qwen35-9b",
+        "revision": "a" * 40,
+        "file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "bytes": len(weights),
+        "sha256": hashlib.sha256(weights).hexdigest(),
+    }
+    monkeypatch.setattr(prepare_llama, "model_spec", lambda _size: spec)
+    downloads = []
+
+    def download(url, path, cap, timeout, expected):
+        downloads.append((url, cap, timeout, expected))
+        path.write_bytes(weights)
+
+    monkeypatch.setattr(prepare_llama, "download", download)
+    target = tmp_path / "models/gguf-qwen35-9b" / spec["revision"][:8]
+    output = tmp_path / "outputs/prepare-9b-cpu"
+
+    prepare_llama.prepare_gguf_only(target, output)
+
+    assert downloads == [
+        (
+            f"https://huggingface.co/{spec['repo']}/resolve/{spec['revision']}/{spec['file']}",
+            len(weights),
+            600,
+            spec["sha256"],
+        )
+    ]
+    assert (target / spec["file"]).read_bytes() == weights
+    assert prepare_llama.verify_gguf_only(target)["model_sha256"] == spec["sha256"]
+    report = json.loads((output / "preparation.json").read_text())
+    assert report["prepared"] is True
+    assert "no llama.cpp build or CUDA toolkit" in report["scope"]
+    assert not list(target.parent.glob(".gguf-only-*"))
+
+
+def test_9b_gguf_only_preparation_hardlinks_verified_local_model_without_download(
+    monkeypatch, tmp_path
+):
+    weights = b"pinned local 9B weights"
+    spec = {
+        "repo": "example/qwen35-9b",
+        "revision": "d" * 40,
+        "file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "bytes": len(weights),
+        "sha256": hashlib.sha256(weights).hexdigest(),
+    }
+    script_root = tmp_path / "checkout"
+    model_root = script_root / "models"
+    source = model_root / "llama-bundle" / spec["file"]
+    source.parent.mkdir(parents=True)
+    source.write_bytes(weights)
+    monkeypatch.chdir(script_root)
+    monkeypatch.setattr(prepare_llama, "__file__", str(script_root / "scripts/prepare_llama.py"))
+    monkeypatch.setattr(prepare_llama, "model_spec", lambda _size: spec)
+    monkeypatch.setattr(
+        prepare_llama, "download", lambda *_: pytest.fail("local preparation must not download")
+    )
+
+    target = model_root / "gguf-qwen35-9b" / spec["revision"][:8]
+    output = script_root / "outputs/prepare-9b-cpu"
+    prepare_llama.prepare_gguf_only(target, output, Path("models/llama-bundle") / spec["file"])
+
+    prepared_model = target / spec["file"]
+    assert prepared_model.stat().st_ino == source.stat().st_ino
+    assert prepare_llama.verify_gguf_only(target)["model_sha256"] == spec["sha256"]
+    assert json.loads((output / "preparation.json").read_text())["prepared"] is True
+
+
+def test_9b_gguf_only_failed_download_publishes_no_partial_model(monkeypatch, tmp_path):
+    weights = b"pinned 9B weights"
+    spec = {
+        "repo": "example/qwen35-9b",
+        "revision": "b" * 40,
+        "file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "bytes": len(weights),
+        "sha256": hashlib.sha256(weights).hexdigest(),
+    }
+    monkeypatch.setattr(prepare_llama, "model_spec", lambda _size: spec)
+
+    def fail_download(_url, path, *_args):
+        path.write_bytes(b"partial")
+        raise RuntimeError("download checksum differs from the fixed source")
+
+    monkeypatch.setattr(prepare_llama, "download", fail_download)
+    target = tmp_path / "models/gguf-qwen35-9b" / spec["revision"][:8]
+    output = tmp_path / "outputs/prepare-9b-cpu"
+
+    with pytest.raises(RuntimeError, match="checksum"):
+        prepare_llama.prepare_gguf_only(target, output)
+
+    assert not target.exists()
+    assert not list(target.parent.glob(".gguf-only-*"))
+    assert json.loads((output / "preparation.json").read_text())["prepared"] is False
+
+
+def test_9b_gguf_only_cli_skips_cuda_compiler_arguments(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prepare_llama.py",
+            "--model-size",
+            "9b",
+            "--gguf-only",
+            "--source-model",
+            "models/source.gguf",
+            "--output-dir",
+            "outputs/prepare-9b-cpu",
+        ],
+    )
+    spec = {**prepare_llama.model_spec("9b"), "revision": "c" * 40}
+    monkeypatch.setattr(prepare_llama, "model_spec", lambda _size: spec)
+    calls = []
+    monkeypatch.setattr(prepare_llama, "prepare_gguf_only", lambda *args: calls.append(args))
+
+    prepare_llama.main()
+
+    assert calls == [
+        (
+            tmp_path / "models/gguf-qwen35-9b" / ("c" * 8),
+            tmp_path / "outputs/prepare-9b-cpu",
+            Path("models/source.gguf"),
+        )
+    ]
+
+
+def test_gguf_only_cli_rejects_non_9b_before_creating_output(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prepare_llama.py",
+            "--model-size",
+            "4b",
+            "--gguf-only",
+            "--output-dir",
+            "outputs/prepare-cpu",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="pinned 9B"):
+        prepare_llama.main()
+
+    assert not (tmp_path / "outputs").exists()
+
+
+def test_ollama_import_accepts_verified_model_only_gguf_under_models(monkeypatch, tmp_path):
+    weights = b"pinned 9B weights"
+    source = tmp_path / "models/model weights/Qwen3.5-9B-Q4_K_M.gguf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(weights)
+    spec = {
+        "bytes": len(weights),
+        "sha256": hashlib.sha256(weights).hexdigest(),
+    }
+    monkeypatch.setattr(prepare_ollama, "ROOT", tmp_path)
+    monkeypatch.setattr(prepare_ollama, "model_spec", lambda _size: spec)
+    monkeypatch.chdir(tmp_path)
+
+    resolved = prepare_ollama.bundle_gguf("9b", Path("models/model weights/Qwen3.5-9B-Q4_K_M.gguf"))
+    assert resolved == source.resolve()
+    assert prepare_ollama.modelfile_contents(resolved) == f'FROM "{resolved}"\n'
+
+
+def test_ollama_import_rejects_model_only_gguf_outside_models(monkeypatch, tmp_path):
+    weights = b"pinned 9B weights"
+    source = tmp_path / "outside/Qwen3.5-9B-Q4_K_M.gguf"
+    source.parent.mkdir()
+    source.write_bytes(weights)
+    spec = {
+        "bytes": len(weights),
+        "sha256": hashlib.sha256(weights).hexdigest(),
+    }
+    monkeypatch.setattr(prepare_ollama, "ROOT", tmp_path)
+    monkeypatch.setattr(prepare_ollama, "model_spec", lambda _size: spec)
+
+    with pytest.raises(SystemExit, match="inside this checkout's models"):
+        prepare_ollama.bundle_gguf("9b", source)

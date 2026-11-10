@@ -28,6 +28,9 @@ from page_cite_rag.llama import (
     sha256,
     verify_bundle,
 )
+from page_cite_rag.llama import (
+    verify_gguf_only as _verify_gguf_only,
+)
 
 
 def download(url: str, path: Path, cap: int, timeout: int, expected: str) -> None:
@@ -155,9 +158,94 @@ def prepare_with_runtime(
     )
 
 
+def verify_gguf_only(directory: Path) -> dict:
+    """Verify the model-only artifact against this preparer's pinned model spec."""
+    return _verify_gguf_only(directory, model_spec("9b"))
+
+
+def prepare_gguf_only(target: Path, output: Path, source_model: Path | None = None) -> None:
+    """Prepare only the pinned 9B GGUF, reusing verified local weights when supplied."""
+    spec = model_spec("9b")
+    if target.exists() or target.is_symlink():
+        verify_gguf_only(target)
+        print("Existing pinned model-only artifact verified; no download or build.")
+        return
+    output.mkdir(parents=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "scope": "pinned 9B GGUF only; no llama.cpp build or CUDA toolkit required",
+        "model_repo": spec["repo"],
+        "model_revision": spec["revision"],
+        "model_bytes": spec["bytes"],
+        "model_sha256": spec["sha256"],
+        "local_source_model": str(source_model) if source_model is not None else None,
+        "prepared": False,
+    }
+    try:
+        if source_model is not None:
+            model_root = (Path(__file__).resolve().parents[1] / "models").resolve()
+            candidate = Path(source_model).expanduser()
+            if candidate.is_symlink():
+                raise ValueError("local source model must not be a symlink")
+            source = candidate.resolve(strict=True)
+            if (
+                not source.is_relative_to(model_root)
+                or not source.is_file()
+                or source.stat().st_size != spec["bytes"]
+                or sha256(source) != spec["sha256"]
+            ):
+                raise ValueError("local source model differs from the pinned GGUF")
+            report["local_source_model"] = str(source)
+        else:
+            source = None
+        with tempfile.TemporaryDirectory(prefix=".gguf-only-", dir=target.parent) as staging:
+            staged = Path(staging)
+            if source is None:
+                download(
+                    f"https://huggingface.co/{spec['repo']}/resolve/{spec['revision']}/{spec['file']}",
+                    staged / spec["file"],
+                    spec["bytes"],
+                    600,
+                    spec["sha256"],
+                )
+            else:
+                os.link(source, staged / spec["file"])
+            (staged / "model-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "format": 1,
+                        "model_repo": spec["repo"],
+                        "model_revision": spec["revision"],
+                        "model_sha256": spec["sha256"],
+                        "publisher": "Unsloth third-party quantization",
+                        "model_license": "Apache-2.0",
+                        "files": {spec["file"]: spec["sha256"]},
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            verify_gguf_only(staged)
+            staged.rename(target)
+        report["prepared"] = True
+        report["model_dir"] = str(target)
+    finally:
+        (output / "preparation.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-size", choices=["9b", "4b"], default="9b")
+    parser.add_argument(
+        "--gguf-only",
+        action="store_true",
+        help="download and verify the pinned 9B GGUF only; skip llama.cpp/CUDA compilation",
+    )
+    parser.add_argument(
+        "--source-model",
+        type=Path,
+        help="reuse a verified pinned GGUF already under this checkout's models directory",
+    )
     parser.add_argument("--bundle-dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--runtime-bundle", type=Path, default=DEFAULT_BUNDLE)
@@ -167,9 +255,17 @@ def main() -> None:
     parser.add_argument("--architecture", default="86-real", choices=["86-real"])
     args = parser.parse_args()
     os.umask(0o077)
+    if args.gguf_only and args.model_size != "9b":
+        raise ValueError("--gguf-only is currently supported for the pinned 9B model only")
+    if args.gguf_only and args.bundle_dir is not None:
+        raise ValueError("--bundle-dir cannot be used with --gguf-only")
+    if args.source_model is not None and not args.gguf_only:
+        raise ValueError("--source-model is only supported with --gguf-only")
     spec = model_spec(args.model_size)
     default_bundle = (
-        Path(f"models/llama-qwen35-{args.model_size}")
+        Path("models/gguf-qwen35-9b") / spec["revision"][:8]
+        if args.gguf_only
+        else Path(f"models/llama-qwen35-{args.model_size}")
         / f"{LLAMA_COMMIT[:8]}-{spec['revision'][:8]}"
     )
     target = (args.bundle_dir or default_bundle).absolute()
@@ -177,8 +273,12 @@ def main() -> None:
     if (root / "models").is_symlink() or not target.resolve().is_relative_to(root / "models"):
         raise ValueError("bundle must be inside this checkout's models directory")
     if target.exists() or target.is_symlink():
-        verify_bundle(target, args.model_size)
-        print("Existing pinned bundle verified; no download or build.")
+        if args.gguf_only:
+            verify_gguf_only(target)
+            print("Existing pinned GGUF-only artifact verified; no download or build.")
+        else:
+            verify_bundle(target, args.model_size)
+            print("Existing pinned bundle verified; no download or build.")
         return
     # Keep preparation artifacts inside the designated output directories.
     output = args.output_dir.absolute()
@@ -189,6 +289,9 @@ def main() -> None:
         or output.is_symlink()
     ):
         raise ValueError("use a new output directory inside this checkout's outputs")
+    if args.gguf_only:
+        prepare_gguf_only(target, output, args.source_model)
+        return
     if args.model_size == "4b":
         runtime_bundle = args.runtime_bundle.absolute()
         if not runtime_bundle.resolve().is_relative_to(root / "models"):

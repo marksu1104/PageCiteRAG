@@ -133,6 +133,21 @@ def test_cjk_line_wrap_spaces_are_removed_but_other_spaces_stay():
     assert cell.text == "閱讀體驗路徑"
 
 
+def test_cjk_compatibility_glyphs_are_normalized_without_touching_other_symbols():
+    from page_cite_rag.docling_document import normalize_cjk_compatibility_chars
+
+    item = SimpleNamespace(text="語⾔；識別¹\ufffd", orig="⼆頁")
+    cell = SimpleNamespace(text="識")
+    document = SimpleNamespace(
+        texts=[item], tables=[SimpleNamespace(data=SimpleNamespace(table_cells=[cell]))]
+    )
+
+    assert normalize_cjk_compatibility_chars(document) == 4
+    assert item.text == "語言；識別¹\ufffd"
+    assert item.orig == "二頁"
+    assert cell.text == "識"
+
+
 def test_table_join_count_is_kept_in_coverage_and_survives_reload(tmp_path):
     record = {"version": "table-line-break-join/v1", "table_cell_line_break_joins": 4}
     bundle = _bundle(normalization=record)
@@ -293,7 +308,7 @@ def test_chunk_index_reloads_without_reembedding_documents(tmp_path):
     assert result.context_groups[0].source_refs == ("#/texts/0", "#/texts/1", "#/tables/0")
     assert encoder.document_calls == 1
 
-    from test_full_answer import _Model
+    from tests.test_full_answer import _Model
 
     config = GenerationConfig(num_ctx=16384, num_predict=1536)
     model = _Model(config)
@@ -366,7 +381,7 @@ def test_context_budget_admits_or_omits_a_docling_chunk_as_a_whole(tmp_path):
     assert len(result.context_groups) == 1
     assert len(result.hits) == 3
 
-    from test_full_answer import _Model
+    from tests.test_full_answer import _Model
 
     config = GenerationConfig(num_ctx=4096, num_predict=512, template_reserve=256)
     workflow = FullAnswerWorkflow(
@@ -635,7 +650,7 @@ def test_page_furniture_is_excluded_from_recovery_and_source_blocks():
 
 
 def test_docling_staged_api_uses_formal_answer_and_native_source(tmp_path):
-    from test_full_answer import _Model
+    from tests.test_full_answer import _Model
 
     bundle = _bundle()
     database = tmp_path / "document.sqlite3"

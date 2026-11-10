@@ -17,9 +17,8 @@ from page_cite_rag.generation import (
     check_budget,
 )
 from page_cite_rag.llama import EXACT_BUDGET_VERSION, render_prompt
-from test_llama import MESSAGES, Output, make_client
-from test_workflows import FakeModel, stats
-from test_workflows import setup as setup
+from tests.test_llama import MESSAGES, Output, make_client
+from tests.test_workflows import FakeModel, stats
 
 
 def test_exact_measurement_counts_full_template_and_reuses_tokens(tmp_path, monkeypatch):
@@ -130,6 +129,8 @@ def test_workflow_uses_same_budget_for_question_admission_and_generation(setup):
                         "status": "answered",
                         "answer_claims": [
                             {
+                                "claim_id": "C1",
+                                "support": "direct",
                                 "text": "Only if n > 64; children excluded.",
                                 "citations": [{"source_id": evidence[0]["source_id"]}],
                             }

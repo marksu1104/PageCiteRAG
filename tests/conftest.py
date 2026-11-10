@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+pytest_plugins = ("tests.test_workflows",)
+
 
 @pytest.fixture(scope="session")
 def embedding_tokenizer_dir(tmp_path_factory):

@@ -17,7 +17,7 @@ from page_cite_rag.span_citations import (
     source_spans,
     validate_span_claims,
 )
-from test_citations import fixture_store
+from tests.test_citations import fixture_store
 
 
 @pytest.mark.parametrize("count", [1, 2])

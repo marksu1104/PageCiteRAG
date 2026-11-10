@@ -1,6 +1,7 @@
-"""Freeze QASPER questions whose human-annotated evidence spans two or more sections.
+"""Freeze exposure-screened QASPER strata for local reading evaluation.
 
-``--stratum no-answer`` instead freezes questions every annotator marked unanswerable
+``--stratum answerable`` freezes questions every annotator marked answerable.
+``--stratum no-answer`` freezes questions every annotator marked unanswerable
 (plan 5.17), to check that answering more often does not turn refusals into guesses.
 ``--exposure exposed`` draws only from papers already seen, for development sets.
 
@@ -28,7 +29,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from page_cite_rag.answer_metrics import read_answer_references  # noqa: E402
-from page_cite_rag.qasper import align_question, read_snapshot, snapshot_path  # noqa: E402
+from page_cite_rag.qasper import (  # noqa: E402
+    align_question,
+    read_snapshot,
+    snapshot_path,
+    source_url,
+)
 
 _spec = importlib.util.spec_from_file_location("prepare", ROOT / "scripts/prepare_reading_eval.py")
 prepare = importlib.util.module_from_spec(_spec)
@@ -59,7 +65,18 @@ def select_cases(
                     rank = prepare._rank("qasper", question.question_id, seed=seed)
                     candidates.append((rank, paper, question, None, 0))
                 continue
+            if stratum == "answerable" and not all(
+                not annotation.unanswerable for annotation in question.annotations
+            ):
+                continue
             alignment = align_question(paper, question)
+            if stratum == "answerable":
+                rank = prepare._rank("qasper", question.question_id, seed=seed)
+                section_count = len(
+                    {section_of[pid] for pid in alignment.gold_passage_ids if pid in section_of}
+                )
+                candidates.append((rank, paper, question, alignment, section_count))
+                continue
             if alignment.exclusion_reason or not alignment.gold_passage_ids:
                 continue
             sections = {section_of[pid] for pid in alignment.gold_passage_ids if pid in section_of}
@@ -85,7 +102,9 @@ def main() -> int:
     parser.add_argument("--split", choices=("train", "validation"), default="train")
     parser.add_argument("--count", type=int, default=48)
     parser.add_argument(
-        "--stratum", choices=("multi-section", "no-answer"), default="multi-section"
+        "--stratum",
+        choices=("answerable", "multi-section", "no-answer"),
+        default="multi-section",
     )
     parser.add_argument("--exposure", choices=("unexposed", "exposed"), default="unexposed")
     parser.add_argument("--selection-seed", type=int, default=42)
@@ -96,7 +115,7 @@ def main() -> int:
     if output.exists() or output.is_symlink():
         raise SystemExit("refusing to overwrite an existing frozen evaluation directory")
     seed = str(args.selection_seed)
-    source_path = snapshot_path(args.qasper_data_dir, args.split)
+    source_path = snapshot_path(args.qasper_data_dir.expanduser().resolve(), args.split)
     papers = list(read_snapshot(args.qasper_data_dir, args.split))
     question_paper = {q.question_id: p.paper_id for p in papers for q in p.questions}
     exposed_questions, scanned, skipped = prepare._exposed_ids(
@@ -137,9 +156,11 @@ def main() -> int:
         gold.append(
             {
                 "case_id": case_id,
-                "stratum": (
-                    "no_answer" if args.stratum == "no-answer" else "multi_section_evidence"
-                ),
+                "stratum": {
+                    "answerable": "answerable",
+                    "multi-section": "multi_section_evidence",
+                    "no-answer": "no_answer",
+                }[args.stratum],
                 "evidence_section_count": sections,
                 "references": [asdict(ref) for ref in references[question.question_id]],
                 "aligned_evidence_passage_ids": (
@@ -184,7 +205,11 @@ def main() -> int:
                 + (
                     "keep questions every annotator marked unanswerable"
                     if args.stratum == "no-answer"
-                    else "keep questions whose aligned human evidence spans >=2 sections"
+                    else (
+                        "keep questions every annotator marked answerable"
+                        if args.stratum == "answerable"
+                        else "keep questions whose aligned human evidence spans >=2 sections"
+                    )
                 )
                 + f"; at most one question per paper in seeded hash order; {args.count} cases"
             )
@@ -203,6 +228,7 @@ def main() -> int:
             "qasper": {
                 **prepare.QASPER,
                 "split": args.split,
+                "url": source_url(args.split),
                 "file": source_path.relative_to(ROOT).as_posix(),
                 "sha256": prepare._file_sha256(source_path),
             }

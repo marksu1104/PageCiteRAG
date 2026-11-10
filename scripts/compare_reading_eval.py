@@ -436,6 +436,307 @@ def build_comparison(
     }
 
 
+def _read_jsonl(path: Path) -> list[dict]:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    if any(not isinstance(row, dict) for row in rows):
+        raise ValueError(f"invalid JSONL object in {path.name}")
+    return rows
+
+
+def _single_routed_run(run_root: Path, case_ids: list[str]) -> tuple[dict, dict[str, dict]]:
+    scores_path = run_root / "scores.json"
+    scores = json.loads(scores_path.read_text(encoding="utf-8"))
+    scope = scores.get("evaluation_scope", {})
+    if (
+        scores.get("state") != "scored_complete"
+        or scope.get("arms") != ["routed-reading"]
+        or scope.get("case_ids") != case_ids
+    ):
+        raise ValueError(
+            "each paired run must be a complete routed-reading run over the same cases"
+        )
+    rows: dict[str, dict] = {}
+    arm = scores.get("arms", {}).get("routed-reading")
+    if not isinstance(arm, dict):
+        raise ValueError("routed-reading score data is missing")
+    for dataset, result in arm.get("datasets", {}).items():
+        for row in result.get("per_case", []):
+            case_id = row.get("case_id")
+            if case_id not in case_ids or case_id in rows:
+                raise ValueError("score rows contain a duplicate or unexpected case ID")
+            rows[case_id] = {"dataset": dataset, **row}
+    if set(rows) != set(case_ids):
+        raise ValueError("paired score rows do not cover the frozen case IDs")
+    return scores, rows
+
+
+def _verify_frozen_file(root: Path, manifest: dict, filename: str) -> Path:
+    path = root / filename
+    expected = manifest.get("files", {}).get(filename)
+    if (
+        not isinstance(expected, dict)
+        or path.is_symlink()
+        or not path.is_file()
+        or path.stat().st_size != expected.get("bytes")
+        or _sha256(path) != expected.get("sha256")
+    ):
+        raise ValueError(f"frozen file identity differs: {filename}")
+    return path
+
+
+def _verify_shared_run_settings(reference_root: Path, candidate_root: Path) -> None:
+    fields = (
+        "models",
+        "retrieval",
+        "embedding_input",
+        "gpu",
+        "preparation_budget",
+        "frozen_inputs_sha256",
+        "dataset_manifest_sha256",
+        "run_selection",
+    )
+    configurations = []
+    for root in (reference_root, candidate_root):
+        path = root / "configuration.json"
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("paired run configuration is missing or unsafe")
+        static = json.loads(path.read_text(encoding="utf-8")).get("static")
+        if not isinstance(static, dict) or any(field not in static for field in fields):
+            raise ValueError("paired run configuration is missing shared identity fields")
+        configurations.append(static)
+    for field in fields:
+        if configurations[0][field] != configurations[1][field]:
+            raise ValueError(f"paired runs differ in shared setting: {field}")
+
+
+def _raw_submission(run_root: Path, case_id: str) -> dict | None:
+    path = (run_root / "routed-reading" / f"{case_id}.json").resolve()
+    if not path.is_relative_to(run_root.resolve()):
+        raise ValueError("case ID escapes its routed-reading result directory")
+    if not path.is_file():
+        return None
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    result = raw.get("result") or {}
+    passage_map = raw.get("block_to_passage_id") or {}
+    claims = []
+    for claim_type in ("answer_claims", "detail_claims"):
+        for claim in result.get(claim_type, []) or []:
+            citations = []
+            for citation in claim.get("citations", []) or []:
+                block_id = citation.get("block_id")
+                citations.append(
+                    {
+                        **citation,
+                        "passage_id": passage_map.get(block_id),
+                    }
+                )
+            claims.append({"type": claim_type, "text": claim.get("text"), "citations": citations})
+    return {
+        "execution": raw.get("execution"),
+        "answer_status": result.get("status"),
+        "answer": result.get("answer"),
+        "limitations": result.get("limitations", []),
+        "claims": claims,
+        "reading_plan_status": raw.get("reading_plan_status"),
+        "raw_file_sha256": _sha256(path),
+    }
+
+
+def build_paired_run_comparison(
+    reference_run_root: Path,
+    candidate_run_root: Path,
+    frozen_root: Path,
+    *,
+    seed: int = 20261108,
+    replicates: int = 10_000,
+) -> tuple[dict, list[dict], dict]:
+    """Pair two independently run routed-reading versions on identical frozen cases."""
+    manifest_path = frozen_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    case_ids = [case["case_id"] for case in manifest.get("cases", [])]
+    _rows_by_case_id(manifest["cases"], case_ids, "frozen manifest")
+    _verify_shared_run_settings(reference_run_root, candidate_run_root)
+    reference_scores, reference_rows = _single_routed_run(reference_run_root, case_ids)
+    candidate_scores, candidate_rows = _single_routed_run(candidate_run_root, case_ids)
+    inputs_path = _verify_frozen_file(frozen_root, manifest, "inputs.jsonl")
+    gold_path = _verify_frozen_file(frozen_root, manifest, "gold.jsonl")
+    input_rows = _read_jsonl(inputs_path)
+    gold_rows = _read_jsonl(gold_path)
+    if [row.get("case_id") for row in input_rows] != case_ids:
+        raise ValueError("frozen input order differs from the manifest")
+    if [row.get("case_id") for row in gold_rows] != case_ids:
+        raise ValueError("frozen gold order differs from the manifest")
+    inputs = _rows_by_case_id(input_rows, case_ids, "inputs")
+    gold = _rows_by_case_id(gold_rows, case_ids, "gold")
+    case_manifest = _rows_by_case_id(manifest["cases"], case_ids, "manifest cases")
+    inputs_sha256 = _sha256(frozen_root / "inputs.jsonl")
+    gold_sha256 = _sha256(frozen_root / "gold.jsonl")
+
+    metrics_by_dataset: dict[str, dict] = {}
+    metric_candidates = (
+        "item_coverage",
+        "answer_f1",
+        "evidence_f1",
+        "evidence_precision",
+        "evidence_recall",
+        "answer_available",
+        "refused",
+        "correct_refusal",
+        "false_refusal",
+    )
+    datasets = sorted({row["dataset"] for row in reference_rows.values()})
+    for dataset_index, dataset in enumerate(datasets):
+        selected_ids = [
+            case_id for case_id in case_ids if reference_rows[case_id]["dataset"] == dataset
+        ]
+        if any(candidate_rows[case_id]["dataset"] != dataset for case_id in selected_ids):
+            raise ValueError("paired runs assign a case to different datasets")
+        clusters = []
+        for case_id in selected_ids:
+            cluster_id = case_manifest[case_id].get("source_id") or case_manifest[case_id].get(
+                "source_sha256"
+            )
+            clusters.append(f"{dataset}:{cluster_id}")
+        metric_results = {}
+        for metric_index, metric in enumerate(metric_candidates):
+            left = [reference_rows[case_id].get(metric) for case_id in selected_ids]
+            right = [candidate_rows[case_id].get(metric) for case_id in selected_ids]
+            valid = [
+                index
+                for index, pair in enumerate(zip(left, right, strict=True))
+                if all(type(value) in (int, float) for value in pair)
+            ]
+            if not valid:
+                continue
+            metric_results[metric] = paired_cluster_summary(
+                [float(left[index]) for index in valid],
+                [float(right[index]) for index in valid],
+                [clusters[index] for index in valid],
+                seed=seed + dataset_index * len(metric_candidates) + metric_index,
+                replicates=replicates,
+            )
+        metrics_by_dataset[dataset] = {
+            "case_count": len(selected_ids),
+            "metrics": metric_results,
+        }
+
+    review_rows = []
+    review_key = {}
+    for index, case_id in enumerate(case_ids):
+        source_case = inputs[case_id]
+        cluster = case_manifest[case_id].get("source_id") or case_manifest[case_id].get(
+            "source_sha256"
+        )
+        reference = _raw_submission(reference_run_root, case_id)
+        candidate = _raw_submission(candidate_run_root, case_id)
+        swap = int(hashlib.sha256(f"quality-v2-blind:{case_id}".encode()).hexdigest()[-1], 16) % 2
+        displayed = (
+            {"submission_1": candidate, "submission_2": reference}
+            if swap
+            else {"submission_1": reference, "submission_2": candidate}
+        )
+        review_key[case_id] = {
+            "submission_1": "candidate" if swap else "reference",
+            "submission_2": "reference" if swap else "candidate",
+        }
+        source = source_case.get("source", {})
+        atom_rows = []
+        gold_row = gold[case_id]
+        for field in ("necessary_atoms", "required_atoms", "atoms"):
+            value = gold_row.get(field)
+            if isinstance(value, list):
+                atom_rows = value
+                break
+        review_targets = [
+            {
+                "atom_id": item.get("atom_id", item.get("id", str(atom_index))),
+                "atom": item.get("text", item.get("atom", item)),
+                "verdict": None,
+                "evidence_support": None,
+            }
+            for atom_index, item in enumerate(atom_rows)
+        ]
+        review_rows.append(
+            {
+                "case_id": case_id,
+                "dataset": source_case.get("dataset"),
+                "source_cluster": cluster,
+                "source_reference": {
+                    "format": source.get("format"),
+                    "source_id": source_case.get("source_id"),
+                    "source_sha256": case_manifest[case_id].get("source_sha256"),
+                    "relative_path": source.get("relative_path"),
+                    "inputs_jsonl_sha256": inputs_sha256,
+                    "citation_readback": "Use the cited page/paragraph in the frozen input source.",
+                },
+                "question": source_case.get("question"),
+                "gold_review_target": gold_row,
+                **displayed,
+                "review": {
+                    "status": "not_reviewed",
+                    "atom_verdicts": review_targets,
+                    "claim_support_verdicts": [
+                        {
+                            "submission": submission_name,
+                            "claim_index": claim_index,
+                            "verdict": None,
+                        }
+                        for submission_name in ("submission_1", "submission_2")
+                        for claim_index, _claim in enumerate(
+                            (displayed[submission_name] or {}).get("claims", [])
+                        )
+                    ],
+                    "critical_error": None,
+                    "requested_language_ok": None,
+                },
+            }
+        )
+
+    runtime_fields = (
+        "generation_calls_attempted",
+        "input_tokens_lower_bound",
+        "output_tokens_lower_bound",
+        "rows_with_unknown_output_usage",
+        "case_elapsed_ms_p50",
+        "case_elapsed_ms_p95",
+        "model_call_elapsed_ms_p50",
+        "model_call_elapsed_ms_p95",
+        "observed_gpu_peak_memory_mib",
+        "observed_gpu_peak_temperature_c",
+    )
+    report = {
+        "state": "paired_comparison_complete",
+        "comparison": "candidate_minus_reference",
+        "source_artifacts": {
+            "manifest_sha256": _sha256(manifest_path),
+            "inputs_sha256": inputs_sha256,
+            "gold_sha256": gold_sha256,
+            "reference_scores_sha256": _sha256(reference_run_root / "scores.json"),
+            "candidate_scores_sha256": _sha256(candidate_run_root / "scores.json"),
+            "analysis_script_sha256": _sha256(Path(__file__).resolve()),
+        },
+        "method": {
+            "arms": ["routed-reading"],
+            "pairing_unit": "same frozen case; cluster bootstrap over source paper/document",
+            "replicates": replicates,
+            "seed": seed,
+            "interval": "descriptive 95% percentile interval; not a significance test",
+            "semantic_quality": "not scored by this mechanical comparison",
+            "independent_human_review": False,
+        },
+        "case_count": len(case_ids),
+        "datasets": metrics_by_dataset,
+        "runtime": {
+            role: {key: scores["arms"]["routed-reading"].get(key) for key in runtime_fields}
+            for role, scores in (
+                ("reference", reference_scores),
+                ("candidate", candidate_scores),
+            )
+        },
+    }
+    return report, review_rows, review_key
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -443,18 +744,70 @@ def main() -> int:
     )
     parser.add_argument("--frozen-root", type=Path, required=True, help="Frozen manifest directory")
     parser.add_argument("--output", type=Path, help="Output path (must not already exist)")
-    args = parser.parse_args()
-    report = build_comparison(args.run_root, args.frozen_root)
-    destination = args.output or args.run_root / "paired-comparisons.json"
-    if destination.exists():
-        raise SystemExit(f"refusing to overwrite existing output: {destination}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    parser.add_argument(
+        "--candidate-run-root",
+        type=Path,
+        help="Pair this routed-reading run with run_root, and write a blinded source-review file",
     )
+    parser.add_argument(
+        "--semantic-review-output",
+        type=Path,
+        help="Blinded source-review JSONL path for paired-run mode",
+    )
+    args = parser.parse_args()
+    if args.candidate_run_root is None:
+        if args.semantic_review_output is not None:
+            raise SystemExit("--semantic-review-output requires --candidate-run-root")
+        report = build_comparison(args.run_root, args.frozen_root)
+        review_rows = None
+        review_key = None
+    else:
+        report, review_rows, review_key = build_paired_run_comparison(
+            args.run_root, args.candidate_run_root, args.frozen_root
+        )
+    destination = args.output or args.run_root / "paired-comparisons.json"
+    review_path = args.semantic_review_output or destination.with_name("semantic-review.jsonl")
+    key_path = review_path.with_name("semantic-review-key.json")
+    destinations = [destination]
+    if review_rows is not None:
+        destinations.extend((review_path, key_path))
+    existing = [str(path) for path in destinations if path.exists() or path.is_symlink()]
+    if existing:
+        raise SystemExit(f"refusing to overwrite existing outputs: {existing}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("x", encoding="utf-8") as target:
+        target.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     destination.chmod(0o600)
+    if review_rows is not None:
+        review_path.parent.mkdir(parents=True, exist_ok=True)
+        review_payload = "".join(
+            json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+            for row in review_rows
+        )
+        with review_path.open("x", encoding="utf-8") as target:
+            target.write(review_payload)
+        review_path.chmod(0o600)
+        with key_path.open("x", encoding="utf-8") as target:
+            target.write(
+                json.dumps(review_key, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+            )
+        key_path.chmod(0o600)
     print(
-        json.dumps({"output": str(destination), "sha256": _sha256(destination)}, ensure_ascii=False)
+        json.dumps(
+            {
+                "output": str(destination),
+                "sha256": _sha256(destination),
+                "semantic_review": (
+                    str(
+                        args.semantic_review_output
+                        or destination.with_name("semantic-review.jsonl")
+                    )
+                    if review_rows is not None
+                    else None
+                ),
+            },
+            ensure_ascii=False,
+        )
     )
     return 0
 

@@ -29,7 +29,7 @@ from page_cite_rag.service import (
 )
 from page_cite_rag.store import SQLiteDocumentStore
 from page_cite_rag.workflows import WorkflowConfig
-from test_answer_cli import FakeClient
+from tests.test_answer_cli import FakeClient
 
 
 def test_service_and_base_workflow_keep_the_same_explanation_defaults(tmp_path):
@@ -112,7 +112,7 @@ def test_service_reuses_one_model_then_releases_owned_model_on_idle(prepared):
 def test_service_routes_asks_through_the_shared_entry(prepared, monkeypatch):
     from page_cite_rag import application
     from page_cite_rag.dense import build_dense_index
-    from test_dense import FakeEncoder
+    from tests.test_dense import FakeEncoder
 
     database, document_id, _ = prepared
     store = SQLiteDocumentStore(database)
@@ -368,8 +368,9 @@ def test_serve_native_gpu_temperature_policy_reaches_both_backends(
             }
             return lexical.search(question, top_k=top_k).model_copy(update={"method": "dense"})
 
-    def open_client(config, *, budget_policy):
+    def open_client(config, *, budget_policy, recover_output_errors):
         assert budget_policy == "exact"
+        assert recover_output_errors is True
         clients.append(FakeClient(config))
         return clients[-1]
 

@@ -106,6 +106,10 @@ class ReadingFinding(BaseModel):
         min_length=1,
         description="Visible originals supporting this finding, including all sides of a relation.",
     )
+    source_span_ids: list[str] = Field(
+        default_factory=list,
+        description="Exact span handles read by the outline reader; empty for block readers.",
+    )
 
     model_config = {"extra": "forbid"}
 

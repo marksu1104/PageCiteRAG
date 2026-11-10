@@ -645,12 +645,12 @@ def _open_generation_client(args: argparse.Namespace, config):
     if args.backend == "pinned-ollama":
         from page_cite_rag.ollama_backend import OllamaGgufClient
 
-        return OllamaGgufClient(config, budget_policy="exact")
+        return OllamaGgufClient(config, budget_policy="exact", recover_output_errors=True)
     from page_cite_rag.llama import LlamaModelClient
 
     if args.token_budget == "exact":
-        return LlamaModelClient(config, budget_policy="exact")
-    return LlamaModelClient(config)
+        return LlamaModelClient(config, budget_policy="exact", recover_output_errors=True)
+    return LlamaModelClient(config, recover_output_errors=True)
 
 
 def _answer_retrievers(args: argparse.Namespace, store: SQLiteDocumentStore):
@@ -734,16 +734,23 @@ def _print_route(trace: dict) -> None:
         return
     summary = trace["reading_summary"]
     print(f"Route: whole-document reading ({reason}).")
-    sections = [
-        *summary["sections_chosen"],
-        *summary["sections_from_search"],
-        *summary["sections_followed_up"],
-    ]
+    sections = summary.get(
+        "sections_read",
+        [
+            *summary["sections_chosen"],
+            *summary["sections_from_search"],
+            *summary["sections_followed_up"],
+        ],
+    )
     shown = "; ".join(_terminal_safe(title) for title in sections[:12])
     more = f" and {len(sections) - 12} more" if len(sections) > 12 else ""
     print(f"Sections read ({len(sections)}): {shown}{more}")
+    handed = summary.get("notes_handed_to_writer", summary["notes"])
+    note_counts = f"Reading notes: {summary['notes']}"
+    if handed != summary["notes"]:
+        note_counts += f"; handed to writer: {handed}"
     print(
-        f"Reading notes: {summary['notes']}, of which {summary['notes_not_in_answer']} are not "
+        f"{note_counts}, of which {summary['notes_not_in_answer']} are not "
         "cited in the answer (see --format json); notes are unverified, citations are checked."
     )
     print(f"Model calls: {summary['model_calls']}; elapsed {summary['elapsed_seconds']} s.")
@@ -754,6 +761,12 @@ def _print_route(trace: dict) -> None:
         )
     if summary["navigation_degraded"]:
         print("Note: section reading stopped early; the answer may be incomplete.")
+    if skipped := summary.get("sources_skipped_for_budget", 0):
+        print(f"Note: {skipped} source passages exceeded the reading budget.")
+    if omitted := summary.get("notes_omitted_for_writer_budget", 0):
+        print(f"Note: {omitted} reading notes were omitted because of the writer budget.")
+    if rejected := summary.get("notes_rejected_for_scope", 0):
+        print(f"Note: {rejected} reading notes were rejected for crossing requirement scope.")
 
 
 def _run_answer(args: argparse.Namespace) -> int:

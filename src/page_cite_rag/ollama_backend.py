@@ -25,6 +25,8 @@ from page_cite_rag.llama import (
     PROMPT_VERSION,
     LlamaConfig,
     LlamaModelClient,
+    verify_bundle,
+    verify_gguf_only,
 )
 from page_cite_rag.owned_process import launch_owned_llama_process
 
@@ -45,6 +47,12 @@ class OllamaGgufClient(LlamaModelClient):
     """The llama client contract on an owned Ollama server; no pull, no remote model."""
 
     _budget_version = OLLAMA_BUDGET_VERSION
+
+    def _verify_bundle_assets(self, directory: Path) -> dict:
+        model_only_manifest = directory / "model-manifest.json"
+        if self.config.model_size == "9b" and model_only_manifest.exists():
+            return verify_gguf_only(directory)
+        return verify_bundle(directory, self.config.model_size)
 
     def __init__(
         self,
@@ -230,6 +238,7 @@ class OllamaGgufClient(LlamaModelClient):
 
     def _tokenized_prompt(self, prompt):
         self._ensure_running()
+        self._verify_assets_unchanged()
         if self._gguf_path is None:
             raise ModelError("tokenizer is unavailable before the pinned model is verified")
         return gguf_token_ids(self._gguf_path, prompt)

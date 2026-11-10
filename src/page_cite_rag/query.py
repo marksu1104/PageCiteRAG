@@ -295,10 +295,6 @@ class QueryRewriter:
                 )
                 or returned_budget != budget
                 or generated_stats.prompt_eval_count > budget.input_upper_estimate
-                or (
-                    budget.exact_input_tokens is not None
-                    and generated_stats.prompt_eval_count != budget.exact_input_tokens
-                )
                 or generated_stats.eval_count > budget.output_reserved
                 or generated_stats.prompt_eval_count + generated_stats.eval_count
                 > budget.context_limit

@@ -63,7 +63,7 @@ def build_search(monkeypatch):
 
 def test_cli_and_api_reranking_share_order_and_release_embedding_first(monkeypatch):
     from page_cite_rag import reranker_server
-    from test_hybrid import result
+    from tests.test_hybrid import result
 
     staged, search = build_search(monkeypatch)
     staged.reranker_model_path = Path("reranker.gguf")
