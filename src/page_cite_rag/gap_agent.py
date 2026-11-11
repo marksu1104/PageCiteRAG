@@ -16,7 +16,6 @@ import re
 from collections.abc import Callable, Sequence
 from copy import copy
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Literal
 
 from pydantic import ConfigDict, Field, create_model, field_validator
@@ -44,6 +43,7 @@ from page_cite_rag.reading_plan import TASK_DEFINITIONS
 from page_cite_rag.references import numbered_paragraph_blocks, referenced_numbers
 from page_cite_rag.retrieval import SearchContextGroup, SearchResult
 from page_cite_rag.source_outline import SourceSection
+from page_cite_rag.span_citations import quote_is_verbatim as quote_is_verbatim
 from page_cite_rag.tokenize import LexicalTokenizer
 
 MAX_ROUNDS = 2
@@ -534,23 +534,6 @@ _FOLLOW_UP_SYSTEM = (
     " Select sections separately for each need_id, using the same subject and scope as "
     "the original need. Existing points are unverified notes, not established facts."
 )
-
-
-@lru_cache(maxsize=1)
-def _to_simplified():
-    import opencc
-
-    return opencc.OpenCC("t2s.json")
-
-
-def _normalized(text: str) -> str:
-    """Whitespace- and script-insensitive form used only to verify quotes."""
-    return _to_simplified().convert(re.sub(r"\s+", "", text).casefold())
-
-
-def quote_is_verbatim(quote: str, source_text: str) -> bool:
-    needle = _normalized(quote)
-    return len(needle) >= 4 and needle in _normalized(source_text)
 
 
 def _round_robin(columns: dict[str, list]) -> list:

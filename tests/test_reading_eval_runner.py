@@ -2895,3 +2895,38 @@ def test_runner_counts_server_usage_without_unknown_on_token_difference(tmp_path
     actual = run_reading_eval.read_jsonl(ledger)[-1]
     assert actual["input_tokens"] == 98 and actual["usage_unknown"] is False
     assert wrapper.records[-1]["local_input_tokens"] == 100
+
+
+@pytest.mark.parametrize("reservation", [None, "*", "PlainText"])
+def test_counting_client_plain_text_reservation_and_usage(tmp_path, reservation):
+    from page_cite_rag.generation import ChatMessage, GenerationResult
+    from tests.test_gap_agent import _stats
+    from tests.test_workflows import FakeModel
+
+    model = FakeModel()
+
+    # Reuse the existing fake's identity/config and replace only its response.
+    def generate(messages, response_model):
+        assert response_model is None
+        return GenerationResult(
+            "Answer: 120", _stats(98, 20), SimpleNamespace(exact_input_tokens=100)
+        )
+
+    model.generate = generate
+    ledger = tmp_path / "calls.jsonl"
+    wrapper = run_reading_eval._CountingModelClient(
+        model, global_call_ledger=ledger, global_call_limit=1
+    )
+    wrapper.begin_case(call_context={"phase": "answer", "arm": "fixed-rag", "case_id": "c1"})
+    if reservation is not None:
+        assert wrapper.reserve_before_dispatch(None, dynamic_schema=reservation == "*")[0]
+    result = wrapper.generate((ChatMessage(role="user", content="question"),), None)
+    assert result.value == "Answer: 120"
+    record = wrapper.records[-1]
+    assert record["response_model"] == "PlainText"
+    assert record["response_schema"] is None and record["structured_value"] is None
+    assert record["raw_model_output"] == "Answer: 120"
+    rows = run_reading_eval.read_jsonl(ledger)
+    assert len(rows) == 2 and rows[0]["response_model"] == "PlainText"
+    assert rows[1]["input_tokens"] == 98 and rows[1]["output_tokens"] == 20
+    assert wrapper.generate_calls == 1

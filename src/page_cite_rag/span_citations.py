@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from bisect import bisect_right
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, model_validator
@@ -31,6 +33,23 @@ from page_cite_rag.models import Block, ParsedUnit
 
 SPAN_VERSION = "whole-block-or-contiguous-4000-char-spans/v1"
 MAX_SPAN_CHARS = 4000
+
+
+@lru_cache(maxsize=1)
+def _to_simplified():
+    import opencc
+
+    return opencc.OpenCC("t2s.json")
+
+
+def _normalized(text: str) -> str:
+    """Whitespace- and script-insensitive form used only to verify quotes."""
+    return _to_simplified().convert(re.sub(r"\s+", "", text).casefold())
+
+
+def quote_is_verbatim(quote: str, source_text: str) -> bool:
+    needle = _normalized(quote)
+    return len(needle) >= 4 and needle in _normalized(source_text)
 
 
 class SpanCitationDraft(BaseModel):

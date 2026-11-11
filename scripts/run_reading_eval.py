@@ -7077,7 +7077,7 @@ class _CountingModelClient:
 
     def reserve_before_dispatch(
         self,
-        response_model: type,
+        response_model: type | None,
         *,
         required_remaining_calls: int = 0,
         dynamic_schema: bool = False,
@@ -7099,12 +7099,14 @@ class _CountingModelClient:
             raise ModelError("global model ledger did not return its reserved dispatch index")
         self._pre_reserved_global_call = (
             index,
-            "*" if dynamic_schema else response_model.__name__,
+            "*"
+            if dynamic_schema
+            else (response_model.__name__ if response_model is not None else "PlainText"),
         )
         return True, index
 
     def _reserve_global_call(
-        self, response_model: type, *, required_remaining_calls: int = 0
+        self, response_model: type | None, *, required_remaining_calls: int = 0
     ) -> int | None:
         if self._global_call_ledger is None:
             return None
@@ -7203,7 +7205,9 @@ class _CountingModelClient:
                         if self._global_call_phase is not None
                         else {}
                     ),
-                    "response_model": response_model.__name__,
+                    "response_model": (
+                        response_model.__name__ if response_model is not None else "PlainText"
+                    ),
                     **self._call_context,
                 },
             )
@@ -7329,7 +7333,9 @@ class _CountingModelClient:
         response_model = args[1] if len(args) > 1 else kwargs["response_model"]
         if self._pre_reserved_global_call is not None:
             global_call_index, reserved_model = self._pre_reserved_global_call
-            if reserved_model != "*" and reserved_model != response_model.__name__:
+            if reserved_model != "*" and reserved_model != (
+                response_model.__name__ if response_model is not None else "PlainText"
+            ):
                 raise ModelError("reserved model schema differs from the dispatched request")
             self._pre_reserved_global_call = None
         else:
@@ -7339,10 +7345,14 @@ class _CountingModelClient:
         record = {
             "call_index": self.generate_calls - self._case_start_calls + 1,
             "role": "answer",
-            "response_model": response_model.__name__,
+            "response_model": (
+                response_model.__name__ if response_model is not None else "PlainText"
+            ),
             "global_call_index": global_call_index,
             "messages": [message.model_dump(mode="json") for message in messages],
-            "response_schema": response_model.model_json_schema(),
+            "response_schema": response_model.model_json_schema()
+            if response_model is not None
+            else None,
             "status": "entered_generate",
         }
         self.records.append(record)
@@ -7374,8 +7384,12 @@ class _CountingModelClient:
             stats=result.stats.model_dump(mode="json"),
             # Local tokenizer count beside the server count, for the stage-2 delta report.
             local_input_tokens=getattr(getattr(result, "budget", None), "exact_input_tokens", None),
-            raw_model_output=result.raw_model_output,
-            structured_value=result.value.model_dump(mode="json"),
+            raw_model_output=result.raw_model_output
+            if response_model is not None
+            else result.value,
+            structured_value=result.value.model_dump(mode="json")
+            if response_model is not None
+            else None,
         )
         self._record_global_usage(global_call_index, record)
         return result

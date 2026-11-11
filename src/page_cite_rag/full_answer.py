@@ -33,6 +33,13 @@ from page_cite_rag.generation import (
     budget_for_model,
 )
 from page_cite_rag.models import Block
+from page_cite_rag.quote_first import (
+    QUOTE_FIRST_PROMPT_VERSION,
+    parse_quote_first,
+    quote_first_draft,
+    quote_first_messages,
+    verify_quotes,
+)
 from page_cite_rag.reading_plan import ReadingPlan, RequirementCoverage
 from page_cite_rag.retrieval import SearchContextGroup, SearchResult
 from page_cite_rag.span_citations import (
@@ -597,6 +604,7 @@ def _spans(blocks: Sequence[Block]):
 class FullAnswerWorkflow(AnswerWorkflow):
     """Use the shared search/admission/budget path with a fuller answer contract."""
 
+    writer: Literal["structured", "quote_first"] = "structured"
     response_model = FullAnswerDraft
     prompt_version = PROMPT_VERSION
 
@@ -609,6 +617,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
         budget_config,
         config=None,
         *,
+        writer: Literal["structured", "quote_first"] = "structured",
         answer_format: Literal["general", "short_answer", "multiple_choice"] = "general",
         prompt_revision: Literal["contract-consistent", "task-aligned-v5"] = (
             "contract-consistent"
@@ -619,6 +628,11 @@ class FullAnswerWorkflow(AnswerWorkflow):
             raise ValueError("unsupported answer format")
         if prompt_revision not in ("contract-consistent", "task-aligned-v5"):
             raise ValueError("unsupported answer prompt revision")
+        if writer not in ("structured", "quote_first"):
+            raise ValueError("unsupported writer")
+        if writer == "quote_first" and answer_format not in ("general", "short_answer"):
+            raise ValueError("unsupported quote-first answer format")
+        self.writer = writer
         self.answer_format = answer_format
         self._navigation_handoff: dict | None = None
         self._reading_plan: list[dict[str, object]] | None = None
@@ -631,6 +645,8 @@ class FullAnswerWorkflow(AnswerWorkflow):
             "contract-consistent": PROMPT_VERSION,
             "task-aligned-v5": TASK_ALIGNED_PROMPT_VERSION,
         }[prompt_revision]
+        if writer == "quote_first":
+            self.prompt_version = QUOTE_FIRST_PROMPT_VERSION
         record = store.get_document(document_id)
         self._native_source = None
         self._native_chunks: tuple[dict, ...] = ()
@@ -782,6 +798,8 @@ class FullAnswerWorkflow(AnswerWorkflow):
         return tuple(ordered.values())
 
     def _response_model_for(self, blocks):
+        if self.writer == "quote_first":
+            return None
         ids = tuple(_spans(blocks))
         if self.answer_format == "short_answer":
             return self._short_answer_model_for(ids)
@@ -1185,6 +1203,19 @@ class FullAnswerWorkflow(AnswerWorkflow):
         requested_block_id: str | None,
         context_groups: Sequence[SearchContextGroup],
     ) -> tuple[ChatMessage, ...]:
+        if self.writer == "quote_first":
+            if mode == "explain":
+                raise WorkflowError("quote-first writer does not support explain")
+            ordinals = {block.block_id: block.ordinal for block in blocks}
+            return quote_first_messages(
+                question,
+                language,
+                self.answer_format,
+                tuple(
+                    (sid, span.text, self._section_titles.get(ordinals[span.block_id]))
+                    for sid, span in _spans(blocks).items()
+                ),
+            )
         messages = self._messages(
             question,
             language,
@@ -1605,6 +1636,18 @@ class FullAnswerWorkflow(AnswerWorkflow):
             raise WorkflowError("evidence selection exceeded the explicit generation budget")
         return stats
 
+    def _output_draft(self, value, blocks):
+        if self.writer == "structured":
+            return super()._output_draft(value, blocks)
+        spans = _spans(blocks)
+        parsed = parse_quote_first(value)
+        ids, deviations = verify_quotes(parsed, spans)
+        payload, draft_deviations = quote_first_draft(parsed, ids, spans, self.answer_format)
+        return FullAnswerDraft.model_validate(payload, strict=True), (
+            *deviations,
+            *draft_deviations,
+        )
+
     def _verify_output(self, draft, blocks, *, language: Language = "zh-Hant"):
         available = _spans(blocks)
         deviations = list(getattr(draft, "_deviations", ()))
@@ -1616,7 +1659,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
         ):
             deviations.extend(getattr(item, "_deviations", ()))
         try:
-            if self.answer_format == "short_answer":
+            if self.writer == "structured" and self.answer_format == "short_answer":
                 benchmark_draft = ShortBenchmarkAnswerDraft.model_validate(
                     draft.model_dump(warnings=False), strict=True
                 )
@@ -1667,6 +1710,19 @@ class FullAnswerWorkflow(AnswerWorkflow):
                     strict=True,
                 )
             draft = FullAnswerDraft.model_validate(draft.model_dump(warnings=False), strict=True)
+        except ValidationError as error:
+            failure = CitationError("invalid answer draft")
+            failure.validation_errors = tuple(
+                {"location": list(item["loc"]), "type": item["type"], "message": item["msg"]}
+                for item in error.errors(include_input=False)[:20]
+            )
+            raise failure from None
+        except (KeyError, AttributeError, ValueError):
+            raise CitationError("citation span was not provided in the context") from None
+        return self._verify_full_draft(draft, blocks, deviations, available)
+
+    def _verify_full_draft(self, draft, blocks, deviations, available):
+        try:
             # Missing or foreign checklist entries do not invalidate cited claims.
             if self.answer_format == "general" and self._reader_coverage:
                 expected = {item["need_id"] for item in self._reading_plan or ()} or {"need-01"}

@@ -100,7 +100,7 @@ class PromptBudget:
 
 
 def check_budget(
-    messages: Sequence[ChatMessage], schema: dict, config: BudgetConfig
+    messages: Sequence[ChatMessage], schema: dict | None, config: BudgetConfig
 ) -> PromptBudget:
     """Conservative estimate, NOT a model tokenizer or proof of arbitrary template size.
 

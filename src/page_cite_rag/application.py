@@ -160,6 +160,7 @@ def document_workflow(
     *,
     top_k: int = FORMAL_RETRIEVAL.final_k,
     neighbor_blocks: int = 0,
+    writer: Literal["structured", "quote_first"] = "structured",
     answer_format: Literal["general", "short_answer", "multiple_choice"] = "general",
     prompt_revision: Literal["contract-consistent", "task-aligned-v5"] = ("contract-consistent"),
 ) -> AnswerWorkflow:
@@ -172,6 +173,7 @@ def document_workflow(
         budget_config,
         WorkflowConfig(top_k=top_k, neighbor_blocks=neighbor_blocks),
         answer_format=answer_format,
+        writer=writer,
         prompt_revision=prompt_revision,
     )
 

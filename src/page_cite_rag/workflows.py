@@ -262,6 +262,8 @@ class AnswerResult(BaseModel):
     writer_budget_version: str | None = None
     model_identity: dict
     prompt_version: Literal[
+        "quote-first-answer/v2",
+        "quote-first-answer/v1",
         "complete-cited-answer-v1",
         "complete-cited-answer-v2",
         "complete-cited-answer-v3",
@@ -747,9 +749,16 @@ class AnswerWorkflow:
         )
         return self._run(question, language, "explain", blocks, block_id, None, start)
 
-    def _response_model_for(self, blocks: Sequence[Block]) -> type[BaseModel]:
+    def _response_model_for(self, blocks: Sequence[Block]) -> type[BaseModel] | None:
         """The same request schema must govern admission, generation and validation."""
         return self.response_model
+
+    def _request_schema(self, blocks: Sequence[Block]) -> dict | None:
+        response_model = self._response_model_for(blocks)
+        return response_model.model_json_schema() if response_model is not None else None
+
+    def _output_draft(self, value, blocks):
+        return value, ()
 
     def _context(
         self,
@@ -760,7 +769,7 @@ class AnswerWorkflow:
         requested_block_id: str | None,
         context_groups: Sequence[SearchContextGroup] = (),
     ) -> tuple[tuple[Block, ...], tuple[str, ...], tuple[ChatMessage, ...], PromptBudget]:
-        schema = self._response_model_for(()).model_json_schema()
+        schema = self._request_schema(())
         selected: list[Block] = []
         omitted_ids: set[str] = set()
         admitted_groups: list[SearchContextGroup] = []
@@ -796,7 +805,7 @@ class AnswerWorkflow:
                     candidate_budget = budget_for_model(
                         self._model,
                         candidate_messages,
-                        self._response_model_for(candidate_selected).model_json_schema(),
+                        self._request_schema(candidate_selected),
                         self._budget_config,
                     )
                 except ContextBudgetError:
@@ -830,7 +839,7 @@ class AnswerWorkflow:
                 candidate_budget = budget_for_model(
                     self._model,
                     candidate_messages,
-                    self._response_model_for((*selected, block)).model_json_schema(),
+                    self._request_schema((*selected, block)),
                     self._budget_config,
                 )
             except ContextBudgetError:
@@ -937,7 +946,9 @@ class AnswerWorkflow:
         generated = self._model.generate(messages, response_model)
         if (
             not isinstance(generated, GenerationResult)
-            or not isinstance(generated.value, response_model)
+            or not isinstance(
+                generated.value, response_model if response_model is not None else str
+            )
             or generated.budget != budget
         ):
             raise WorkflowError("generation returned an incompatible draft or context budget")
@@ -958,7 +969,13 @@ class AnswerWorkflow:
             raise WorkflowError("generation token counts exceeded the explicit context budget")
         # validate_claims rereads source again and rejects any citation outside the admitted set.
         try:
-            claims, extra_fields = self._verify_output(generated.value, selected, language=language)
+            draft, writer_deviations = self._output_draft(generated.value, selected)
+            claims, extra_fields = self._verify_output(draft, selected, language=language)
+            if writer_deviations:
+                extra_fields["output_deviations"] = (
+                    *extra_fields.get("output_deviations", ()),
+                    *writer_deviations,
+                )
         except CitationError as error:
             reason = _MODEL_CITATION_ERRORS.get(str(error))
             if reason is not None:
@@ -978,17 +995,15 @@ class AnswerWorkflow:
             for claim in detail_claims
         )
         all_claims = tuple(answer_claims) + tuple(detail_claims)
-        if generated.value.status in ("answered", "partial") and requested_block_id is not None:
+        if draft.status in ("answered", "partial") and requested_block_id is not None:
             if not any(
                 citation.block_id == requested_block_id
                 for claim in all_claims
                 for citation in claim.citations
             ):
                 raise WorkflowError("the explanation does not cite its requested source block")
-        limitations.extend(
-            _format_output_text(text, language) for text in generated.value.limitations
-        )
-        status = generated.value.status
+        limitations.extend(_format_output_text(text, language) for text in draft.limitations)
+        status = draft.status
         return self.result_model(
             **shared,
             **extra_fields,
