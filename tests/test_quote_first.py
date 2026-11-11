@@ -187,8 +187,6 @@ def test_exact_prompt(language, answer_format):
             'write "Evidence:" followed by the passages you use: for each '
             "one, its ID in brackets and the exact words copied from it in "
             'double quotes, for example [S12] "exact words from the passage". '
-            "List each passage at most once and copy only the words needed, at "
-            "most two sentences per passage. "
             'Then write "Reasoning:" with a few sentences connecting the '
             "facts. "
         )
