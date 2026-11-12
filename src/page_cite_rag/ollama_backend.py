@@ -98,6 +98,22 @@ class OllamaGgufClient(LlamaModelClient):
             ),
         }
 
+    def chat_completions_base_url(self) -> str:
+        """Return the owned server's OpenAI-compatible endpoint after a health check."""
+        self._ensure_running()
+        return f"{str(self._http.base_url).rstrip('/')}/v1"
+
+    @property
+    def ollama_model_name(self) -> str:
+        """The local, pinned model name; never triggers a pull."""
+        return self._ollama_model
+
+    def before_agent_dispatch(self) -> None:
+        """Apply the owned server's health, pacing and GPU guards before dispatch."""
+        self._ensure_running()
+        self.wait_for_gpu_headroom()
+        self._check_gpu()
+
     def _start(self, *, transport=None) -> None:
         import httpx
 

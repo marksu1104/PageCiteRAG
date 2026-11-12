@@ -633,6 +633,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
         if writer == "quote_first" and answer_format not in ("general", "short_answer"):
             raise ValueError("unsupported quote-first answer format")
         self.writer = writer
+        self._search_steps: tuple[str, ...] = ()
         self.answer_format = answer_format
         self._navigation_handoff: dict | None = None
         self._reading_plan: list[dict[str, object]] | None = None
@@ -691,6 +692,37 @@ class FullAnswerWorkflow(AnswerWorkflow):
         workflow = copy(self)
         workflow._reader_coverage = enabled
         return workflow
+
+    def answer_from_context(
+        self,
+        question: str,
+        blocks: Sequence[Block],
+        *,
+        language: Language = "zh-Hant",
+        context_groups: Sequence[SearchContextGroup] = (),
+        before_generation: Callable[[PromptBudget], None] | None = None,
+        after_generation: Callable[[GenerationStats], None] | None = None,
+        search_steps: Sequence[str] = (),
+    ) -> AnswerResult:
+        """Pass bounded, unverified search hints only to the quote-first writer."""
+        if isinstance(search_steps, (str, bytes)) or not isinstance(search_steps, Sequence):
+            raise ValueError("search steps must be a sequence of queries")
+        if len(search_steps) > 16 or any(
+            not isinstance(q, str) or not q.strip() or len(q) > 300 for q in search_steps
+        ):
+            raise ValueError("search steps require at most 16 nonempty queries of 300 characters")
+        if search_steps and self.writer != "quote_first":
+            raise ValueError("search steps require the quote-first writer")
+        writer = copy(self)
+        writer._search_steps = tuple(search_steps)
+        return super(FullAnswerWorkflow, writer).answer_from_context(
+            question,
+            blocks,
+            language=language,
+            context_groups=context_groups,
+            before_generation=before_generation,
+            after_generation=after_generation,
+        )
 
     def answer_from_agent_context(
         self,
@@ -1215,6 +1247,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
                     (sid, span.text, self._section_titles.get(ordinals[span.block_id]))
                     for sid, span in _spans(blocks).items()
                 ),
+                search_steps=self._search_steps,
             )
         messages = self._messages(
             question,

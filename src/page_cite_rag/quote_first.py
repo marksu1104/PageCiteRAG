@@ -18,6 +18,7 @@ def quote_first_messages(
     language: str,
     answer_format: str,
     sources: Sequence[tuple[str, str, str | None]],
+    search_steps: Sequence[str] = (),
 ) -> tuple[ChatMessage, ChatMessage]:
     if answer_format not in ("general", "short_answer"):
         raise ValueError("unsupported quote-first answer format")
@@ -46,7 +47,13 @@ def quote_first_messages(
     for source_id, text, section in sources:
         prefix = f"(Section: {section}) " if section is not None else ""
         passages.append(f"[{source_id}] {prefix}{text.strip()}")
-    user = "Passages:\n" + "\n\n".join(passages) + f"\n\nQuestion: {question}"
+    user = "Passages:\n" + "\n\n".join(passages)
+    if search_steps:
+        user += (
+            "\n\nSearch steps that found these passages (unverified hints, not evidence):\n"
+            + "\n".join(f"{i}. {q}" for i, q in enumerate(search_steps, 1))
+        )
+    user += f"\n\nQuestion: {question}"
     return ChatMessage(role="system", content=system), ChatMessage(role="user", content=user)
 
 
