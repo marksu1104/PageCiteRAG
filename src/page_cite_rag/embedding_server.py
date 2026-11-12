@@ -28,6 +28,7 @@ from page_cite_rag.gpu_processes import (
     gpu_process_lifecycle,
     register_owned_gpu_process,
     snapshot_gpu_processes,
+    sw_thermal_regulation,
     transient_sw_thermal_flag,
     unregister_owned_gpu_process,
     wait_for_gpu_dispatch,
@@ -178,8 +179,13 @@ def _gpu_sample(
             result = _read_gpu(uuid, temperature_limits)
             if not (result["hw_thermal_slowdown"] or result["sw_thermal_slowdown"]):
                 result["transient_sw_thermal_flag_c"] = flagged_c
-        if result["hw_thermal_slowdown"] or result["sw_thermal_slowdown"]:
+        if result["hw_thermal_slowdown"] or (
+            result["sw_thermal_slowdown"]
+            and not sw_thermal_regulation(result, max_gpu_temperature_c)
+        ):
             raise _GpuGuardTriggered("gpu_thermal_slowdown", result)
+        if result["sw_thermal_slowdown"]:
+            result["sw_thermal_regulation_c"] = result["temperature_c"]
         if result["memory_mib"] > MAX_GPU_MEMORY_MIB:
             raise _GpuGuardTriggered("gpu_memory_limit", result)
         if result["temperature_c"] > max_gpu_temperature_c:
@@ -419,6 +425,9 @@ class NativeEmbeddingServer:
             },
             "hw_thermal_slowdown": any(sample["hw_thermal_slowdown"] for sample in samples),
             "sw_thermal_slowdown": any(sample["sw_thermal_slowdown"] for sample in samples),
+            "sw_thermal_regulation_samples": sum(
+                "sw_thermal_regulation_c" in sample for sample in samples
+            ),
             "transient_sw_thermal_flags": sum(
                 "transient_sw_thermal_flag_c" in sample for sample in samples
             ),

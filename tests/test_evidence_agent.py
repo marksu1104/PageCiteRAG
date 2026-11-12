@@ -51,8 +51,12 @@ def setup(tmp_path, monkeypatch):
         chat_completions_base_url=lambda: "http://synthetic/v1",
         ollama_model_name="synthetic",
         before_agent_dispatch=lambda: checks.append("dispatch"),
+        chat_sampling=lambda: {"temperature": 0.0, "seed": 42},
     )
     return workflow, client, blocks, retriever, model, checks
+
+
+CAPPED = {"reasoning_effort": "none", "max_completion_tokens": LIMITS.max_tokens}
 
 
 def response(request, name="search_passages", arguments=None, **message_extra):
@@ -135,7 +139,12 @@ def test_search_search_finish(setup, monkeypatch):
         f"{pids[0]}: {blocks[0].text.replace(chr(10), chr(32))}\n\nSteps used: 0 of 8."
     )
     trace = result.trace
-    assert trace["version"] == "evidence-agent/v2"
+    assert trace["version"] == "evidence-agent/v4"
+    assert trace["tool_call_repairs"] == 0
+    assert trace["sampling"] == {"temperature": 0.0, "seed": 42}
+    assert all(
+        r["max_tokens"] == LIMITS.max_tokens and "max_completion_tokens" not in r for r in requests
+    )
     assert trace["selected_passage_ids"] == [pids[2], pids[0]]
     assert trace["handoff_passage_ids"] == [pids[2], pids[0], pids[1]]
     assert trace["handoff_reason"] == "finish_called"
@@ -228,9 +237,7 @@ def test_response_guards_preserve_usage(field):
         after_model_call=after.append,
     )
     with pytest.raises(ModelError):
-        guard.handle_request(
-            httpx.Request("POST", "http://synthetic", json={"reasoning_effort": "none"})
-        )
+        guard.handle_request(httpx.Request("POST", "http://synthetic", json=CAPPED))
     assert len(after) == 1
     assert after[0]["status"] == "failed"
     assert after[0]["error_type"] == "ModelError"
@@ -251,9 +258,7 @@ def test_before_hook_failure_sends_nothing():
         after_model_call=after.append,
     )
     with pytest.raises(ValueError, match="ledger exhausted"):
-        guard.handle_request(
-            httpx.Request("POST", "http://synthetic", json={"reasoning_effort": "none"})
-        )
+        guard.handle_request(httpx.Request("POST", "http://synthetic", json=CAPPED))
     assert calls == ["dispatch", "before"]
     assert after[0]["status"] == "failed" and after[0]["eval_count"] is None
 
@@ -268,7 +273,7 @@ def test_transport_model_call_ceiling():
     guard = GuardedTransport(
         SimpleNamespace(before_agent_dispatch=lambda: None), inner=httpx.MockTransport(handler)
     )
-    request = httpx.Request("POST", "http://synthetic", json={"reasoning_effort": "none"})
+    request = httpx.Request("POST", "http://synthetic", json=CAPPED)
     for _ in range(LIMITS.model_calls):
         guard.handle_request(request)
     with pytest.raises(ModelError, match="ceiling"):
@@ -404,3 +409,155 @@ def test_passage_namespace_rejects_foreign_search_and_keeps_full_text(setup):
     )
     state = EvidenceTools([long], long_initial, lambda q: long_initial)
     assert state.initial_passages.endswith("x" * 3000 + " last fact")
+
+
+def test_cap_is_rewritten_for_ollama_and_required():
+    sent = []
+
+    def handler(request):
+        sent.append(json.loads(request.read()))
+        return response(request)
+
+    guard = GuardedTransport(
+        SimpleNamespace(before_agent_dispatch=lambda: None), inner=httpx.MockTransport(handler)
+    )
+    guard.handle_request(httpx.Request("POST", "http://synthetic", json=CAPPED))
+    assert sent[0]["max_tokens"] == LIMITS.max_tokens and "max_completion_tokens" not in sent[0]
+    for body in ({"reasoning_effort": "none"}, {**CAPPED, "max_completion_tokens": 4096}):
+        with pytest.raises(ModelError, match="token cap"):
+            guard.handle_request(httpx.Request("POST", "http://synthetic", json=body))
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("completion_tokens", [LIMITS.max_tokens + 1, None])
+def test_uncapped_or_unaccounted_output_fails(completion_tokens):
+    after = []
+
+    def handler(request):
+        reply = response(request).json()
+        reply["usage"]["completion_tokens"] = completion_tokens
+        return httpx.Response(200, json=reply, request=request)
+
+    guard = GuardedTransport(
+        SimpleNamespace(before_agent_dispatch=lambda: None),
+        inner=httpx.MockTransport(handler),
+        after_model_call=after.append,
+    )
+    with pytest.raises(ModelError, match="token cap"):
+        guard.handle_request(httpx.Request("POST", "http://synthetic", json=CAPPED))
+    assert after[0]["status"] == "failed"
+
+
+def test_chat_sampling_follows_client_profile():
+    client = object.__new__(OllamaGgufClient)
+    client._sampling_seed = 7
+    client._sampling_profile = "greedy"
+    assert client.chat_sampling() == {"temperature": 0.0, "seed": 7}
+    client._sampling_profile = "qwen-general"
+    assert client.chat_sampling() == {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "presence_penalty": 1.5,
+        "seed": 7,
+    }
+    client._sampling_profile = "longbench-official"
+    with pytest.raises(ModelError):
+        client.chat_sampling()
+
+
+REJECTED_FINISH = (
+    'llama-server returned invalid tool call arguments for "finish": unexpected end of JSON input'
+)
+
+
+def server_error(request, message):
+    return httpx.Response(
+        500, json={"error": {"message": message, "type": "api_error"}}, request=request
+    )
+
+
+def test_rejected_tool_call_is_corrected_once(setup, monkeypatch):
+    workflow, client, blocks, _, model, checks = setup
+    pid = f"P{blocks[0].ordinal}"
+    requests, before, after = [], [], []
+
+    def handler(request):
+        requests.append(json.loads(request.read()))
+        if len(requests) == 1:
+            return server_error(request, REJECTED_FINISH)
+        return response(request, "finish", {"passage_ids": [pid]})
+
+    initial = workflow.search_sources("Who was excluded?")[0]
+    mock_agent_http(monkeypatch, client, handler)
+    result = run_evidence_agent(
+        workflow,
+        client,
+        "Who was excluded?",
+        language="en",
+        initial_search=initial.model_copy(update={"hits": initial.hits[:1]}),
+        before_model_call=lambda: before.append(True),
+        after_model_call=after.append,
+    )
+    assert len(requests) == len(checks) == len(before) == len(after) == 2
+    assert requests[1]["messages"][:-1] == requests[0]["messages"]
+    correction = requests[1]["messages"][-1]
+    assert correction["role"] == "user" and "finish call" in correction["content"]
+    rejected, repaired = result.trace["model_calls"]
+    assert rejected["status"] == "tool_call_rejected" and rejected["http_status"] == 500
+    assert rejected["error_message"] == REJECTED_FINISH and rejected["eval_count"] is None
+    assert repaired["status"] == "completed" and repaired["repair"] is True
+    assert result.trace["tool_call_repairs"] == 1
+    assert result.trace["handoff_reason"] == "finish_called"
+    assert result.answer.status == "answered" and len(model.calls) == 1
+
+
+def test_second_rejection_fails_the_question_without_writer(setup, monkeypatch):
+    workflow, client, _, _, model, _ = setup
+    after = []
+    mock_agent_http(monkeypatch, client, lambda request: server_error(request, REJECTED_FINISH))
+    with pytest.raises(agent_module.AgentToolCallError, match="finish"):
+        run_evidence_agent(
+            workflow, client, "Who was excluded?", language="en", after_model_call=after.append
+        )
+    assert issubclass(agent_module.AgentToolCallError, ModelError)
+    assert [r["status"] for r in after] == ["tool_call_rejected"] * 2
+    assert [r["repair"] for r in after] == [False, True]
+    assert model.calls == []
+
+
+def test_other_server_errors_are_recorded_and_not_resent():
+    sent, after = [], []
+
+    def handler(request):
+        sent.append(True)
+        return server_error(request, "llama runner process has terminated")
+
+    guard = GuardedTransport(
+        SimpleNamespace(before_agent_dispatch=lambda: None),
+        inner=httpx.MockTransport(handler),
+        after_model_call=after.append,
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        guard.handle_request(httpx.Request("POST", "http://synthetic", json=CAPPED))
+    assert len(sent) == 1 and guard.repairs == 0
+    assert after[0]["status"] == "failed" and after[0]["http_status"] == 500
+    assert after[0]["error_message"] == "llama runner process has terminated"
+
+
+def test_correction_does_not_use_an_agent_step():
+    replies = iter(["reject"] + ["ok"] * LIMITS.model_calls)
+
+    def handler(request):
+        if next(replies) == "reject":
+            return server_error(request, REJECTED_FINISH)
+        return response(request)
+
+    guard = GuardedTransport(
+        SimpleNamespace(before_agent_dispatch=lambda: None), inner=httpx.MockTransport(handler)
+    )
+    request = httpx.Request("POST", "http://synthetic", json={**CAPPED, "messages": []})
+    for _ in range(LIMITS.model_calls):
+        guard.handle_request(request)
+    assert len(guard.records) == LIMITS.model_calls + 1 and guard.repairs == 1
+    with pytest.raises(ModelError, match="ceiling"):
+        guard.handle_request(request)

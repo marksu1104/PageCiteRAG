@@ -12,6 +12,7 @@ from page_cite_rag.generation import ModelError
 from page_cite_rag.gpu_processes import (
     MAX_GPU_MEMORY_MIB,
     stable_gpu_headroom_window,
+    sw_thermal_regulation,
     transient_sw_thermal_flag,
     wait_for_gpu_dispatch,
 )
@@ -128,7 +129,11 @@ def test_dispatch_wait_uses_driver_headroom_and_records_wait(tmp_path, monkeypat
 
 def test_dispatch_wait_does_not_wait_through_thermal_slowdown(tmp_path, monkeypatch):
     client = higher_client(tmp_path, monkeypatch)
-    monkeypatch.setattr(client, "_gpu_snapshot", lambda: health_sample(sw_thermal_slowdown=True))
+    monkeypatch.setattr(
+        client,
+        "_gpu_snapshot",
+        lambda: health_sample(sw_thermal_slowdown=True, temperature_c=82),
+    )
     with pytest.raises(ModelError, match="thermal slowdown"):
         client.wait_for_gpu_headroom()
     assert client.diagnostics()["closed"] is True
@@ -175,7 +180,10 @@ def test_normal_temperatures_allowed_and_telemetry_kept(tmp_path, monkeypatch, t
         {"memory_mib": 24001},
         {"pids": [999]},
         {"hw_thermal_slowdown": True},
-        {"sw_thermal_slowdown": True},
+        # Policy 2026-11-12: a SW flag is regulation only from the target (84 C) to the limit.
+        {"sw_thermal_slowdown": True, "temperature_c": 82},
+        {"sw_thermal_slowdown": True, "hw_thermal_slowdown": True},
+        {"sw_thermal_slowdown": True, "temperature_c": 89},
         {"hw_thermal_slowdown": None},
         {"max_operating_c": 90},
     ],
@@ -379,7 +387,8 @@ def test_embedding_guard_rereads_a_brief_software_flag(monkeypatch, second, cate
 
 
 def test_embedding_guard_still_stops_at_once_on_a_software_flag_above_80_c(monkeypatch):
-    responses = iter(("6000,84,Not Active,Active", "12345\n"))
+    # Policy 2026-11-12: above 80 C a SW flag below the 84 C target is still a stop.
+    responses = iter(("6000,82,Not Active,Active", "12345\n"))
     monkeypatch.setattr(
         embedding_server.subprocess, "check_output", lambda *_args, **_kwargs: next(responses)
     )
@@ -430,3 +439,68 @@ def test_gpu_snapshot_drops_a_vanished_pid_only_after_a_clean_recheck(
         gpu_processes.unregister_owned_gpu_process(server)
     assert state["unexpected_pids"] == unexpected
     assert state["vanished_pids"] == ([5000] if not unexpected else [])
+
+
+@pytest.mark.parametrize(
+    ("change", "limit", "regulation"),
+    [
+        ({"temperature_c": 84, "sw_thermal_slowdown": True}, 88, True),
+        ({"temperature_c": 88, "sw_thermal_slowdown": True}, 88, True),
+        ({"temperature_c": 83, "sw_thermal_slowdown": True}, 88, False),
+        ({"temperature_c": 89, "sw_thermal_slowdown": True}, 88, False),
+        (
+            {"temperature_c": 86, "sw_thermal_slowdown": True, "hw_thermal_slowdown": True},
+            88,
+            False,
+        ),
+        ({"temperature_c": 86, "sw_thermal_slowdown": False}, 88, False),
+        (
+            {"temperature_c": 86, "sw_thermal_slowdown": True, "target_temperature_c": None},
+            88,
+            False,
+        ),
+        ({"temperature_c": 80, "sw_thermal_slowdown": True}, 80, False),
+    ],
+)
+def test_sw_thermal_regulation_window(change, limit, regulation):
+    assert sw_thermal_regulation(health_sample(**change), limit) is regulation
+
+
+def test_llama_guard_tolerates_target_regulation_and_counts_it(tmp_path, monkeypatch):
+    client = higher_client(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        client, "_gpu_snapshot", lambda: health_sample(temperature_c=86, sw_thermal_slowdown=True)
+    )
+    with client:
+        client._check_gpu(before=True)
+        client._check_gpu()
+        diagnostics = client.diagnostics()
+    assert diagnostics["sw_thermal_regulation_samples"] == 2
+    assert diagnostics["closed"] is False
+
+
+def test_embedding_guard_tolerates_target_regulation(monkeypatch):
+    responses = iter(("6000,86,Not Active,Active", "12345\n"))
+    monkeypatch.setattr(
+        embedding_server.subprocess, "check_output", lambda *_args, **_kwargs: next(responses)
+    )
+    sample = embedding_server._gpu_sample(
+        UUID,
+        max_gpu_temperature_c=88,
+        temperature_limits={"max_operating_c": 93, "target_temperature_c": 84},
+    )
+    assert sample["sw_thermal_regulation_c"] == 86 and sample["sw_thermal_slowdown"] is True
+
+
+@pytest.mark.parametrize("telemetry", ["6000,86,Active,Active", "6000,89,Not Active,Active"])
+def test_embedding_guard_stops_on_hw_or_over_limit_even_when_sw(monkeypatch, telemetry):
+    responses = iter((telemetry, "12345\n"))
+    monkeypatch.setattr(
+        embedding_server.subprocess, "check_output", lambda *_args, **_kwargs: next(responses)
+    )
+    with pytest.raises(embedding_server._GpuGuardTriggered):
+        embedding_server._gpu_sample(
+            UUID,
+            max_gpu_temperature_c=88,
+            temperature_limits={"max_operating_c": 93, "target_temperature_c": 84},
+        )

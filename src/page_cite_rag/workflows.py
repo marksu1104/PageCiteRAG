@@ -255,6 +255,7 @@ class AnswerResult(BaseModel):
     # claim's support is unchanged, so one repeated reference no longer voids the answer.
     citation_duplicates_removed: int = Field(default=0, ge=0)
     output_deviations: tuple[dict, ...] = ()
+    writer_steps: tuple[dict, ...] = ()
     claim_duplicates_removed: int = Field(default=0, ge=0)
     requirement_coverage: tuple[RequirementCoverage, ...] = ()
     claim_support: tuple[Literal["direct", "limited_inference"], ...] = ()
@@ -262,6 +263,7 @@ class AnswerResult(BaseModel):
     writer_budget_version: str | None = None
     model_identity: dict
     prompt_version: Literal[
+        "quote-two-step-answer/v1",
         "quote-first-answer/v2",
         "quote-first-answer/v1",
         "complete-cited-answer-v1",
@@ -940,36 +942,18 @@ class AnswerWorkflow:
                 generation_stats=None,
                 elapsed_ms=(time.perf_counter() - start) * 1000,
             )
-        response_model = self._response_model_for(selected)
-        if before_generation is not None:
-            before_generation(budget)
-        generated = self._model.generate(messages, response_model)
-        if (
-            not isinstance(generated, GenerationResult)
-            or not isinstance(
-                generated.value, response_model if response_model is not None else str
-            )
-            or generated.budget != budget
-        ):
-            raise WorkflowError("generation returned an incompatible draft or context budget")
-        try:
-            generation_stats = GenerationStats.model_validate(
-                generated.stats.model_dump(warnings=False), strict=True
-            )
-        except (AttributeError, ValidationError):
-            raise WorkflowError("generation returned invalid completion statistics") from None
-        if after_generation is not None:
-            after_generation(generation_stats)
-        if (
-            generation_stats.eval_count > self._budget_config.num_predict
-            or generation_stats.prompt_eval_count > budget.input_upper_estimate
-            or generation_stats.prompt_eval_count + generation_stats.eval_count
-            > self._budget_config.num_ctx
-        ):
-            raise WorkflowError("generation token counts exceeded the explicit context budget")
+        generated = self._generate_checked(
+            messages,
+            self._response_model_for(selected),
+            budget,
+            before_generation,
+            after_generation,
+        )
         # validate_claims rereads source again and rejects any citation outside the admitted set.
         try:
-            draft, writer_deviations = self._output_draft(generated.value, selected)
+            generated, draft, writer_deviations, writer_steps = self._writer_output(
+                generated, selected, question, language, before_generation, after_generation
+            )
             claims, extra_fields = self._verify_output(draft, selected, language=language)
             if writer_deviations:
                 extra_fields["output_deviations"] = (
@@ -1023,9 +1007,49 @@ class AnswerWorkflow:
                 if status == "answered"
                 else "model_insufficient_evidence"
             ),
-            generation_stats=generation_stats,
+            generation_stats=generated.stats,
+            writer_steps=writer_steps,
             elapsed_ms=(time.perf_counter() - start) * 1000,
         )
+
+    def _generate_checked(
+        self, messages, response_model, budget, before_generation, after_generation
+    ):
+        if before_generation is not None:
+            before_generation(budget)
+        generated = self._model.generate(messages, response_model)
+        if (
+            not isinstance(generated, GenerationResult)
+            or not isinstance(
+                generated.value, response_model if response_model is not None else str
+            )
+            or generated.budget != budget
+        ):
+            raise WorkflowError("generation returned an incompatible draft or context budget")
+        try:
+            generation_stats = GenerationStats.model_validate(
+                generated.stats.model_dump(warnings=False), strict=True
+            )
+        except (AttributeError, ValidationError):
+            raise WorkflowError("generation returned invalid completion statistics") from None
+        if after_generation is not None:
+            after_generation(generation_stats)
+        if (
+            generation_stats.eval_count > self._budget_config.num_predict
+            or generation_stats.prompt_eval_count > budget.input_upper_estimate
+            or generation_stats.prompt_eval_count + generation_stats.eval_count
+            > self._budget_config.num_ctx
+        ):
+            raise WorkflowError("generation token counts exceeded the explicit context budget")
+        return GenerationResult(
+            generated.value, generation_stats, generated.budget, generated.raw_model_output
+        )
+
+    def _writer_output(
+        self, generated, blocks, question, language, before_generation, after_generation
+    ):
+        draft, deviations = self._output_draft(generated.value, blocks)
+        return generated, draft, deviations, ()
 
     def _verify_claims(self, draft, blocks) -> tuple[VerifiedClaim, ...]:
         return validate_claims(self._store, self.document_id, draft, blocks)

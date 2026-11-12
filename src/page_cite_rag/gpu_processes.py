@@ -37,6 +37,28 @@ def transient_sw_thermal_flag(sample: dict) -> bool:
     )
 
 
+def sw_thermal_regulation(sample: dict, max_temperature_c: int) -> bool:
+    """Whether a SW thermal slowdown flag is the GPU holding its own target temperature.
+
+    Approved 2026-11-12: under sustained load the RTX A6000 lowers clocks to stay near its
+    reported target temperature (84 C) and reports SW thermal slowdown; that is normal
+    regulation, not a fault. It is tolerated only from the driver-reported target up to the
+    configured limit (at most 88 C, at least 5 C below max operating) while HW slowdown is off.
+    HW slowdown, any temperature above the limit and a persistent SW flag below the target
+    still stop the owned server.
+    """
+    temperature, target = sample.get("temperature_c"), sample.get("target_temperature_c")
+    return (
+        type(max_temperature_c) is int
+        and max_temperature_c > TRANSIENT_SW_THERMAL_MAX_C
+        and sample.get("sw_thermal_slowdown") is True
+        and sample.get("hw_thermal_slowdown") is False
+        and type(temperature) is int
+        and type(target) is int
+        and target <= temperature <= max_temperature_c
+    )
+
+
 class GpuDispatchTimeout(TimeoutError):
     """No inference was sent because the dispatch headroom wait expired."""
 

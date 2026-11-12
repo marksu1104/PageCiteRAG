@@ -108,6 +108,23 @@ class OllamaGgufClient(LlamaModelClient):
         """The local, pinned model name; never triggers a pull."""
         return self._ollama_model
 
+    def chat_sampling(self) -> dict:
+        """OpenAI-compatible sampling arguments matching this client's generation profile.
+
+        qwen-general follows the vendor's non-thinking recommendation; top_k and min_p have
+        no OpenAI-compatible field on the pinned Ollama, so they apply to the writer only.
+        """
+        if self._sampling_profile == "greedy":
+            return {"temperature": 0.0, "seed": self._sampling_seed}
+        if self._sampling_profile == "qwen-general":
+            return {
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "presence_penalty": 1.5,
+                "seed": self._sampling_seed,
+            }
+        raise ModelError("the agent supports only the greedy and qwen-general profiles")
+
     def before_agent_dispatch(self) -> None:
         """Apply the owned server's health, pacing and GPU guards before dispatch."""
         self._ensure_running()

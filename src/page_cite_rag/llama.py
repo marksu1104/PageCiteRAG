@@ -44,6 +44,7 @@ from page_cite_rag.gpu_processes import (
     gpu_process_lifecycle,
     register_owned_gpu_process,
     snapshot_gpu_processes,
+    sw_thermal_regulation,
     transient_sw_thermal_flag,
     unregister_owned_gpu_process,
     wait_for_gpu_dispatch,
@@ -308,6 +309,7 @@ class LlamaModelClient:
             "last_gpu_check": None,
             "monitor_sample_count": 0,
             "transient_sw_thermal_flags": 0,
+            "sw_thermal_regulation_samples": 0,
             "observed_gpu_peak": {"memory_mib": None, "temperature_c": None},
         }
         self._exit_before_captured = False
@@ -523,9 +525,15 @@ class LlamaModelClient:
             ):
                 self._record_guard_error("gpu_status_unavailable")
                 raise ModelError("GPU thermal safeguards unavailable; own server stopped")
-            if sample["hw_thermal_slowdown"] or sample["sw_thermal_slowdown"]:
+            if sample["hw_thermal_slowdown"] or (
+                sample["sw_thermal_slowdown"]
+                and not sw_thermal_regulation(sample, self.config.max_gpu_temperature_c)
+            ):
                 self._record_guard_error("gpu_thermal_slowdown")
                 raise ModelError("GPU thermal slowdown observed; own server stopped")
+            if sample["sw_thermal_slowdown"]:
+                with self._diagnostic_lock:
+                    self._diagnostic["sw_thermal_regulation_samples"] += 1
         if process_state["unexpected_pids"]:
             self._record_guard_error("unexpected_gpu_process")
             raise ModelError("another GPU compute process is present; own server stopped")

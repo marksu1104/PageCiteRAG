@@ -35,7 +35,11 @@ from page_cite_rag.generation import (
 from page_cite_rag.models import Block
 from page_cite_rag.quote_first import (
     QUOTE_FIRST_PROMPT_VERSION,
+    QUOTE_TWO_STEP_PROMPT_VERSION,
+    parse_quote_extract,
     parse_quote_first,
+    quote_answer_sources,
+    quote_extract_messages,
     quote_first_draft,
     quote_first_messages,
     verify_quotes,
@@ -604,7 +608,7 @@ def _spans(blocks: Sequence[Block]):
 class FullAnswerWorkflow(AnswerWorkflow):
     """Use the shared search/admission/budget path with a fuller answer contract."""
 
-    writer: Literal["structured", "quote_first"] = "structured"
+    writer: Literal["structured", "quote_first", "quote_two_step"] = "structured"
     response_model = FullAnswerDraft
     prompt_version = PROMPT_VERSION
 
@@ -617,7 +621,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
         budget_config,
         config=None,
         *,
-        writer: Literal["structured", "quote_first"] = "structured",
+        writer: Literal["structured", "quote_first", "quote_two_step"] = "structured",
         answer_format: Literal["general", "short_answer", "multiple_choice"] = "general",
         prompt_revision: Literal["contract-consistent", "task-aligned-v5"] = (
             "contract-consistent"
@@ -628,9 +632,12 @@ class FullAnswerWorkflow(AnswerWorkflow):
             raise ValueError("unsupported answer format")
         if prompt_revision not in ("contract-consistent", "task-aligned-v5"):
             raise ValueError("unsupported answer prompt revision")
-        if writer not in ("structured", "quote_first"):
+        if writer not in ("structured", "quote_first", "quote_two_step"):
             raise ValueError("unsupported writer")
-        if writer == "quote_first" and answer_format not in ("general", "short_answer"):
+        if writer in ("quote_first", "quote_two_step") and answer_format not in (
+            "general",
+            "short_answer",
+        ):
             raise ValueError("unsupported quote-first answer format")
         self.writer = writer
         self._search_steps: tuple[str, ...] = ()
@@ -648,6 +655,8 @@ class FullAnswerWorkflow(AnswerWorkflow):
         }[prompt_revision]
         if writer == "quote_first":
             self.prompt_version = QUOTE_FIRST_PROMPT_VERSION
+        elif writer == "quote_two_step":
+            self.prompt_version = QUOTE_TWO_STEP_PROMPT_VERSION
         record = store.get_document(document_id)
         self._native_source = None
         self._native_chunks: tuple[dict, ...] = ()
@@ -711,7 +720,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
             not isinstance(q, str) or not q.strip() or len(q) > 300 for q in search_steps
         ):
             raise ValueError("search steps require at most 16 nonempty queries of 300 characters")
-        if search_steps and self.writer != "quote_first":
+        if search_steps and self.writer not in ("quote_first", "quote_two_step"):
             raise ValueError("search steps require the quote-first writer")
         writer = copy(self)
         writer._search_steps = tuple(search_steps)
@@ -830,7 +839,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
         return tuple(ordered.values())
 
     def _response_model_for(self, blocks):
-        if self.writer == "quote_first":
+        if self.writer in ("quote_first", "quote_two_step"):
             return None
         ids = tuple(_spans(blocks))
         if self.answer_format == "short_answer":
@@ -1235,19 +1244,18 @@ class FullAnswerWorkflow(AnswerWorkflow):
         requested_block_id: str | None,
         context_groups: Sequence[SearchContextGroup],
     ) -> tuple[ChatMessage, ...]:
-        if self.writer == "quote_first":
+        if self.writer in ("quote_first", "quote_two_step"):
             if mode == "explain":
                 raise WorkflowError("quote-first writer does not support explain")
             ordinals = {block.block_id: block.ordinal for block in blocks}
+            sources = tuple(
+                (sid, span.text, self._section_titles.get(ordinals[span.block_id]))
+                for sid, span in _spans(blocks).items()
+            )
+            if self.writer == "quote_two_step":
+                return quote_extract_messages(question, sources, search_steps=self._search_steps)
             return quote_first_messages(
-                question,
-                language,
-                self.answer_format,
-                tuple(
-                    (sid, span.text, self._section_titles.get(ordinals[span.block_id]))
-                    for sid, span in _spans(blocks).items()
-                ),
-                search_steps=self._search_steps,
+                question, language, self.answer_format, sources, search_steps=self._search_steps
             )
         messages = self._messages(
             question,
@@ -1668,6 +1676,68 @@ class FullAnswerWorkflow(AnswerWorkflow):
         ):
             raise WorkflowError("evidence selection exceeded the explicit generation budget")
         return stats
+
+    def _writer_output(
+        self, generated, blocks, question, language, before_generation, after_generation
+    ):
+        if self.writer != "quote_two_step":
+            return super()._writer_output(
+                generated, blocks, question, language, before_generation, after_generation
+            )
+        spans = _spans(blocks)
+        extracted = parse_quote_extract(generated.value)
+        extracted_ids, extract_deviations = verify_quotes(extracted, spans)
+        extract_deviations = [*extracted.deviations, *extract_deviations]
+        reason = (
+            "quote_two_step_none"
+            if extracted.unanswerable
+            else "quote_two_step_unparsed"
+            if not extracted.parsed
+            else "quote_two_step_no_verified_evidence"
+            if not extracted_ids
+            else None
+        )
+        if reason:
+            extract_deviations.append({"type": reason, "count": 1})
+        steps = [self._writer_step("extract", generated, extract_deviations)]
+        if reason:
+            draft = FullAnswerDraft(status="insufficient_evidence")
+            return generated, draft, tuple(extract_deviations), tuple(steps)
+        messages = quote_first_messages(
+            question,
+            language,
+            self.answer_format,
+            quote_answer_sources(extracted, extracted_ids, spans),
+            search_steps=self._search_steps,
+        )
+        budget = budget_for_model(self._model, messages, None, self._budget_config)
+        generated = self._generate_checked(
+            messages, None, budget, before_generation, after_generation
+        )
+        parsed = parse_quote_first(generated.value)
+        answer_ids, deviations = verify_quotes(parsed, spans)
+        verified_ids = [sid for sid in answer_ids if sid in extracted_ids]
+        payload, draft_deviations = quote_first_draft(
+            parsed, verified_ids, spans, self.answer_format, extracted_ids=extracted_ids
+        )
+        deviations.extend(draft_deviations)
+        steps.append(self._writer_step("answer", generated, deviations))
+        return (
+            generated,
+            FullAnswerDraft.model_validate(payload, strict=True),
+            (*extract_deviations, *deviations),
+            tuple(steps),
+        )
+
+    @staticmethod
+    def _writer_step(step, generated, deviations):
+        return {
+            "step": step,
+            "prompt_eval_count": generated.stats.prompt_eval_count,
+            "eval_count": generated.stats.eval_count,
+            "exact_input_tokens": generated.budget.exact_input_tokens,
+            "deviations": list(deviations),
+        }
 
     def _output_draft(self, value, blocks):
         if self.writer == "structured":
