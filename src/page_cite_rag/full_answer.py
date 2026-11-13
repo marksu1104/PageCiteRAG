@@ -42,6 +42,7 @@ from page_cite_rag.quote_first import (
     parse_truncated_evidence,
     quote_answer_sources,
     quote_first_draft,
+    quote_first_explanation,
     quote_first_messages,
     verify_quotes,
 )
@@ -426,6 +427,8 @@ def _validate_claim_ids(claim_ids: Sequence[str]) -> None:
 
 class FullAnswerDraft(_StatusDiscriminatedDraft):
     _deviations: list[dict] = PrivateAttr(default_factory=list)
+    _explanation: str | None = PrivateAttr(default=None)
+    _explanation_sources: tuple[str, ...] = PrivateAttr(default=())
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     status: Literal["answered", "partial", "insufficient_evidence"]
@@ -1360,8 +1363,6 @@ class FullAnswerWorkflow(AnswerWorkflow):
         context_groups: Sequence[SearchContextGroup],
     ) -> tuple[ChatMessage, ...]:
         if self.writer == "quote_first":
-            if mode == "explain":
-                raise WorkflowError("quote-first writer does not support explain")
             ordinals = {block.block_id: block.ordinal for block in blocks}
             spans = _spans(blocks)
             sources = tuple(
@@ -1871,7 +1872,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
         generated = self._generate_checked(
             messages, None, budget, before_generation, after_generation
         )
-        parsed = parse_quote_first(generated.value)
+        parsed = parse_quote_first(generated.value, self.answer_format)
         answer_ids, deviations = verify_quotes(parsed, spans)
         verified_ids = [sid for sid in answer_ids if sid in extracted_ids]
         payload, draft_deviations = quote_first_draft(
@@ -1881,7 +1882,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
         steps.append(self._writer_step("answer", generated, deviations))
         return (
             generated,
-            FullAnswerDraft.model_validate(payload, strict=True),
+            self._quote_draft(payload, parsed, verified_ids, spans),
             (*prior_deviations, *deviations),
             tuple(steps),
         )
@@ -1900,13 +1901,27 @@ class FullAnswerWorkflow(AnswerWorkflow):
         if self.writer == "structured":
             return super()._output_draft(value, blocks)
         spans = _spans(blocks)
-        parsed = parse_quote_first(value)
+        parsed = parse_quote_first(value, self.answer_format)
         ids, deviations = verify_quotes(parsed, spans)
         payload, draft_deviations = quote_first_draft(parsed, ids, spans, self.answer_format)
-        return FullAnswerDraft.model_validate(payload, strict=True), (
+        return self._quote_draft(payload, parsed, ids, spans), (
             *deviations,
             *draft_deviations,
         )
+
+    def _quote_draft(
+        self,
+        payload: dict,
+        parsed: QuoteFirstParse,
+        ids: Sequence[str],
+        spans: Mapping[str, SourceSpan],
+    ) -> FullAnswerDraft:
+        draft = FullAnswerDraft.model_validate(payload, strict=True)
+        if self.answer_format == "general" and draft.answer_claims:
+            draft._explanation, draft._explanation_sources = quote_first_explanation(
+                parsed, ids, spans
+            )
+        return draft
 
     def _verify_output(self, draft, blocks, *, language: Language = "zh-Hant"):
         available = _spans(blocks)

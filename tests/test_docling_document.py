@@ -13,8 +13,9 @@ from page_cite_rag.api import create_app
 from page_cite_rag.cli import main
 from page_cite_rag.docling_document import _recover_omitted_items, bundle_from_native, load_bundle
 from page_cite_rag.docling_retrieval import build_index, load_retriever
-from page_cite_rag.full_answer import PROMPT_VERSION, FullAnswerWorkflow
+from page_cite_rag.full_answer import FullAnswerWorkflow
 from page_cite_rag.generation import GenerationConfig
+from page_cite_rag.quote_first import QUOTE_FIRST_PROMPT_VERSION
 from page_cite_rag.service import DocumentService, ServiceConfig
 from page_cite_rag.store import SQLiteDocumentStore
 from page_cite_rag.workflows import AnswerWorkflow, read_verified_source
@@ -650,7 +651,7 @@ def test_page_furniture_is_excluded_from_recovery_and_source_blocks():
 
 
 def test_docling_staged_api_uses_formal_answer_and_native_source(tmp_path):
-    from tests.test_full_answer import _Model
+    from tests.test_answer_cli import FakeClient
 
     bundle = _bundle()
     database = tmp_path / "document.sqlite3"
@@ -674,7 +675,7 @@ def test_docling_staged_api_uses_formal_answer_and_native_source(tmp_path):
             top_k=3,
         ),
         config,
-        lambda: _Model(config),
+        lambda: FakeClient(config),
         staged_search=lambda query, limit: retriever.search(query, top_k=limit),
     )
     app = create_app(service, api_token="test-local-token", allow_test_client=True)
@@ -689,7 +690,9 @@ def test_docling_staged_api_uses_formal_answer_and_native_source(tmp_path):
             ) as client:
                 answer = await client.post("/v1/ask", json={"question": "What condition?"})
                 assert answer.status_code == 200
-                assert answer.json()["result"]["prompt_version"] == PROMPT_VERSION
+                assert answer.json()["result"]["prompt_version"] == QUOTE_FIRST_PROMPT_VERSION
+                assert answer.json()["result"]["explanation"]
+                assert answer.json()["result"]["explanation_sources"]
                 source = await client.get(f"/v1/source/{bundle.blocks[-1].block_id}")
                 assert source.status_code == 200
                 assert source.json()["native_location"]["native_ref"] == "#/tables/0"

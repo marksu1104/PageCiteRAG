@@ -741,13 +741,35 @@ def _print_answer(result, output_format: str, store=None) -> None:
             )
             print(f"  {_terminal_safe(json.dumps(citation.quote, ensure_ascii=False))}")
 
-    if result.answer_claims:
+    if result.explanation:
+        print(_terminal_safe(result.explanation))
+        print("\nSources:" if result.language == "en" else "\n來源：")
+        citations = {}
+        for claim in (*result.answer_claims, *result.detail_claims):
+            for citation in claim.citations:
+                citations.setdefault(citation.block_id, citation)
+        for number, block_id in enumerate(result.explanation_sources, 1):
+            citation = citations.get(block_id)
+            source = citation
+            # Claim/citation caps do not truncate the full explanation's source list.
+            if source is None and store is not None:
+                source = store.get_block(result.document_id, block_id)
+            if source is None:
+                print(f"[{number}] block {block_id}")
+                continue
+            page = f"page {source.page_number}, " if source.page_number is not None else ""
+            quote = citation.quote if citation is not None else source.text
+            print(
+                f"[{number}] {page}lines {source.line_start}-{source.line_end}; "
+                f"{_terminal_safe(json.dumps(quote, ensure_ascii=False))}"
+            )
+    elif result.answer_claims:
         print("Answer:")
         for claim in result.answer_claims:
             print_claim(claim, "answer evidence")
     else:
         print(f"Answer: {_terminal_safe(result.answer)}")
-    if result.detail_claims:
+    if result.detail_claims and not result.explanation:
         print("\nDetails:")
         for claim in result.detail_claims:
             print_claim(claim, "detail evidence")
@@ -1038,16 +1060,8 @@ def _run_answer(args: argparse.Namespace) -> int:
             config,
             top_k=workflow_config.top_k,
             neighbor_blocks=workflow_config.neighbor_blocks,
-            writer=(
-                "quote_first"
-                if route == "agent" or getattr(args, "answer_format", "general") == "short"
-                else "structured"
-            ),
-            answer_format=(
-                "short_answer"
-                if getattr(args, "answer_format", "general") == "short"
-                else "general"
-            ),
+            writer="quote_first",
+            answer_format="general",
         )
         if route != "fixed":
             from page_cite_rag.application import answer_question
@@ -1220,7 +1234,6 @@ def _create_document_service(args: argparse.Namespace):
             idle_seconds=args.idle_seconds,
             request_timeout_seconds=args.request_timeout_seconds,
             route=args.route,
-            answer_format=args.answer_format,
         ),
         config,
         lambda: _open_generation_client(args, config),
@@ -1304,7 +1317,6 @@ def _document_service_options(parser: argparse.ArgumentParser) -> None:
         default="auto",
         help=_ROUTE_HELP,
     )
-    parser.add_argument("--answer-format", choices=("general", "short"), default="general")
     parser.add_argument("--top-k", type=_positive_integer, default=FORMAL_RETRIEVAL.final_k)
     parser.add_argument("--queue-capacity", type=int, default=2)
     parser.add_argument("--idle-seconds", type=float, default=300.0)
@@ -1514,7 +1526,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help=_ROUTE_HELP,
     )
-    ask_parser.add_argument("--answer-format", choices=("general", "short"), default="general")
     _embedding_options(ask_parser)
     ask_parser.add_argument(
         "--native-gpu",

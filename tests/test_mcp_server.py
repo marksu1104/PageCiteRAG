@@ -78,6 +78,8 @@ def test_all_tools_protocol_and_service_outputs(prepared):
                 assert not result.is_error
                 output = result.structured_content
                 assert output["result"]["answer"]
+                assert output["result"]["explanation"]
+                assert output["result"]["explanation_sources"]
                 citation = output["result"]["answer_claims"][0]["citations"][0]
                 assert citation["quote"] in service.source(citation["block_id"]).text
                 assert {

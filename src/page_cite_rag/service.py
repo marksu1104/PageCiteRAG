@@ -59,7 +59,6 @@ class ServiceConfig(BaseModel):
     idle_seconds: float = Field(default=300, gt=0, le=300)
     # The CLI defaults to auto; direct service callers keep fixed retrieval.
     route: Literal["auto", "fixed", "agent"] = "fixed"
-    answer_format: Literal["general", "short"] = "general"
 
 
 class ServiceTrace(BaseModel):
@@ -389,12 +388,8 @@ class DocumentService:
             self.model_config,
             top_k=self.config.top_k,
             neighbor_blocks=(self.config.neighbor_blocks if job.mode == "explain" else 0),
-            writer=(
-                "quote_first"
-                if self.config.route == "agent" or self.config.answer_format == "short"
-                else "structured"
-            ),
-            answer_format=("short_answer" if self.config.answer_format == "short" else "general"),
+            writer="quote_first",
+            answer_format="general",
         )
         started = time.perf_counter()
         reading_trace = None

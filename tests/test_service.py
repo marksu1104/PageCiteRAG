@@ -486,7 +486,7 @@ def test_resident_english_rewrite_option_uses_one_bounded_query_call(prepared):
 def test_api_opt_in_chinese_rewrite_keeps_original_question_and_records_cost(prepared):
     class RewriteClient(FakeClient):
         def generate(self, messages, schema_class):
-            if schema_class is None:
+            if schema_class is None and not messages[1].content.startswith("Passages:"):
                 self.calls.append((messages, schema_class))
                 return GenerationResult(
                     "explain, result",
@@ -680,9 +680,8 @@ def test_owned_native_server_checks_external_cancel_signal():
         server._check_cancelled()
 
 
-@pytest.mark.parametrize("answer_format", ["general", "short"])
 @pytest.mark.parametrize("route", ["fixed", "auto", "agent"])
-def test_service_answer_format_reaches_shared_workflow(prepared, monkeypatch, answer_format, route):
+def test_service_always_uses_general_quote_first(prepared, monkeypatch, route):
     from page_cite_rag import application
     from page_cite_rag import service as service_module
 
@@ -700,17 +699,11 @@ def test_service_answer_format_reaches_shared_workflow(prepared, monkeypatch, an
 
     monkeypatch.setattr(service_module, "document_workflow", workflow)
     monkeypatch.setattr(application, "answer_question", answer)
-    settings = ServiceConfig(
-        database_path=database, document_id=document_id, route=route, answer_format=answer_format
-    )
+    settings = ServiceConfig(database_path=database, document_id=document_id, route=route)
     assert ServiceConfig(database_path=database, document_id=document_id).route == "fixed"
-    assert ServiceConfig(database_path=database, document_id=document_id).answer_format == "general"
+    with pytest.raises(ValueError):
+        ServiceConfig(database_path=database, document_id=document_id, answer_format="short")
     with DocumentService(settings, config, lambda: FakeClient(config)) as service:
         with pytest.raises(ValueError, match="writer checked"):
             service.submit("ask", "question")[1].result(timeout=5)
-    assert captured == [
-        (
-            "quote_first" if route == "agent" or answer_format == "short" else "structured",
-            "short_answer" if answer_format == "short" else "general",
-        )
-    ]
+    assert captured == [("quote_first", "general")]

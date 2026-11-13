@@ -251,6 +251,8 @@ class AnswerResult(BaseModel):
     ]
     retrieval: RetrievalTrace | None
     generation_stats: GenerationStats | None
+    explanation: str | None = None
+    explanation_sources: tuple[str, ...] = ()
     agent_usage: AgentUsage | None = None
     # Exact repeats of one source within one claim, dropped before citation checks; the
     # claim's support is unchanged, so one repeated reference no longer voids the answer.
@@ -268,6 +270,8 @@ class AnswerResult(BaseModel):
         "quote-first-answer/v2",
         "quote-first-answer/v3",
         "quote-first-answer/v1",
+        "quote-first-answer/v4",
+        "quote-first-answer/v4-no-refusal",
         "complete-cited-answer-v1",
         "complete-cited-answer-v2",
         "complete-cited-answer-v3",
@@ -960,6 +964,9 @@ class AnswerWorkflow:
                 generated, selected, question, language, before_generation, after_generation
             )
             claims, extra_fields = self._verify_output(draft, selected, language=language)
+            if getattr(draft, "_explanation", None) is not None:
+                extra_fields["explanation"] = draft._explanation
+                extra_fields["explanation_sources"] = draft._explanation_sources
             if writer_deviations:
                 extra_fields["output_deviations"] = (
                     *extra_fields.get("output_deviations", ()),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -111,8 +112,25 @@ class FakeClient:
         if self.failure:
             raise self.failure
         if schema_class is None:
+            value = "document, evidence"
+            if messages[1].content.startswith("Passages:"):
+                passage = re.search(r"\[(S\d+(?:_\d+)?)\] (.+)", messages[1].content)
+                source_id, quote = passage.groups()
+                quote = re.sub(r"^\(Section: .*?\) ", "", quote)
+                answer = (
+                    "结果并不显著，除非 n > 64；儿童被排除。"
+                    if "Traditional Chinese" in messages[0].content
+                    else "The result was not significant unless n > 64."
+                )
+                source_id = "S999" if self.invalid_citation else source_id
+                value = (
+                    "Answer: Unanswerable"
+                    if self.insufficient
+                    else f'Evidence:\n[{source_id}] "{quote}"\nReasoning: The source states it.\n'
+                    f"Answer: {answer} [{source_id}]"
+                )
             return GenerationResult(
-                "document, evidence",
+                value,
                 GenerationStats(
                     prompt_eval_count=50,
                     eval_count=10,
@@ -319,10 +337,10 @@ def test_ask_text_output_displays_answer_quote_and_positions(document, clients, 
     build_bm25_index(store, document_id)
     assert cli.main(ask_arguments(document)) == 0
     output = capsys.readouterr()
-    assert "- The result was not significant unless n > 64." in output.out
+    assert output.out.startswith("The result was not significant unless n > 64. [1]")
+    assert "Sources:" in output.out  # English answer, English label
+    assert "[1] lines 1-1;" in output.out
     assert "lines 1-1" in output.out
-    assert f"block {blocks[0].block_id}" in output.out
-    assert "chars [0," in output.out
     assert json.dumps(blocks[0].text, ensure_ascii=False) in output.out
     assert "Status: answered" in output.out
     assert "not whether a claim" in output.out
@@ -383,7 +401,7 @@ def test_unknown_question_returns_zero_visible_insufficient_without_generation(
     assert clients[0][2].close_count == 1
 
 
-@pytest.mark.parametrize("failure", ["citation", "timeout", "budget", "model", "os"])
+@pytest.mark.parametrize("failure", ["timeout", "budget", "model", "os"])
 def test_answer_failures_return_nonzero_and_close_client_without_raw_data(
     document, monkeypatch, capsys, failure
 ):
@@ -393,15 +411,12 @@ def test_answer_failures_return_nonzero_and_close_client_without_raw_data(
 
     def open_client(args, config):
         client = FakeClient(config)
-        if failure == "citation":
-            client.invalid_citation = True
-        else:
-            client.failure = {
-                "timeout": ModelTimeoutError("local generation timed out; not retried"),
-                "budget": ContextBudgetError("input exceeds the reserved context budget"),
-                "model": ModelError("local generation failed"),
-                "os": OSError("PRIVATE_CANARY /private/path"),
-            }[failure]
+        client.failure = {
+            "timeout": ModelTimeoutError("local generation timed out; not retried"),
+            "budget": ContextBudgetError("input exceeds the reserved context budget"),
+            "model": ModelError("local generation failed"),
+            "os": OSError("PRIVATE_CANARY /private/path"),
+        }[failure]
         opened.append(client)
         return client
 
@@ -940,9 +955,8 @@ def test_non_fixed_rejects_rewrite_and_rerank(document, clients, capsys, route, 
 
 
 @pytest.mark.parametrize("route", ["fixed", "auto", "agent"])
-@pytest.mark.parametrize("answer_format", ["general", "short"])
-def test_cli_answer_format_selects_writer(
-    document, clients, monkeypatch, capsys, route, answer_format, tokenizer_directory
+def test_cli_uses_quote_first_general(
+    document, clients, monkeypatch, capsys, route, tokenizer_directory
 ):
     from page_cite_rag import application
 
@@ -977,25 +991,15 @@ def test_cli_answer_format_selects_writer(
             "GPU-12345678-1234-1234-1234-123456789abc",
         ]
 
-    # Stop at the concrete workflow so short format needs no structured fake response.
+    # Inspect the concrete workflow before routing runs.
     def routed(*args, **kwargs):
         raise ModelError("checked writer")
 
     monkeypatch.setattr(application, "answer_question", routed)
     if route == "fixed":
         monkeypatch.setattr(application, "ask_document", routed)
-    assert (
-        cli.main(
-            ask_arguments(document, "--route", route, "--answer-format", answer_format, *options)
-        )
-        == 1
-    )
-    assert captured == [
-        (
-            "quote_first" if route == "agent" or answer_format == "short" else "structured",
-            "short_answer" if answer_format == "short" else "general",
-        )
-    ]
+    assert cli.main(ask_arguments(document, "--route", route, *options)) == 1
+    assert captured == [("quote_first", "general")]
     capsys.readouterr()
 
 
@@ -1288,3 +1292,74 @@ def test_local_service_own_ollama_keeps_original_default_error(command):
     args = cli.build_parser().parse_args([command, "synthetic", "--backend", "ollama"])
     with pytest.raises(ValueError, match="exact token budget requires an owned backend"):
         cli._generation_config(args)
+
+
+@pytest.mark.parametrize("command", ["ask", "serve", "mcp"])
+def test_product_commands_reject_answer_format(command):
+    arguments = [command, "0" * 64]
+    if command == "ask":
+        arguments.append("question")
+    with pytest.raises(SystemExit) as error:
+        cli.build_parser().parse_args([*arguments, "--answer-format", "short"])
+    assert error.value.code == 2
+
+
+def test_unknown_quote_first_citation_is_visible_insufficient(document, monkeypatch, capsys):
+    store, document_id, _ = document
+    build_bm25_index(store, document_id)
+
+    def client(args, config):
+        model = FakeClient(config)
+        model.invalid_citation = True
+        return model
+
+    monkeypatch.setattr(cli, "_open_generation_client", client)
+    assert cli.main(ask_arguments(document, "--format", "json")) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "insufficient_evidence"
+    assert result["explanation"] is None
+    assert result["explanation_sources"] == []
+    assert result["answer_claims"] == []
+    assert {"type": "quote_unknown_source", "count": 1} in result["output_deviations"]
+
+
+def test_explanation_source_list_survives_claim_cap(document, capsys):
+    from page_cite_rag.application import document_workflow
+    from page_cite_rag.generation import GenerationConfig
+
+    store, document_id, blocks = document
+    client = FakeClient(GenerationConfig())
+
+    def generate(messages, schema):
+        ids = [f"S{block.ordinal}" for block in blocks]
+        evidence = "\n".join(f'[{sid}] "{block.text}"' for sid, block in zip(ids, blocks))
+        text = "\n".join(f"- Fact {i} [{ids[0]}]" for i in range(12))
+        text += f"\n- Another fact [{ids[1]}]"
+        return GenerationResult(
+            f"Evidence:\n{evidence}\nAnswer:\n{text}",
+            client.generate_stats,
+            check_budget(messages, None, client.config),
+        )
+
+    client.generate_stats = GenerationStats(
+        prompt_eval_count=100,
+        eval_count=20,
+        total_duration=100,
+        load_duration=None,
+        prompt_eval_duration=40,
+        eval_duration=60,
+        done_reason="stop",
+        elapsed_ms=1.0,
+    )
+    client.generate = generate
+    workflow = document_workflow(
+        store, document_id, None, client, client.config, writer="quote_first"
+    )
+    result = workflow.answer_from_context("Explain", blocks, language="en")
+    assert len(result.answer_claims) + len(result.detail_claims) == 12
+    assert result.explanation_sources == (blocks[0].block_id, blocks[1].block_id)
+    cli._print_answer(result, "text", store)
+    text = capsys.readouterr().out
+    assert "[1] lines 1-1;" in text
+    assert "[2] lines 3-3;" in text
+    assert json.dumps(blocks[1].text, ensure_ascii=False) in text

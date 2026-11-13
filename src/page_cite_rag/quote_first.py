@@ -8,8 +8,8 @@ from typing import Literal
 from page_cite_rag.generation import ChatMessage
 from page_cite_rag.span_citations import SourceSpan, _normalized, quote_is_verbatim
 
-QUOTE_FIRST_PROMPT_VERSION = "quote-first-answer/v1"
-QUOTE_FIRST_V3_PROMPT_VERSION = "quote-first-answer/v3"
+QUOTE_FIRST_PROMPT_VERSION = "quote-first-answer/v4"
+QUOTE_FIRST_V3_PROMPT_VERSION = "quote-first-answer/v4-no-refusal"
 _ID = re.compile(r"\[(S\d+(?:_\d+)?)\]")
 _HEADER = re.compile(r"^\s*[#*\s]*(Evidence|Reasoning|Answer)\**\s*:\s*\**\s*(.*?)\s*$", re.I)
 _BULLET = re.compile(r"^\s*(?:[-*•]|\d+\.)\s+(.+)$")
@@ -32,9 +32,13 @@ def quote_first_messages(
         'Finish with a final line "Answer: " followed by only the answer, as short as possible: '
         "a name, number, date, short phrase, one sentence, or yes/no."
         if answer_format == "short_answer"
-        else 'Finish with "Answer:" followed by one to six bullet points; each bullet is one '
-        "complete sentence that ends with the IDs of the passages it relies on, for example "
-        '"- The method lowers cost by 20% [S12][S15]".'
+        else 'Finish with "Answer:" followed by a helpful answer written for the user: '
+        "match the depth, length and audience the question asks for (a detailed, plain-language "
+        "explanation when asked to explain, one sentence for a short fact); use Markdown lists "
+        "or headings when they help. End every sentence that states what the passages say with "
+        "the IDs of the passages it relies on, for example "
+        '"The method lowers cost by 20% [S12][S15]." You may add brief background explanation '
+        "that is not in the passages; leave those sentences without passage IDs."
     )
     if prompt_revision not in ("v1", "v3"):
         raise ValueError("unsupported quote-first prompt revision")
@@ -96,9 +100,10 @@ class QuoteFirstParse:
     unanswerable: bool
     parsed: bool
     deviations: tuple[dict, ...] = ()
+    answer_text: str = ""
 
 
-def parse_quote_first(text: str) -> QuoteFirstParse:
+def parse_quote_first(text: str, answer_format: str = "general") -> QuoteFirstParse:
     lines = text.splitlines()
     headers = [(i, match) for i, line in enumerate(lines) if (match := _HEADER.match(line))]
     answers = [(i, m) for i, m in headers if m[1].lower() == "answer"]
@@ -106,7 +111,18 @@ def parse_quote_first(text: str) -> QuoteFirstParse:
         return QuoteFirstParse((), "", (), False, False)
     last, answer = answers[-1]
     bullets = tuple(m[1].strip() for line in lines[last + 1 :] if (m := _BULLET.match(line)))
-    answer_lines = bullets or ((answer[2].strip(),) if answer[2].strip() else ())
+    prefix, inline = lines[last].split(":", 1)
+    inline = inline.lstrip()
+    # Only consume closing emphasis belonging to the Answer heading, not answer Markdown.
+    stars = prefix.count("*") if prefix.rstrip().lower().endswith("answer") else 0
+    if stars and inline.startswith("*" * stars):
+        inline = inline[stars:]
+    answer_text = "\n".join([inline, *lines[last + 1 :]]).strip()
+    answer_lines = (
+        bullets or ((answer[2].strip(),) if answer[2].strip() else ())
+        if answer_format == "short_answer"
+        else tuple(unit for unit, _, _ in _answer_units(answer_text))
+    )
     evidence_headers = [(i, m) for i, m in headers if i < last and m[1].lower() == "evidence"]
     reasoning_headers = [(i, m) for i, m in headers if i < last and m[1].lower() == "reasoning"]
     reasoning = ""
@@ -124,8 +140,64 @@ def parse_quote_first(text: str) -> QuoteFirstParse:
         and re.sub(r"[\W_]", "", " ".join(answer_lines)).casefold() == "unanswerable"
     )
     return QuoteFirstParse(
-        tuple(evidence), reasoning, answer_lines, unanswerable, bool(answer_lines)
+        tuple(evidence),
+        reasoning,
+        answer_lines,
+        unanswerable,
+        bool(answer_lines),
+        answer_text=answer_text,
     )
+
+
+def _answer_units(text: str) -> list[tuple[str, int, int]]:
+    """Return claim units and their original ranges, preserving adjacent source markers."""
+    units = []
+    offset = 0
+    boundary = re.compile(r"[。！？!?]+|\.(?=\s|$|\[S\d)")
+    trailing_ids = re.compile(r"(?:[ \t]*\[S\d+(?:_\d+)?\])+")
+    for line in text.splitlines(keepends=True):
+        if line.strip() and not line.lstrip().startswith("#"):
+            bullet = _BULLET.match(line)
+            if bullet:
+                units.append((bullet[1].strip(), offset, offset + len(line.rstrip("\r\n"))))
+            else:
+                start = 0
+                while start < len(line):
+                    match = boundary.search(line, start)
+                    end = match.end() if match else len(line)
+                    ids = trailing_ids.match(line, end)
+                    if ids:
+                        end = ids.end()
+                        # A final period may also follow the IDs.
+                        if line[end : end + 1] == ".":
+                            end += 1
+                    if unit := line[start:end].strip():
+                        units.append((unit, offset + start, offset + end))
+                    start = end
+        offset += len(line)
+    return units
+
+
+def quote_first_explanation(
+    parse: QuoteFirstParse, verified_ids: Sequence[str], spans: Mapping[str, SourceSpan]
+) -> tuple[str, tuple[str, ...]]:
+    text = parse.answer_text
+    for unit, start, end in reversed(_answer_units(text)):
+        ids = _ID.findall(unit)
+        if ids and not any(sid in verified_ids for sid in ids):
+            text = text[:start] + text[end:]
+    sources = []
+
+    def reference(match: re.Match) -> str:
+        sid = match[1]
+        if sid not in verified_ids:
+            return ""
+        block_id = spans[sid].block_id
+        if block_id not in sources:
+            sources.append(block_id)
+        return f"[{sources.index(block_id) + 1}]"
+
+    return _ID.sub(reference, text).strip(), tuple(sources)
 
 
 def _parse_evidence(area: str) -> list[tuple[str, tuple[str, ...]]]:
@@ -238,9 +310,6 @@ def quote_first_draft(
     lines = parse.answer_lines
     if answer_format == "short_answer":
         lines = (" ".join(lines),)
-    elif len(lines) > 6:
-        _deviation(deviations, "quote_first_lines_capped")
-        lines = lines[:6]
     claims = []
     for line in lines:
         ids = list(
@@ -250,10 +319,9 @@ def quote_first_draft(
                 else (m[1] for m in _ID.finditer(line) if m[1] in verified_ids)
             )
         )
-        if not ids and extracted_ids and answer_format == "general":
-            ids = list(extracted_ids)
-            _deviation(deviations, "quote_two_step_line_cited_all_extracted")
         if not ids:
+            if answer_format == "general" and not _ID.search(line):
+                continue
             _deviation(deviations, "quote_first_line_without_verified_source")
             continue
         if len(ids) > 8:
@@ -263,6 +331,10 @@ def quote_first_draft(
         if not text:
             # A bullet holding only source markers states nothing that could be cited.
             _deviation(deviations, "quote_first_empty_line")
+            continue
+        if answer_format == "general" and len(claims) >= 12:
+            if not any(d["type"] == "quote_first_claims_capped" for d in deviations):
+                _deviation(deviations, "quote_first_claims_capped")
             continue
         direct = any(_normalized(text) in _normalized(spans[sid].text) for sid in ids)
         basis = None

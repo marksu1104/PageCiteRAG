@@ -3,7 +3,7 @@
 import pytest
 
 from page_cite_rag import cli
-from page_cite_rag.full_answer import PROMPT_VERSION
+from page_cite_rag.quote_first import QUOTE_FIRST_PROMPT_VERSION
 from tests.test_answer_cli import FakeClient
 
 
@@ -30,7 +30,7 @@ def test_cli_uses_unified_cited_answer_contract(setup, monkeypatch, capsys):
         )
         == 0
     )
-    assert f'"prompt_version": "{PROMPT_VERSION}"' in capsys.readouterr().out
+    assert f'"prompt_version": "{QUOTE_FIRST_PROMPT_VERSION}"' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("command", ["ask", "explain"])

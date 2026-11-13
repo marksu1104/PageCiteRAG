@@ -135,7 +135,7 @@ def test_general_intersection_and_dropped_lines(spans):
     draft = FullAnswerDraft.model_validate(payload, strict=True)
     assert [c.source_id for c in draft.answer_claims[0].citations] == ["S2", "S1"]
     assert draft.answer_claims[0].text == "120 adults"
-    assert deviations == [{"type": "quote_first_line_without_verified_source", "count": 2}]
+    assert deviations == [{"type": "quote_first_line_without_verified_source", "count": 1}]
     payload, _ = quote_first_draft(
         replace(parsed, answer_lines=("missing [S99]",)), ["S1"], spans, "general"
     )
@@ -173,10 +173,14 @@ def test_exact_prompt(language, answer_format):
         )
         if answer_format == "short_answer"
         else (
-            'Finish with "Answer:" followed by one to six bullet points; each '
-            "bullet is one complete sentence that ends with the IDs of the "
-            'passages it relies on, for example "- The method lowers cost by '
-            '20% [S12][S15]".'
+            'Finish with "Answer:" followed by a helpful answer written for the user: '
+            "match the depth, length and audience the question asks for "
+            "(a detailed, plain-language "
+            "explanation when asked to explain, one sentence for a short fact); use Markdown lists "
+            "or headings when they help. End every sentence that states what the passages say with "
+            "the IDs of the passages it relies on, for example "
+            '"The method lowers cost by 20% [S12][S15]." You may add brief background explanation '
+            "that is not in the passages; leave those sentences without passage IDs."
         )
     )
     lang = "English" if language == "en" else "Traditional Chinese"
@@ -237,6 +241,9 @@ def test_workflow(setup, monkeypatch, answer_format, fabricated):
     result = workflow.answer_from_context("Who was excluded?", blocks, language="en")
     AnswerResult.model_validate_json(result.model_dump_json(), strict=True)
     assert result.prompt_version == QUOTE_FIRST_PROMPT_VERSION
+    if answer_format == "short_answer" or fabricated:
+        assert result.explanation is None
+        assert result.explanation_sources == ()
     if fabricated:
         assert result.status == "insufficient_evidence"
         assert result.stop_reason == "model_insufficient_evidence"
@@ -263,11 +270,6 @@ def test_writer_rejections(setup):
     ):
         with pytest.raises(ValueError):
             FullAnswerWorkflow(store, doc_id, retriever, model, model.config, **kwargs)
-    workflow = document_workflow(
-        store, doc_id, retriever, model, model.config, writer="quote_first"
-    )
-    with pytest.raises(WorkflowError, match="explain"):
-        workflow.explain(blocks[0].block_id)
 
 
 @pytest.mark.parametrize("failure", ["type", "budget", "tokens"])
@@ -339,14 +341,17 @@ def test_general_citations_cap(spans):
     assert deviations == [{"type": "quote_first_citations_capped", "count": 1}]
 
 
-def test_general_line_cap_precedes_source_filter(spans):
-    # The seventh line cannot enter the answer even when it has a verified source.
-    parsed = parse_quote_first("Answer:\n" + "- Missing [S99]\n" * 6 + "- 120 adults [S1]")
+def test_general_claim_cap_follows_source_filter(spans):
+    parsed = parse_quote_first(
+        "Answer:\n" + "- Missing [S99]\n" * 6 + "\n".join(f"- Fact {i} [S1]" for i in range(14))
+    )
     payload, deviations = quote_first_draft(parsed, ["S1"], spans, "general")
-    assert FullAnswerDraft.model_validate(payload, strict=True).status == "insufficient_evidence"
+    draft = FullAnswerDraft.model_validate(payload, strict=True)
+    assert len(draft.answer_claims) == 3
+    assert len(draft.detail_claims) == 9
     assert deviations == [
-        {"type": "quote_first_lines_capped", "count": 1},
         {"type": "quote_first_line_without_verified_source", "count": 6},
+        {"type": "quote_first_claims_capped", "count": 1},
     ]
 
 
@@ -501,3 +506,110 @@ def test_v3_workflow_version_and_factory(setup, monkeypatch, writer):
         assert workflow._messages_with_context_groups(
             "Q", "en", "ask", blocks, None, ()
         ) == baseline._messages_with_context_groups("Q", "en", "ask", blocks, None, ())
+
+
+def test_general_sentence_units_preserve_markers_and_markdown():
+    text = (
+        "# Overview\n中文一。[S2][S1] English fact! [S1] Next? [S2]\n"
+        "- Bullet has two sentences. Keep together [S1]\n"
+        "2. 編號。維持一項 [S2]\nExample e.g. this works. [S1][S2] Done."
+    )
+    parsed = parse_quote_first("Answer: discarded\nAnswer: " + text)
+    assert parsed.answer_text == text
+    assert parsed.answer_lines[:5] == (
+        "中文一。[S2][S1]",
+        "English fact! [S1]",
+        "Next? [S2]",
+        "Bullet has two sentences. Keep together [S1]",
+        "編號。維持一項 [S2]",
+    )
+    assert "this works. [S1][S2]" in parsed.answer_lines
+    assert not any(unit.startswith("[S") for unit in parsed.answer_lines)
+    assert parsed.answer_lines[-1] == "Done."
+
+
+@pytest.mark.parametrize("mode", ["ask", "explain"])
+def test_general_explanation_keeps_background_and_verified_numbering(setup, monkeypatch, mode):
+    store, doc_id, blocks, retriever, model, _ = setup
+    s1, s2 = (f"S{block.ordinal}" for block in blocks[:2])
+    text = (
+        f"# Summary\nChildren were excluded. [{s2}][{s1}] "
+        f"共120人。[{s1}] A plain background explanation. "
+        f"Adults participated! [{s2}] Fabricated fact. [S999]"
+    )
+    output = (
+        f'Evidence:\n[{s1}] "{blocks[0].text}"\n[{s2}] "{blocks[1].text}"\n'
+        "Reasoning: Read the passages.\nAnswer: " + text
+    )
+
+    def generate(messages, response_model):
+        assert response_model is None
+        return GenerationResult(output, stats(), check_budget(messages, None, model.config))
+
+    monkeypatch.setattr(model, "generate", generate)
+    workflow = document_workflow(
+        store, doc_id, retriever, model, model.config, writer="quote_first", neighbor_blocks=1
+    )
+    result = (
+        workflow.explain(blocks[0].block_id, language="en")
+        if mode == "explain"
+        else workflow.answer_from_context("Explain to a beginner", blocks, language="en")
+    )
+    assert len(result.answer_claims) == 3
+    assert result.detail_claims == ()
+    assert result.explanation == (
+        "# Summary\nChildren were excluded. [1][2] 共120人。[2] "
+        "A plain background explanation. Adults participated! [1]"
+    )
+    assert result.explanation_sources == (blocks[1].block_id, blocks[0].block_id)
+    assert {
+        "type": "quote_first_line_without_verified_source",
+        "count": 1,
+    } in result.output_deviations
+    AnswerResult.model_validate_json(result.model_dump_json(), strict=True)
+
+
+def test_short_answer_retains_legacy_line_selection():
+    parsed = parse_quote_first(
+        "Answer: Inline fact. Next fact. [S1]\n- First. Second. [S1]\n"
+        "Unbulleted continuation.\n- Third [S1]",
+        "short_answer",
+    )
+    assert parsed.answer_lines == ("First. Second. [S1]", "Third [S1]")
+
+
+def test_prompt_versions_and_adaptive_general_only():
+    from page_cite_rag.quote_first import QUOTE_FIRST_V3_PROMPT_VERSION
+
+    assert QUOTE_FIRST_PROMPT_VERSION == "quote-first-answer/v4"
+    assert QUOTE_FIRST_V3_PROMPT_VERSION == "quote-first-answer/v4-no-refusal"
+    for revision in ("v1", "v3"):
+        general = quote_first_messages("q", "en", "general", (), prompt_revision=revision)[0]
+        short = quote_first_messages("q", "en", "short_answer", (), prompt_revision=revision)[0]
+        assert "match the depth, length and audience" in general.content
+        assert "match the depth, length and audience" not in short.content
+
+
+@pytest.mark.parametrize("heading", ["Answer:", "**Answer:**", "**Answer**:"])
+def test_inline_answer_preserves_markdown(heading):
+    parsed = parse_quote_first(f"{heading} **Key fact** [S1].\n\nMore detail [S1].")
+    assert parsed.answer_text == "**Key fact** [S1].\n\nMore detail [S1]."
+    assert parsed.answer_lines == ("**Key fact** [S1].", "More detail [S1].")
+
+
+def test_general_background_alone_is_insufficient(setup, monkeypatch):
+    store, doc_id, blocks, retriever, model, _ = setup
+    output = f'Evidence:\n[S{blocks[0].ordinal}] "{blocks[0].text}"\nAnswer: Background only.'
+
+    def generate(messages, response_model):
+        return GenerationResult(output, stats(), check_budget(messages, None, model.config))
+
+    monkeypatch.setattr(model, "generate", generate)
+    workflow = document_workflow(
+        store, doc_id, retriever, model, model.config, writer="quote_first"
+    )
+    result = workflow.answer_from_context("Explain", blocks, language="en")
+    assert result.status == "insufficient_evidence"
+    assert result.explanation is None
+    assert result.explanation_sources == ()
+    assert result.output_deviations == ()
