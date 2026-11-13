@@ -524,6 +524,12 @@ def _generation_options(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--model-size",
+        choices=("9b", "4b", "27b"),
+        default="9b",
+        help="Pinned Qwen3.5 model size (only for pinned-ollama and llama).",
+    )
+    parser.add_argument(
         "--api-provider",
         choices=("custom", "gemini", "groq", "openrouter", "ollama-local"),
         default="custom",
@@ -574,6 +580,9 @@ def _generation_options(parser: argparse.ArgumentParser) -> None:
 def _generation_config(args: argparse.Namespace):
     # Validate choices before loading a large embedding model or starting a server.
     from page_cite_rag.generation import DEFAULT_LLM, GenerationConfig
+
+    if args.model_size != "9b" and args.backend not in OWNED_BACKENDS:
+        raise ValueError("--model-size applies only to the pinned backends")
 
     if args.token_budget is None:
         args.token_budget = (
@@ -640,6 +649,7 @@ def _generation_config(args: argparse.Namespace):
         timeout_seconds=args.generation_timeout,
         num_thread=args.llm_threads,
         max_gpu_temperature_c=_gpu_temperature_limit(args),
+        model_size=args.model_size,
     )
 
 

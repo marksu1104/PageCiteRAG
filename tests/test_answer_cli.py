@@ -686,10 +686,44 @@ def test_default_backend_is_the_validated_pinned_ollama_with_exact_budget():
     config = cli._generation_config(args)
     assert args.token_budget == "exact"
     assert config.num_predict == 3072 and config.num_ctx == 16384
+    assert config.model_size == "9b"
     own = cli.build_parser().parse_args(
         ["ask", "0" * 64, "question", "--backend", "ollama", "--llm-model", "mine:latest"]
     )
     assert cli._generation_config(own).model == "mine:latest" and own.token_budget == "conservative"
+
+
+def test_pinned_model_size_is_configured_and_used_by_client(monkeypatch):
+    from page_cite_rag.ollama_backend import ollama_model_name
+
+    args = cli.build_parser().parse_args(["ask", "0" * 64, "question", "--model-size", "4b"])
+    config = cli._generation_config(args)
+    assert config.model_size == "4b"
+    captured = {}
+
+    class FakePinnedClient:
+        def __init__(self, received, **_kwargs):
+            captured["config"] = received
+            captured["model"] = ollama_model_name(received.model_size)
+
+    monkeypatch.setattr("page_cite_rag.ollama_backend.OllamaGgufClient", FakePinnedClient)
+    cli._open_generation_client(args, config)
+    assert captured == {"config": config, "model": ollama_model_name("4b")}
+
+
+def test_model_size_rejected_for_api_backend():
+    args = cli.build_parser().parse_args(
+        ["ask", "0" * 64, "question", "--backend", "api", "--model-size", "4b"]
+    )
+    with pytest.raises(ValueError, match="--model-size applies only to the pinned backends"):
+        cli._generation_config(args)
+
+
+@pytest.mark.parametrize("command", ["chat", "mcp"])
+def test_model_size_option_is_shared_with_chat_and_mcp(command):
+    args = [command, "synthetic-document"]
+    parsed = cli.build_parser().parse_args([*args, "--model-size", "4b"])
+    assert parsed.model_size == "4b"
 
 
 def test_native_gpu_detail_searches_after_whole_document_admission(
