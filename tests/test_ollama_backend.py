@@ -13,12 +13,6 @@ import pytest
 from pydantic import BaseModel
 
 from page_cite_rag import llama, ollama_backend
-
-# The owned Ollama server is Linux-only (pinned Linux runtime). These tests also stand in a
-# pinned-size model blob with a sparse 5.7 GB file, which NTFS allocates in full.
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32", reason="owned Ollama server is Linux-only; sparse 5.7 GB blob"
-)
 from page_cite_rag.generation import ChatMessage, ContextBudgetError, ModelError, ModelTimeoutError
 
 MESSAGES = (
@@ -26,6 +20,12 @@ MESSAGES = (
     ChatMessage(role="user", content="Is it significant?"),
 )
 NAME = ollama_backend.ollama_model_name("9b")
+# The owned Ollama server is Linux-only (pinned Linux runtime). These tests also stand in a
+# pinned-size model blob with a sparse 5.7 GB file, which NTFS allocates in full.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="owned Ollama server is Linux-only; sparse 5.7 GB blob"
+)
+
 SPEC = llama.model_spec("9b")
 
 
