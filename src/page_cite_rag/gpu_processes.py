@@ -15,7 +15,9 @@ _lock = threading.RLock()
 _processes: dict[int, subprocess.Popen] = {}
 
 MAX_GPU_MEMORY_MIB = 24_000
-GPU_DISPATCH_HEADROOM_C = 15
+# Dispatch gate below the driver target (approved 2026-11-13: 15 -> 10, i.e. 69 -> 74 C locally).
+# The 15 C margin only avoided SW-slowdown stops near target, which 2026-11-12 made normal.
+GPU_DISPATCH_HEADROOM_C = 10
 # Approved 2026-11-04: a software-only thermal flag at or below this temperature is re-read
 # once after SW_THERMAL_RECHECK_SECONDS and tolerated (and recorded) only if it has cleared.
 TRANSIENT_SW_THERMAL_MAX_C = 80
@@ -168,7 +170,7 @@ def wait_for_gpu_dispatch(
     *,
     max_temperature_c: int,
     timeout_seconds: float = 120.0,
-    headroom_c: int = 15,
+    headroom_c: int = GPU_DISPATCH_HEADROOM_C,
     recent_samples: Callable[[], list[dict]] | None = None,
 ) -> dict:
     """Apply the shared soft dispatch gate while leaving hard GPU guards in ``check``.

@@ -80,13 +80,13 @@ def test_stable_dispatch_window_requires_continuous_recent_safe_samples(monkeypa
     assert result["seconds"] == 0
     assert result["reused_monitor_window"] is True
     assert result["safe_sample_count"] == 4
-    assert result["dispatch_temperature_limit_c"] == 69
+    assert result["dispatch_temperature_limit_c"] == 74
 
 
 @pytest.mark.parametrize(
     "changes",
     [
-        {"temperature_c": 70},
+        {"temperature_c": 75},
         {"sw_thermal_slowdown": True},
         {"process_state": {"unexpected_pids": [123], "owned_service_exited": False}},
         {"sampled_monotonic": 6.0},
@@ -108,7 +108,7 @@ def test_stable_dispatch_window_fails_closed(changes):
 
 def test_dispatch_wait_uses_driver_headroom_and_records_wait(tmp_path, monkeypatch):
     client = higher_client(tmp_path, monkeypatch)
-    temperatures = iter((80, 74, 69, 68))
+    temperatures = iter((80, 75, 74, 73))
     monkeypatch.setattr(
         client, "_gpu_snapshot", lambda: health_sample(temperature_c=next(temperatures))
     )
@@ -123,8 +123,8 @@ def test_dispatch_wait_uses_driver_headroom_and_records_wait(tmp_path, monkeypat
     with client:
         assert client.wait_for_gpu_headroom() == 3
         record = client.diagnostics()["last_dispatch_wait"]
-        assert record["dispatch_temperature_limit_c"] == 69
-        assert record["observed_temperature_c"] == 68
+        assert record["dispatch_temperature_limit_c"] == 74
+        assert record["observed_temperature_c"] == 73
 
 
 def test_dispatch_wait_does_not_wait_through_thermal_slowdown(tmp_path, monkeypatch):

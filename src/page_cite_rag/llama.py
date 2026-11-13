@@ -1473,9 +1473,10 @@ class LlamaModelClient:
     def wait_for_gpu_headroom(self, *, timeout_seconds: float = 120.0) -> float:
         """Bound dispatch pacing, without weakening the continuously active hard guards.
 
-        Start with 15 C of headroom below the driver's target where available.
-        The previous 10 C margin still saw a software thermal slowdown at 87 C in a
-        sustained local run; this scheduling margin is empirical, not a vendor limit.
+        Keep GPU_DISPATCH_HEADROOM_C (10 C, approved 2026-11-13) below the driver's target.
+        A 10 C margin once reached SW slowdown at 87 C in a sustained run; since 2026-11-12
+        SW-only regulation between target and the limit is normal, so the wider 15 C margin
+        is no longer needed. This scheduling margin is empirical, not a vendor limit.
         Waiting is separate from
         inference time; an active thermal flag is a failure, never a retry signal.
         Also used before Agent requests that bypass ``generate``.
