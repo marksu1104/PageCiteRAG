@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import re
 import sqlite3
@@ -113,7 +114,9 @@ class FakeClient:
             raise self.failure
         if schema_class is None:
             value = "document, evidence"
-            if messages[1].content.startswith("Passages:"):
+            if len(messages) == 1:
+                value = "significant standalone"
+            elif messages[1].content.startswith("Passages:"):
                 passage = re.search(r"\[(S\d+(?:_\d+)?)\] (.+)", messages[1].content)
                 source_id, quote = passage.groups()
                 quote = re.sub(r"^\(Section: .*?\) ", "", quote)
@@ -1363,3 +1366,173 @@ def test_explanation_source_list_survives_claim_cap(document, capsys):
     assert "[1] lines 1-1;" in text
     assert "[2] lines 3-3;" in text
     assert json.dumps(blocks[1].text, ensure_ascii=False) in text
+
+
+def chat_arguments(document, *options):
+    args = ask_arguments(document, *options)
+    return ["chat", args[1], *args[3:]]
+
+
+@pytest.mark.parametrize("ending", ["/exit\nnot answered\n", ""])
+def test_chat_follow_up_reuses_client_and_retriever(document, clients, monkeypatch, capsys, ending):
+    store, document_id, _ = document
+    build_bm25_index(store, document_id)
+    original = cli._answer_retrievers
+    loaded = []
+
+    def load(*args):
+        loaded.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(cli, "_answer_retrievers", load)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\nsignificant\nWhat about that?\n" + ending))
+    assert cli.main(chat_arguments(document)) == 0
+    output = capsys.readouterr()
+    assert output.out.count("Status: answered") == 2
+    assert "(Standalone question: significant standalone)" in output.out
+    assert not any(line.startswith("> ") for line in output.out.splitlines())
+    assert output.err == "> " * 4
+    assert len(clients) == 1
+    assert len(loaded) == 1
+    client = clients[0][2]
+    assert client.close_count == 1
+    assert len(client.calls) == 3
+    assert len(client.calls[0][0]) == 2
+    assert len(client.calls[1][0]) == 1
+    assert "Human: significant" in client.calls[1][0][0].content
+    assert "significant standalone" in client.calls[2][0][1].content
+
+
+@pytest.mark.parametrize("route", ["fixed", "auto"])
+def test_chat_json_is_one_record_per_question(document, clients, monkeypatch, capsys, route):
+    store, document_id, _ = document
+    build_bm25_index(store, document_id)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("significant\nWhy?\n"))
+    assert cli.main(chat_arguments(document, "--format", "json", "--route", route)) == 0
+    output = capsys.readouterr()
+    records = [json.loads(line) for line in output.out.splitlines()]
+    assert len(records) == 2
+    assert records[0]["question"] == records[0]["standalone_question"] == "significant"
+    assert records[0]["condense"] == {
+        "rewritten": False,
+        "standalone": "significant",
+        "error": None,
+        "stats": None,
+    }
+    assert records[1]["question"] == "Why?"
+    assert records[1]["standalone_question"] == "significant standalone"
+    assert records[1]["condense"]["rewritten"] is True
+    assert records[1]["condense"]["stats"]["eval_count"] == 10
+    assert all(record["result"]["status"] == "answered" for record in records)
+    assert clients[0][2].close_count == 1
+
+
+def test_chat_question_failure_does_not_enter_history(document, clients, monkeypatch, capsys):
+    from page_cite_rag import application
+
+    store, document_id, _ = document
+    build_bm25_index(store, document_id)
+    original = application.ask_document
+    questions = []
+
+    def ask(workflow, question, **kwargs):
+        questions.append(question)
+        if question == "bad":
+            raise ValueError("private failure detail")
+        return original(workflow, question, **kwargs)
+
+    monkeypatch.setattr(application, "ask_document", ask)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("bad\nsignificant\nWhy?\n/exit\n"))
+    assert cli.main(chat_arguments(document)) == 0
+    output = capsys.readouterr()
+    assert questions == ["bad", "significant", "significant standalone"]
+    assert output.out.count("Status: answered") == 2
+    assert "chat failed:" in output.err
+    assert "private failure detail" not in output.err
+    assert len(clients[0][2].calls) == 3
+    assert "Human: bad" not in clients[0][2].calls[1][0][0].content
+    assert clients[0][2].close_count == 1
+
+
+def test_chat_fatal_model_failure_ends_session(document, monkeypatch, capsys):
+    store, document_id, _ = document
+    build_bm25_index(store, document_id)
+    opened = []
+
+    def open_client(args, config):
+        client = FakeClient(config)
+        client.failure = ModelError("GPU thermal slowdown observed; own server stopped")
+        opened.append(client)
+        return client
+
+    monkeypatch.setattr(cli, "_open_generation_client", open_client)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("significant\nnot answered\n"))
+    assert cli.main(chat_arguments(document)) == 1
+    output = capsys.readouterr()
+    assert "GPU thermal slowdown" in output.err
+    assert len(opened[0].calls) == 1
+    assert opened[0].close_count == 1
+
+
+def test_chat_model_startup_failure_ends_session(document, monkeypatch, capsys):
+    store, document_id, _ = document
+    build_bm25_index(store, document_id)
+
+    def open_client(*args):
+        raise ModelError("pinned Ollama runtime could not be started")
+
+    monkeypatch.setattr(cli, "_open_generation_client", open_client)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("significant\n"))
+    assert cli.main(chat_arguments(document)) == 1
+    assert "could not be started" in capsys.readouterr().err
+
+
+def test_chat_and_ask_share_options():
+    parser = cli.build_parser()
+    ask = vars(parser.parse_args(["ask", "doc", "question"]))
+    chat = vars(parser.parse_args(["chat", "doc"]))
+    del ask["question"]
+    del ask["command"]
+    del chat["command"]
+    assert ask == chat
+
+
+@pytest.mark.parametrize(
+    "language,label", [("zh-Hant", "（改寫後的問題："), ("auto", "(Standalone question:")]
+)
+def test_chat_rewrite_label_uses_answer_language(
+    document, clients, monkeypatch, capsys, language, label
+):
+    store, document_id, _ = document
+    build_bm25_index(store, document_id)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("significant\nWhy?\n"))
+    assert cli.main(chat_arguments(document, "--language", language)) == 0
+    assert label in capsys.readouterr().out
+
+
+def test_chat_idle_time_is_outside_question_deadline(document, clients, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    store, document_id, _ = document
+    build_bm25_index(store, document_id)
+    now = [100.0]
+    deadlines = []
+    original = cli._open_generation_client
+
+    def open_client(*args):
+        client = original(*args)
+        client.set_request_deadline = deadlines.append
+        return client
+
+    class SlowInput(io.StringIO):
+        def readline(self):
+            now[0] += 1000
+            return super().readline()
+
+    monkeypatch.setattr(cli, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(cli, "_open_generation_client", open_client)
+    monkeypatch.setattr(sys, "stdin", SlowInput("significant\nWhy?\n"))
+    assert cli.main(chat_arguments(document)) == 0
+    assert deadlines == [700.0, 1700.0, 2700.0]
+    assert capsys.readouterr().out.count("Status: answered") == 2
+    assert clients[0][2].close_count == 1

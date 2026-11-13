@@ -840,9 +840,11 @@ def _run_answer(args: argparse.Namespace) -> int:
     from page_cite_rag.retrieval import RetrievalError
     from page_cite_rag.workflows import WorkflowConfig
 
+    chat = args.command == "chat"
+    is_question = args.command in ("ask", "chat")
     client = None
     retrieval_owner = [None]
-    route = getattr(args, "route", "fixed") if args.command == "ask" else "fixed"
+    route = getattr(args, "route", "fixed") if is_question else "fixed"
     native_gpu = getattr(args, "native_gpu", False)
     request_timeout = args.request_timeout_seconds
     if (
@@ -885,11 +887,12 @@ def _run_answer(args: argparse.Namespace) -> int:
 
     try:
         config = _generation_config(args)
-        if not args.question.strip() or len(args.question) > 4000:
-            raise ValueError("question must be nonblank and at most 4000 characters")
-        args.question.encode("utf-8")
+        if not chat:
+            if not args.question.strip() or len(args.question) > 4000:
+                raise ValueError("question must be nonblank and at most 4000 characters")
+            args.question.encode("utf-8")
         workflow_config = WorkflowConfig(
-            top_k=args.top_k if args.command == "ask" else 6,
+            top_k=args.top_k if is_question else 6,
             neighbor_blocks=args.neighbors if args.command == "explain" else 0,
         )
         if not args.db.expanduser().is_file():
@@ -901,9 +904,9 @@ def _run_answer(args: argparse.Namespace) -> int:
         docling_source = document.parser_name == "docling" and _has_native_docling_source(
             store, args.document_id
         )
-        if args.command == "ask" and args.method is None:
+        if is_question and args.method is None:
             args.method = "hybrid" if docling_source or native_gpu else "bm25"
-        if args.command == "ask":
+        if is_question:
             # RetrievalError messages are shown to the user; they carry no input or paths.
             if route != "fixed" and (args.rewrite_query or args.rerank):
                 raise _RouteConfigurationError(
@@ -991,7 +994,7 @@ def _run_answer(args: argparse.Namespace) -> int:
         precomputed_search = None
         precomputed_blocks = ()
         initial_gpu_search_trace = None
-        if native_gpu and route == "fixed":
+        if not chat and native_gpu and route == "fixed":
             search_workflow = document_workflow(
                 store,
                 args.document_id,
@@ -1014,7 +1017,7 @@ def _run_answer(args: argparse.Namespace) -> int:
         if callable(set_deadline):
             set_deadline(request_deadline)
         ensure_request_time()
-        if args.command != "ask":
+        if not is_question:
             retriever = None
         elif native_gpu:
             pass
@@ -1063,23 +1066,131 @@ def _run_answer(args: argparse.Namespace) -> int:
             writer="quote_first",
             answer_format="general",
         )
-        if route != "fixed":
-            from page_cite_rag.application import answer_question
 
-            routed = answer_question(
-                workflow,
-                args.question,
-                language=args.language,
-                source_language=document.language,
-                route=route,
-            )
+        def answer_once(question):
+            nonlocal precomputed_search, precomputed_blocks, initial_gpu_search_trace
+            if not question.strip() or len(question) > 4000:
+                raise ValueError("question must be nonblank and at most 4000 characters")
+            question.encode("utf-8")
+            if chat and native_gpu and route == "fixed":
+                precomputed_search, precomputed_blocks = workflow.search_sources(question)
+                precomputed_blocks = workflow._context_blocks(
+                    precomputed_search, precomputed_blocks
+                )
+                gpu_backend = getattr(retriever, "_search_backend", retriever)
+                initial_gpu_search_trace = getattr(gpu_backend, "last_trace", None)
+            trace = None
+            if route != "fixed":
+                from page_cite_rag.application import answer_question
+
+                routed = answer_question(
+                    workflow,
+                    question,
+                    language=args.language,
+                    source_language=document.language,
+                    route=route,
+                )
+                result, trace = routed.result, routed.trace
+            elif is_question and precomputed_search is not None:
+                result = workflow.answer_from_context(
+                    question,
+                    precomputed_blocks,
+                    language=args.language,
+                    context_groups=precomputed_search.context_groups,
+                )
+            elif is_question:
+                result = ask_document(workflow, question, language=args.language)
+            else:
+                result = explain_source(workflow, args.block_id, question, language=args.language)
             ensure_request_time()
-            result = routed.result
+            return result, trace
+
+        if chat:
+            from page_cite_rag.conversation import Turn, condense_question
+            from page_cite_rag.generation import ContextBudgetError, StructuredOutputError
+
+            turns = []
+            ensure_request_time()
+            deadline_timer.cancel()
+            deadline_timer.join(timeout=5)
+            while True:
+                print("> ", end="", file=sys.stderr, flush=True)
+                line = sys.stdin.readline()
+                if not line or line.strip() == "/exit":
+                    break
+                question = line.strip()
+                if not question:
+                    continue
+                request_deadline = time.monotonic() + request_timeout
+                deadline_expired.clear()
+                deadline_timer = threading.Timer(request_timeout, stop_request)
+                deadline_timer.daemon = True
+                deadline_timer.start()
+                try:
+                    if not question.strip() or len(question) > 4000:
+                        raise ValueError("question must be nonblank and at most 4000 characters")
+                    question.encode("utf-8")
+                    if callable(set_deadline):
+                        set_deadline(request_deadline)
+                    standalone, condense = condense_question(client, turns, question)
+                    ensure_request_time()
+                    result, trace = answer_once(standalone)
+                    if args.format == "json":
+                        print(
+                            _terminal_safe(
+                                json.dumps(
+                                    {
+                                        "question": question,
+                                        "standalone_question": standalone,
+                                        "condense": condense,
+                                        "result": result.model_dump(mode="json"),
+                                    },
+                                    ensure_ascii=False,
+                                    allow_nan=False,
+                                )
+                            )
+                        )
+                    else:
+                        if condense["rewritten"]:
+                            label = (
+                                f"(Standalone question: {standalone})"
+                                if args.language == "en" or result.language == "en"
+                                else f"（改寫後的問題：{standalone}）"
+                            )
+                            print(_terminal_safe(label))
+                        whole = trace is not None and trace.get("route") == "whole_document_context"
+                        _print_answer(result, args.format, None if whole else store)
+                    turns.append(Turn(question, result.explanation or result.answer))
+                    turns = turns[-6:]
+                except Exception as exc:
+                    # Runtime/guard failures must terminate; only local question failures continue.
+                    if (
+                        deadline_expired.is_set()
+                        or (
+                            isinstance(exc, ModelError)
+                            and not isinstance(exc, (ContextBudgetError, StructuredOutputError))
+                        )
+                        or isinstance(exc, RetrievalError)
+                    ):
+                        raise
+                    detail = (
+                        str(exc)
+                        if isinstance(exc, ModelError)
+                        else "invalid configuration or local resource"
+                    )
+                    print(f"page-cite-rag: chat failed: {detail}", file=sys.stderr)
+                finally:
+                    deadline_timer.cancel()
+                    deadline_timer.join(timeout=5)
+            return 0
+
+        result, trace = answer_once(args.question)
+        if route != "fixed":
             if args.format == "json":
-                report = {"answer": result.model_dump(mode="json"), "routing": routed.trace}
+                report = {"answer": result.model_dump(mode="json"), "routing": trace}
                 if (
                     result.status == "insufficient_evidence"
-                    and routed.trace.get("route") != "whole_document_context"
+                    and trace.get("route") != "whole_document_context"
                 ):
                     report["closest_passages"] = _closest_passages(result, store)
                 if initial_gpu_search_trace is not None:
@@ -1097,24 +1208,10 @@ def _run_answer(args: argparse.Namespace) -> int:
                 )
             else:
                 # Passages of a whole-document read are in document order, not by relevance.
-                whole = routed.trace.get("route") == "whole_document_context"
+                whole = trace.get("route") == "whole_document_context"
                 _print_answer(result, args.format, None if whole else store)
-                _print_route(routed.trace)
+                _print_route(trace)
         else:
-            if args.command == "ask" and precomputed_search is not None:
-                result = workflow.answer_from_context(
-                    args.question,
-                    precomputed_blocks,
-                    language=args.language,
-                    context_groups=precomputed_search.context_groups,
-                )
-            elif args.command == "ask":
-                result = ask_document(workflow, args.question, language=args.language)
-            else:
-                result = explain_source(
-                    workflow, args.block_id, args.question, language=args.language
-                )
-            ensure_request_time()
             if args.format == "json" and (initial_gpu_search_trace or args.device == "cuda"):
                 report = result.model_dump(mode="json")
                 if result.status == "insufficient_evidence":
@@ -1510,34 +1607,42 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser = subparsers.add_parser(
         "ask", help="Answer from one document's existing index with source-verified quotations."
     )
-    ask_parser.add_argument("document_id", help="Document ID returned by ingest.")
-    ask_parser.add_argument("question", help="Question; quote text containing spaces.")
-    ask_parser.add_argument("--method", choices=("bm25", "dense", "hybrid"), default=None)
-    ask_parser.add_argument("--rerank", action="store_true", help="Rerank native GPU candidates.")
-    ask_parser.add_argument("--top-k", type=_positive_integer, default=FORMAL_RETRIEVAL.final_k)
-    ask_parser.add_argument(
-        "--rewrite-query",
-        action="store_true",
-        help="Opt in to lexical keyword expansion; dense keeps the original question.",
+    chat_parser = subparsers.add_parser(
+        "chat", help="Ask follow-up questions about one document in a conversation."
     )
-    ask_parser.add_argument(
-        "--route",
-        choices=("auto", "fixed", "agent"),
-        default="auto",
-        help=_ROUTE_HELP,
-    )
-    _embedding_options(ask_parser)
-    ask_parser.add_argument(
-        "--native-gpu",
-        action="store_true",
-        help=(
-            "Use the pinned native GPU embedding model for one dense/hybrid retrieval, "
-            "then close it before generation; bounded Agent follow-up searches may co-reside "
-            "with generation under the combined 24,000 MiB limit."
-        ),
-    )
-    ask_parser.add_argument("--embedding-gguf", type=Path)
-
+    for question_parser in (ask_parser, chat_parser):
+        question_parser.add_argument("document_id", help="Document ID returned by ingest.")
+        if question_parser is ask_parser:
+            question_parser.add_argument("question", help="Question; quote text containing spaces.")
+        question_parser.add_argument("--method", choices=("bm25", "dense", "hybrid"), default=None)
+        question_parser.add_argument(
+            "--rerank", action="store_true", help="Rerank native GPU candidates."
+        )
+        question_parser.add_argument(
+            "--top-k", type=_positive_integer, default=FORMAL_RETRIEVAL.final_k
+        )
+        question_parser.add_argument(
+            "--rewrite-query",
+            action="store_true",
+            help="Opt in to lexical keyword expansion; dense keeps the original question.",
+        )
+        question_parser.add_argument(
+            "--route",
+            choices=("auto", "fixed", "agent"),
+            default="auto",
+            help=_ROUTE_HELP,
+        )
+        _embedding_options(question_parser)
+        question_parser.add_argument(
+            "--native-gpu",
+            action="store_true",
+            help=(
+                "Use the pinned native GPU embedding model for one dense/hybrid retrieval, "
+                "then close it before generation; bounded Agent follow-up searches may co-reside "
+                "with generation under the combined 24,000 MiB limit."
+            ),
+        )
+        question_parser.add_argument("--embedding-gguf", type=Path)
     explain_parser = subparsers.add_parser(
         "explain", help="Explain a stored block and bounded neighbors without retrieval."
     )
@@ -1548,10 +1653,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="Explain this passage precisely, preserving its qualifications.",
     )
     explain_parser.add_argument("--neighbors", type=int, choices=(0, 1, 2), default=1)
-    for answer_parser in (ask_parser, explain_parser):
+    for answer_parser in (ask_parser, chat_parser, explain_parser):
         answer_parser.add_argument("--db", type=Path, default=_DEFAULT_DATABASE)
         _generation_options(answer_parser)
     ask_parser.set_defaults(output_tokens=3072)
+    chat_parser.set_defaults(output_tokens=3072)
     explain_parser.set_defaults(output_tokens=2048)
 
     serve_parser = subparsers.add_parser(
@@ -1583,7 +1689,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_eval(args)
     if args.command == "model":
         return _run_model(args)
-    if args.command in ("ask", "explain"):
+    if args.command in ("ask", "chat", "explain"):
         return _run_answer(args)
     if args.command == "mcp":
         return _run_mcp(args)
