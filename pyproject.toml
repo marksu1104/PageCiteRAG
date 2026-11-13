@@ -7,7 +7,7 @@ name = "page-cite-rag"
 version = "0.1.0"
 description = "Local-first bilingual document reading with source-grounded answers."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11.5"
 dependencies = [
     "opencc>=1.4.2,<2",
     "bm25s>=0.2,<0.3",

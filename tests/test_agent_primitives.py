@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import pytest
-from tests.reading_fixtures import _setup
 
 from page_cite_rag.agent import _search_preview
 from page_cite_rag.application import ask_with_agent
 from page_cite_rag.tokenize import LexicalTokenizer
+from tests.reading_fixtures import _setup
 
 
 def test_shared_agent_entry_rejects_mismatched_search_before_model_use(tmp_path):

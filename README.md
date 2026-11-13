@@ -21,7 +21,7 @@ answer preserves every important detail. Inspect citations before relying on an 
 
 ## Quick start
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.11.5+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 git clone https://github.com/marksu1104/PageCiteRAG.git
