@@ -66,11 +66,13 @@ class ApiChatClient:
 
     PROVIDERS = {
         "custom": (None, "PAGECITE_API_KEY", "provider_default", None),
+        # Gemini 3 rejects reasoning_effort "none"; "minimal" is its lowest level. Any call
+        # that still thinks shows up as hidden tokens and is rejected below.
         "gemini": (
             "https://generativelanguage.googleapis.com/v1beta/openai",
             "GEMINI_API_KEY",
-            "reasoning_effort_none",
-            ("reasoning_effort", "none"),
+            "reasoning_effort_minimal_verified",
+            ("reasoning_effort", "minimal"),
         ),
         "groq": (
             "https://api.groq.com/openai/v1",
@@ -210,6 +212,18 @@ class ApiChatClient:
         tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
         if type(tokens) is int and tokens > 0:
             raise ModelError("API completion used reasoning tokens")
+        if isinstance(usage, dict):
+            # Gemini's OpenAI endpoint omits reasoning_tokens but counts hidden thinking in
+            # total_tokens, so a total above prompt + completion means the model thought.
+            total, prompt, completion = (
+                usage.get("total_tokens"),
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+            )
+            if all(type(v) is int for v in (total, prompt, completion)) and total > (
+                prompt + completion
+            ):
+                raise ModelError("API completion used hidden reasoning tokens")
 
     def before_agent_dispatch(self) -> None:
         """Check the process-wide ceiling; no GPU checks or consumed call yet."""

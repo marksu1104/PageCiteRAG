@@ -345,7 +345,7 @@ def test_closed_client_does_not_consume_call():
             "https://generativelanguage.googleapis.com/v1beta/openai",
             "GEMINI_API_KEY",
             "reasoning_effort",
-            "none",
+            "minimal",
         ),
         ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", "reasoning_effort", "none"),
         (
@@ -378,7 +378,11 @@ def test_provider_defaults_and_nonthinking(provider, base, key_env, field, value
         client.generate(MESSAGES, None)
         assert client.identity["provider"] == provider
         assert client.thinking_control == (
-            "reasoning_disabled" if provider == "openrouter" else "reasoning_effort_none"
+            "reasoning_disabled"
+            if provider == "openrouter"
+            else "reasoning_effort_minimal_verified"
+            if provider == "gemini"
+            else "reasoning_effort_none"
         )
     assert seen[0][0] == f"{base}/chat/completions"
     assert seen[0][1] == f"Bearer {KEY}"
@@ -475,3 +479,18 @@ def test_429_retry_respects_max_calls():
         with pytest.raises(ModelError, match="call limit"):
             client.generate(MESSAGES, None)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("total,fails", [(14, False), (64, True), (None, False)])
+def test_hidden_reasoning_in_total_tokens_is_rejected(monkeypatch, total, fails):
+    """Gemini omits reasoning_tokens but counts hidden thinking in total_tokens."""
+    usage = {"prompt_tokens": 13, "completion_tokens": 1}
+    if total is not None:
+        usage["total_tokens"] = total
+    payload = {"usage": usage}
+    client = ApiChatClient.__new__(ApiChatClient)
+    if fails:
+        with pytest.raises(ModelError, match="hidden reasoning tokens"):
+            client._check_reasoning_usage(payload)
+    else:
+        client._check_reasoning_usage(payload)
