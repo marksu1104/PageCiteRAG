@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from copy import copy
 from dataclasses import dataclass
 from typing import Literal
@@ -257,6 +258,49 @@ class AgentAnswer:
     trace: dict
 
 
+Mode = Literal["auto", "detail", "global", "deep"]
+MODES: tuple[str, ...] = ("auto", "detail", "global", "deep")
+
+# LlamaIndex 0.14.25, llama_index/core/selectors/prompts.py:
+# DEFAULT_SINGLE_SELECT_PROMPT_TMPL, copied verbatim.
+ROUTER_PROMPT = (
+    "Some choices are given below. It is provided in a numbered list "
+    "(1 to {num_choices}), where each item in the list corresponds to a summary.\n"
+    "---------------------\n{context_list}\n---------------------\n"
+    "Using only the choices above and not prior knowledge, return the choice that "
+    "is most relevant to the question: '{query_str}'\n"
+    # Project addition: require a number-only output.
+    "Return only the number of the choice."
+)
+ROUTER_CHOICES = (
+    "(1) Useful for questions about specific details in the document: facts, numbers, "
+    "definitions, methods, or explaining a particular concept or passage.\n\n"
+    "(2) Useful for questions about the document as a whole: its main idea or summary, "
+    "its contributions, strengths and limitations, or comparisons and lists that span "
+    "many sections."
+)
+
+
+def choose_mode(client, question: str) -> tuple[str, dict]:
+    from page_cite_rag.generation import ChatMessage, ModelError
+
+    record = {"mode": "detail", "reply": "", "error": None, "stats": None}
+    prompt = ROUTER_PROMPT.format(num_choices=2, context_list=ROUTER_CHOICES, query_str=question)
+    try:
+        response = client.generate([ChatMessage(role="user", content=prompt)], None)
+        reply = response.value
+        record["reply"] = reply[:40]
+        record["stats"] = response.stats.model_dump(mode="json")
+        choice = re.search(r"[12]", reply)
+        if choice:
+            record["mode"] = "global" if choice.group() == "2" else "detail"
+        else:
+            record["error"] = "no_valid_choice"
+    except ModelError as error:
+        record["error"] = str(error)
+    return record["mode"], record
+
+
 Route = Literal["auto", "fixed", "agent"]
 ROUTES: tuple[str, ...] = ("auto", "fixed", "agent")
 
@@ -267,21 +311,43 @@ def answer_question(
     *,
     language: Language = "zh-Hant",
     source_language: str = "unknown",
-    route: Route = "auto",
+    mode: Mode = "detail",
+    route: Route | None = None,
 ) -> AgentAnswer:
     """Select evidence using the shared writer admission and retrieval contracts."""
     from page_cite_rag.gpu_retrieval import StagedGpuSearch
     from page_cite_rag.retrieval_profile import RERANK_KEEP
 
-    if route not in ROUTES:
+    if mode not in MODES:
+        raise ValueError("mode must be auto, detail, global or deep")
+    if route is not None and route not in ROUTES:
         raise ValueError("route must be auto, fixed or agent")
     language = resolve_answer_language(question, language)
+    requested_mode = mode
+    router = None
+    if route is None:
+        if mode == "auto":
+            mode, router = choose_mode(workflow._model, question)
+        route = "agent" if mode == "deep" else "auto"
+    else:
+        mode = "deep" if route == "agent" else "detail"
+        requested_mode = mode
     trace = {
-        "version": "routed-answer/v4",
+        "version": "routed-answer/v5",
+        "requested_mode": requested_mode,
+        "mode": mode,
         "requested_route": route,
         "route": "fixed",
         "reason": "requested" if route == "fixed" else "rerank_unavailable",
     }
+    if router is not None:
+        trace["router"] = router
+    if mode == "global":
+        from page_cite_rag.global_answer import answer_global
+
+        run = answer_global(workflow, question, language=language)
+        trace.update(route="global", reason="requested", global_trace=run.trace)
+        return AgentAnswer(run.result, trace)
     if route == "agent":
         from page_cite_rag.evidence_agent import run_evidence_agent
         from page_cite_rag.ollama_backend import OllamaGgufClient

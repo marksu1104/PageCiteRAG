@@ -800,14 +800,16 @@ def _print_answer(result, output_format: str, store=None) -> None:
 
 
 _ROUTE_REASONS = {
-    "requested": "requested with --route",
+    "requested": "requested with --mode",
     "auto": "auto",
 }
 
 
 def _print_route(trace: dict) -> None:
     route = trace.get("route")
-    if route == "whole_document_context":
+    if trace.get("mode") == "global":
+        print("Mode: global document answer.")
+    elif route == "whole_document_context":
         print("Route: whole document (fits the context).")
     elif route == "reranked":
         print("Route: reranked top 20 of 200.")
@@ -831,7 +833,6 @@ class _RouteConfigurationError(ValueError):
 
 def _run_answer(args: argparse.Namespace) -> int:
     from page_cite_rag.application import (
-        ask_document,
         document_retriever,
         document_workflow,
         explain_source,
@@ -844,7 +845,7 @@ def _run_answer(args: argparse.Namespace) -> int:
     is_question = args.command in ("ask", "chat")
     client = None
     retrieval_owner = [None]
-    route = getattr(args, "route", "fixed") if is_question else "fixed"
+    mode = getattr(args, "mode", "auto") if is_question else "detail"
     native_gpu = getattr(args, "native_gpu", False)
     request_timeout = args.request_timeout_seconds
     if (
@@ -908,11 +909,11 @@ def _run_answer(args: argparse.Namespace) -> int:
             args.method = "hybrid" if docling_source or native_gpu else "bm25"
         if is_question:
             # RetrievalError messages are shown to the user; they carry no input or paths.
-            if route != "fixed" and (args.rewrite_query or args.rerank):
+            if mode != "detail" and (args.rewrite_query or args.rerank):
                 raise _RouteConfigurationError(
-                    "--rewrite-query and --rerank apply to --route fixed"
+                    "--rewrite-query and --rerank apply to --mode detail"
                 )
-            if route == "agent" and (
+            if mode == "deep" and (
                 not native_gpu
                 or args.method != "hybrid"
                 or args.backend not in ("pinned-ollama", "api")
@@ -920,7 +921,7 @@ def _run_answer(args: argparse.Namespace) -> int:
                 raise _RouteConfigurationError(
                     "agent requires --native-gpu, --method hybrid and --backend pinned-ollama"
                 )
-            if route == "auto" and native_gpu:
+            if mode in ("auto", "detail") and native_gpu:
                 args.method = "hybrid"
             if args.rerank and not native_gpu:
                 raise ValueError("--rerank requires --native-gpu")
@@ -949,12 +950,14 @@ def _run_answer(args: argparse.Namespace) -> int:
                     gpu_temperature_limit_c=_gpu_temperature_limit(args),
                     reranker_model_path=(
                         DEFAULT_MODEL_PATH
-                        if args.rerank or (route == "auto" and DEFAULT_MODEL_PATH.is_file())
+                        if args.rerank
+                        or (mode in ("auto", "detail") and DEFAULT_MODEL_PATH.is_file())
                         else None
                     ),
                     candidates=(
                         RERANK_CANDIDATES_PER_BRANCH
-                        if args.rerank or (route == "auto" and DEFAULT_MODEL_PATH.is_file())
+                        if args.rerank
+                        or (mode in ("auto", "detail") and DEFAULT_MODEL_PATH.is_file())
                         else FORMAL_RETRIEVAL.candidates_per_branch
                     ),
                 )
@@ -991,25 +994,7 @@ def _run_answer(args: argparse.Namespace) -> int:
                 raise ValueError("explanation block was not found within this document")
             lexical, dense = None, None
 
-        precomputed_search = None
-        precomputed_blocks = ()
         initial_gpu_search_trace = None
-        if not chat and native_gpu and route == "fixed":
-            search_workflow = document_workflow(
-                store,
-                args.document_id,
-                retriever,
-                None,
-                config,
-                top_k=workflow_config.top_k,
-            )
-            precomputed_search, precomputed_blocks = search_workflow.search_sources(args.question)
-            precomputed_blocks = search_workflow._context_blocks(
-                precomputed_search, precomputed_blocks
-            )
-            gpu_backend = getattr(retriever, "_search_backend", retriever)
-            if isinstance(getattr(gpu_backend, "last_trace", None), dict):
-                initial_gpu_search_trace = dict(gpu_backend.last_trace)
 
         if client is None:
             client = _open_generation_client(args, config)
@@ -1068,19 +1053,12 @@ def _run_answer(args: argparse.Namespace) -> int:
         )
 
         def answer_once(question):
-            nonlocal precomputed_search, precomputed_blocks, initial_gpu_search_trace
+            nonlocal initial_gpu_search_trace
             if not question.strip() or len(question) > 4000:
                 raise ValueError("question must be nonblank and at most 4000 characters")
             question.encode("utf-8")
-            if chat and native_gpu and route == "fixed":
-                precomputed_search, precomputed_blocks = workflow.search_sources(question)
-                precomputed_blocks = workflow._context_blocks(
-                    precomputed_search, precomputed_blocks
-                )
-                gpu_backend = getattr(retriever, "_search_backend", retriever)
-                initial_gpu_search_trace = getattr(gpu_backend, "last_trace", None)
             trace = None
-            if route != "fixed":
+            if is_question:
                 from page_cite_rag.application import answer_question
 
                 routed = answer_question(
@@ -1088,18 +1066,12 @@ def _run_answer(args: argparse.Namespace) -> int:
                     question,
                     language=args.language,
                     source_language=document.language,
-                    route=route,
+                    mode=mode,
                 )
                 result, trace = routed.result, routed.trace
-            elif is_question and precomputed_search is not None:
-                result = workflow.answer_from_context(
-                    question,
-                    precomputed_blocks,
-                    language=args.language,
-                    context_groups=precomputed_search.context_groups,
-                )
-            elif is_question:
-                result = ask_document(workflow, question, language=args.language)
+                if native_gpu:
+                    gpu_backend = getattr(retriever, "_search_backend", retriever)
+                    initial_gpu_search_trace = getattr(gpu_backend, "last_trace", None)
             else:
                 result = explain_source(workflow, args.block_id, question, language=args.language)
             ensure_request_time()
@@ -1185,7 +1157,7 @@ def _run_answer(args: argparse.Namespace) -> int:
             return 0
 
         result, trace = answer_once(args.question)
-        if route != "fixed":
+        if mode != "detail":
             if args.format == "json":
                 report = {"answer": result.model_dump(mode="json"), "routing": trace}
                 if (
@@ -1272,11 +1244,11 @@ def _create_document_service(args: argparse.Namespace):
         raise ValueError("local API requires an owned backend with exact token budgeting")
     from page_cite_rag.service import DocumentService, ServiceConfig
 
-    if args.rerank and args.route != "fixed":
-        raise _RouteConfigurationError("--rewrite-query and --rerank apply to --route fixed")
+    if args.rerank and args.mode != "detail":
+        raise _RouteConfigurationError("--rewrite-query and --rerank apply to --mode detail")
     if args.rerank and args.embedding_backend != "native-gpu":
         raise ValueError("--rerank requires --embedding-backend native-gpu")
-    if args.route == "agent" and (
+    if args.mode == "deep" and (
         args.embedding_backend != "native-gpu"
         or args.method != "hybrid"
         or args.backend not in ("pinned-ollama", "api")
@@ -1284,7 +1256,7 @@ def _create_document_service(args: argparse.Namespace):
         raise _RouteConfigurationError(
             "agent requires --native-gpu, --method hybrid and --backend pinned-ollama"
         )
-    if args.route == "auto" and args.embedding_backend == "native-gpu":
+    if args.mode in ("auto", "detail") and args.embedding_backend == "native-gpu":
         args.method = "hybrid"
     if args.embedding_backend == "native-gpu" and (
         args.method == "bm25"
@@ -1312,12 +1284,12 @@ def _create_document_service(args: argparse.Namespace):
             gpu_temperature_limit_c=_gpu_temperature_limit(args),
             reranker_model_path=(
                 DEFAULT_MODEL_PATH
-                if args.rerank or (args.route == "auto" and DEFAULT_MODEL_PATH.is_file())
+                if args.rerank or (args.mode in ("auto", "detail") and DEFAULT_MODEL_PATH.is_file())
                 else None
             ),
             candidates=(
                 RERANK_CANDIDATES_PER_BRANCH
-                if args.rerank or (args.route == "auto" and DEFAULT_MODEL_PATH.is_file())
+                if args.rerank or (args.mode in ("auto", "detail") and DEFAULT_MODEL_PATH.is_file())
                 else FORMAL_RETRIEVAL.candidates_per_branch
             ),
         )
@@ -1330,7 +1302,7 @@ def _create_document_service(args: argparse.Namespace):
             queue_capacity=args.queue_capacity,
             idle_seconds=args.idle_seconds,
             request_timeout_seconds=args.request_timeout_seconds,
-            route=args.route,
+            mode=args.mode,
         ),
         config,
         lambda: _open_generation_client(args, config),
@@ -1396,10 +1368,11 @@ def _run_mcp(args: argparse.Namespace) -> int:
         return 1
 
 
-_ROUTE_HELP = (
-    "Validated auto: use the whole document if it fits, otherwise with --native-gpu "
-    "rerank 200 candidates and keep 20, otherwise fixed retrieval. "
-    "agent: LangChain evidence Agent for multi-step questions; slower, requires --native-gpu."
+_MODE_HELP = (
+    "auto: select detail or global with a router. "
+    "detail: use the whole document if it fits, otherwise rerank when available, "
+    "otherwise fixed retrieval. global: answer across the whole document. "
+    "deep: evidence Agent for multi-step questions; slower, requires --native-gpu."
 )
 
 
@@ -1409,10 +1382,10 @@ def _document_service_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--method", choices=("bm25", "dense", "hybrid"), default=None)
     parser.add_argument("--rerank", action="store_true", help="Rerank native GPU candidates.")
     parser.add_argument(
-        "--route",
-        choices=("auto", "fixed", "agent"),
+        "--mode",
+        choices=("auto", "detail", "global", "deep"),
         default="auto",
-        help=_ROUTE_HELP,
+        help=_MODE_HELP,
     )
     parser.add_argument("--top-k", type=_positive_integer, default=FORMAL_RETRIEVAL.final_k)
     parser.add_argument("--queue-capacity", type=int, default=2)
@@ -1627,10 +1600,10 @@ def build_parser() -> argparse.ArgumentParser:
             help="Opt in to lexical keyword expansion; dense keeps the original question.",
         )
         question_parser.add_argument(
-            "--route",
-            choices=("auto", "fixed", "agent"),
+            "--mode",
+            choices=("auto", "detail", "global", "deep"),
             default="auto",
-            help=_ROUTE_HELP,
+            help=_MODE_HELP,
         )
         _embedding_options(question_parser)
         question_parser.add_argument(

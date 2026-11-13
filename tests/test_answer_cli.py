@@ -244,15 +244,17 @@ def ask_arguments(document, *options):
         "en",
         "--db",
         str(store.database_path),
-        "--route",
-        "fixed",
+        "--mode",
+        "detail",
         "--backend",
         "ollama",
         *options,
     ]
 
 
-def test_ask_json_end_to_end_has_program_derived_exact_citations(document, clients, capsys):
+def test_ask_json_end_to_end_has_program_derived_exact_citations(
+    document, clients, capsys, require_retrieval
+):
     store, document_id, blocks = document
     build_bm25_index(store, document_id)
     before = store.database_path.read_bytes()
@@ -389,7 +391,7 @@ def test_explain_no_index_required_and_neighbors_bounded(document, clients, caps
 
 
 def test_unknown_question_returns_zero_visible_insufficient_without_generation(
-    document, clients, capsys
+    document, clients, capsys, require_retrieval
 ):
     store, document_id, _ = document
     build_bm25_index(store, document_id)
@@ -605,7 +607,7 @@ main([sys.argv[2], '--help'])
     assert result.returncode == 0, result.stderr
     assert "--backend" in result.stdout and "--language" in result.stdout
     if command == "ask":
-        assert "--route" in result.stdout and "--agent" not in result.stdout
+        assert "--mode" in result.stdout and "--agent" not in result.stdout
         assert "--native-gpu" in result.stdout
 
 
@@ -620,15 +622,15 @@ def _fake_routed_answer(events=None):
     """Stand-in for application.answer_question: the fixed writer plus its route trace."""
     from page_cite_rag import application
 
-    def answer(workflow, question, *, language, source_language, route):
+    def answer(workflow, question, *, language, source_language, mode):
         if events is not None:
             events.append("fixed answer")
         result = application.ask_document(workflow, question, language=language)
         trace = {
             "version": "routed-answer/v3",
-            "requested_route": route,
+            "requested_mode": mode,
             "route": "fixed",
-            "reason": "auto" if route == "auto" else "requested",
+            "reason": "auto" if mode == "auto" else "requested",
         }
         return application.AgentAnswer(result, trace)
 
@@ -655,14 +657,14 @@ def test_auto_route_cli_answers_through_the_shared_entry_and_reports_it(
         return fake(workflow, question, **kwargs)
 
     monkeypatch.setattr(application, "answer_question", answer)
-    assert cli.main(ask_arguments(document, "--route", "auto", "--format", "json")) == 0
+    assert cli.main(ask_arguments(document, "--mode", "auto", "--format", "json")) == 0
     output = json.loads(capsys.readouterr().out)
-    assert seen["route"] == "auto" and seen["language"] == "en"
+    assert seen["mode"] == "auto" and seen["language"] == "en"
     assert output["answer"]["retrieval"]["method"] == "bm25"
     assert output["routing"]["route"] == "fixed"
     assert output["routing"]["reason"] == "auto"
 
-    assert cli.main(ask_arguments(document, "--route", "auto")) == 0
+    assert cli.main(ask_arguments(document, "--mode", "auto")) == 0
     text = capsys.readouterr().out
     assert "Route: fixed retrieval (auto)." in text
     assert all(client.close_count == 1 for _args, _config, client in clients)
@@ -671,14 +673,14 @@ def test_auto_route_cli_answers_through_the_shared_entry_and_reports_it(
 def test_auto_accepts_bm25_and_uses_whole_document(document, clients, capsys):
     store, document_id, _ = document
     build_bm25_index(store, document_id)
-    assert cli.main(ask_arguments(document, "--route", "auto", "--method", "bm25")) == 0
+    assert cli.main(ask_arguments(document, "--mode", "auto", "--method", "bm25")) == 0
     assert "Route: whole document (fits the context)." in capsys.readouterr().out
     assert len(clients) == 1
 
 
 def test_default_backend_is_the_validated_pinned_ollama_with_exact_budget():
     args = cli.build_parser().parse_args(["ask", "0" * 64, "question"])
-    assert args.backend == "pinned-ollama" and args.route == "auto"
+    assert args.backend == "pinned-ollama" and args.mode == "auto"
     assert args.output_tokens == 3072 and args.context_window == 16384
     config = cli._generation_config(args)
     assert args.token_budget == "exact"
@@ -689,8 +691,8 @@ def test_default_backend_is_the_validated_pinned_ollama_with_exact_budget():
     assert cli._generation_config(own).model == "mine:latest" and own.token_budget == "conservative"
 
 
-def test_native_gpu_ask_searches_before_opening_the_generation_model(
-    document, clients, tokenizer_directory, monkeypatch, capsys
+def test_native_gpu_detail_searches_after_whole_document_admission(
+    document, clients, tokenizer_directory, monkeypatch, capsys, require_retrieval
 ):
     from page_cite_rag.retrieval import BM25Retriever
 
@@ -724,6 +726,7 @@ def test_native_gpu_ask_searches_before_opening_the_generation_model(
             assert tokenizer_directory.is_dir()
             assert clients == []
             events.append("embedding setup")
+            self.reranker_model_path = reranker_model_path
             self.retriever = BM25Retriever(store, document_id)
 
         def search(self, query, *, top_k):
@@ -768,8 +771,8 @@ def test_native_gpu_ask_searches_before_opening_the_generation_model(
     assert answer["status"] == "answered"
     assert events == [
         "embedding setup",
-        "GPU query embedding and search",
         "generation model startup",
+        "GPU query embedding and search",
     ]
     assert len(clients) == 1 and clients[0][2].close_count == 1
 
@@ -820,6 +823,7 @@ def test_native_gpu_auto_does_not_open_embedding_session(
             assert clients == []
             events.append("GPU search setup")
             self.method = "hybrid"
+            self.reranker_model_path = reranker_model_path
             self.retriever = BM25Retriever(store, document_id)
 
         def search(self, query, *, top_k):
@@ -860,7 +864,7 @@ def test_native_gpu_auto_does_not_open_embedding_session(
         str(tokenizer_directory),
         "--gpu-temperature-limit",
         "88",
-        "--route",
+        "--mode",
         "auto",
         "--format",
         "json",
@@ -887,17 +891,20 @@ def test_cli_request_timeout_may_extend_to_an_hour_for_cpu_only_machines(documen
     assert cli.main(ask_arguments(document, "--request-timeout-seconds", "3600")) == 0
 
 
-@pytest.mark.parametrize("command", ["ask", "serve"])
-@pytest.mark.parametrize("route", ["auto", "fixed", "agent"])
-def test_route_choices_accept_only_active_routes(command, route):
+@pytest.mark.parametrize("command", ["ask", "chat", "serve", "mcp"])
+@pytest.mark.parametrize("route", ["auto", "detail", "global", "deep"])
+def test_mode_choices_accept_only_active_modes(command, route):
     parser = cli.build_parser()
     arguments = [command, "0" * 64]
     if command == "ask":
         arguments.append("question")
-    assert parser.parse_args([*arguments, "--route", route]).route == route
-    for retired in ("whole-document", "unknown"):
+    assert parser.parse_args([*arguments, "--mode", route]).mode == route
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args([*arguments, "--route", "auto"])
+    assert error.value.code == 2
+    for retired in ("whole-document", "unknown", "fixed", "agent"):
         with pytest.raises(SystemExit) as error:
-            parser.parse_args([*arguments, "--route", retired])
+            parser.parse_args([*arguments, "--mode", retired])
         assert error.value.code == 2
 
 
@@ -947,17 +954,17 @@ def test_whole_document_fits_skips_tokenizing_a_far_too_large_collection(documen
     assert workflow.whole_document_fits("question", language="en") is False
 
 
-@pytest.mark.parametrize("route", ["auto", "agent"])
+@pytest.mark.parametrize("route", ["auto", "global", "deep"])
 @pytest.mark.parametrize("option", ["--rewrite-query", "--rerank"])
 def test_non_fixed_rejects_rewrite_and_rerank(document, clients, capsys, route, option):
-    assert cli.main(ask_arguments(document, "--route", route, option)) == 1
+    assert cli.main(ask_arguments(document, "--mode", route, option)) == 1
     assert clients == []
     output = capsys.readouterr()
     assert output.out == ""
-    assert "--rewrite-query and --rerank apply to --route fixed" in output.err
+    assert "--rewrite-query and --rerank apply to --mode detail" in output.err
 
 
-@pytest.mark.parametrize("route", ["fixed", "auto", "agent"])
+@pytest.mark.parametrize("route", ["detail", "auto", "deep"])
 def test_cli_uses_quote_first_general(
     document, clients, monkeypatch, capsys, route, tokenizer_directory
 ):
@@ -974,7 +981,7 @@ def test_cli_uses_quote_first_general(
 
     monkeypatch.setattr(application, "document_workflow", workflow)
     options = []
-    if route == "agent":
+    if route == "deep":
         from page_cite_rag import gpu_retrieval
 
         monkeypatch.setattr(gpu_retrieval, "StagedGpuSearch", lambda *a, **kw: object())
@@ -999,9 +1006,9 @@ def test_cli_uses_quote_first_general(
         raise ModelError("checked writer")
 
     monkeypatch.setattr(application, "answer_question", routed)
-    if route == "fixed":
+    if route == "detail":
         monkeypatch.setattr(application, "ask_document", routed)
-    assert cli.main(ask_arguments(document, "--route", route, *options)) == 1
+    assert cli.main(ask_arguments(document, "--mode", route, *options)) == 1
     assert captured == [("quote_first", "general")]
     capsys.readouterr()
 
@@ -1015,9 +1022,12 @@ def test_insufficient_passages_are_from_admitted_context_in_order(document, monk
     client.insufficient = True
     monkeypatch.setattr(cli, "_open_generation_client", lambda *args: client)
     # A whole-document read is in document order, so it lists no "most relevant" passages.
-    assert cli.main(ask_arguments(document, "--route", "auto", "--format", "json")) == 0
+    assert cli.main(ask_arguments(document, "--mode", "auto", "--format", "json")) == 0
     assert "closest_passages" not in json.loads(capsys.readouterr().out)
-    arguments = ask_arguments(document, "--route", "fixed", "--format", "json")
+    from page_cite_rag.full_answer import FullAnswerWorkflow
+
+    monkeypatch.setattr(FullAnswerWorkflow, "whole_document_fits", lambda *a, **kw: False)
+    arguments = ask_arguments(document, "--mode", "detail", "--format", "json")
     assert cli.main(arguments) == 0
     output = json.loads(capsys.readouterr().out)
     passages = output["closest_passages"]
@@ -1035,7 +1045,7 @@ def test_insufficient_passages_are_from_admitted_context_in_order(document, monk
         for i in admitted
     ]
     first = by_id[admitted[0]]
-    assert cli.main(ask_arguments(document, "--route", "fixed")) == 0
+    assert cli.main(ask_arguments(document, "--mode", "detail")) == 0
     output = capsys.readouterr().out
     assert "Most relevant passages:" in output
     assert f"lines {first.line_start}-{first.line_end}" in output
@@ -1051,7 +1061,7 @@ def test_insufficient_passages_are_from_admitted_context_in_order(document, monk
     ],
 )
 def test_cli_agent_rejects_missing_requirements_before_model(document, clients, capsys, options):
-    assert cli.main(ask_arguments(document, "--route", "agent", *options)) == 1
+    assert cli.main(ask_arguments(document, "--mode", "deep", *options)) == 1
     assert clients == []
     output = capsys.readouterr()
     assert output.out == ""
@@ -1194,8 +1204,8 @@ def test_api_cli_agent_still_requires_native_retrieval(document, monkeypatch, ca
     )
     arguments = ask_arguments(
         document,
-        "--route",
-        "agent",
+        "--mode",
+        "deep",
         "--backend",
         "api",
         "--api-base",
@@ -1237,8 +1247,8 @@ def test_api_cli_agent_admits_gpu_retrieval_without_local_generation(
                 "https://provider.invalid/v1",
                 "--api-model",
                 "cloud",
-                "--route",
-                "agent",
+                "--mode",
+                "deep",
                 "--method",
                 "hybrid",
                 "--native-gpu",
@@ -1403,12 +1413,12 @@ def test_chat_follow_up_reuses_client_and_retriever(document, clients, monkeypat
     assert "significant standalone" in client.calls[2][0][1].content
 
 
-@pytest.mark.parametrize("route", ["fixed", "auto"])
+@pytest.mark.parametrize("route", ["detail", "auto"])
 def test_chat_json_is_one_record_per_question(document, clients, monkeypatch, capsys, route):
     store, document_id, _ = document
     build_bm25_index(store, document_id)
     monkeypatch.setattr(sys, "stdin", io.StringIO("significant\nWhy?\n"))
-    assert cli.main(chat_arguments(document, "--format", "json", "--route", route)) == 0
+    assert cli.main(chat_arguments(document, "--format", "json", "--mode", route)) == 0
     output = capsys.readouterr()
     records = [json.loads(line) for line in output.out.splitlines()]
     assert len(records) == 2
@@ -1427,7 +1437,9 @@ def test_chat_json_is_one_record_per_question(document, clients, monkeypatch, ca
     assert clients[0][2].close_count == 1
 
 
-def test_chat_question_failure_does_not_enter_history(document, clients, monkeypatch, capsys):
+def test_chat_question_failure_does_not_enter_history(
+    document, clients, monkeypatch, capsys, require_retrieval
+):
     from page_cite_rag import application
 
     store, document_id, _ = document
@@ -1536,3 +1548,11 @@ def test_chat_idle_time_is_outside_question_deadline(document, clients, monkeypa
     assert deadlines == [700.0, 1700.0, 2700.0]
     assert capsys.readouterr().out.count("Status: answered") == 2
     assert clients[0][2].close_count == 1
+
+
+@pytest.fixture
+def require_retrieval(monkeypatch):
+    """Exercise the fallback for a document that exceeds whole-document admission."""
+    from page_cite_rag.full_answer import FullAnswerWorkflow
+
+    monkeypatch.setattr(FullAnswerWorkflow, "whole_document_fits", lambda *args, **kwargs: False)

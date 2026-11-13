@@ -131,7 +131,7 @@ def test_service_routes_asks_through_the_shared_entry(prepared, monkeypatch):
     config = GenerationConfig()
     with DocumentService(
         ServiceConfig(
-            database_path=database, document_id=document_id, method="hybrid", route="auto"
+            database_path=database, document_id=document_id, method="hybrid", mode="auto"
         ),
         config,
         lambda: FakeClient(config),
@@ -139,11 +139,11 @@ def test_service_routes_asks_through_the_shared_entry(prepared, monkeypatch):
     ) as service:
         answer = service.submit("ask", "significant")[1].result(timeout=5)
         assert answer.trace.reading_trace["version"] == "routed-answer/v1"
-        assert calls[0]["route"] == "auto" and calls[0]["source_language"] == "en"
-        with pytest.raises(ValueError, match="--rewrite-query and --rerank apply to --route fixed"):
+        assert calls[0]["mode"] == "auto" and calls[0]["source_language"] == "en"
+        with pytest.raises(ValueError, match="--rewrite-query and --rerank apply to --mode detail"):
             service.submit("ask", "significant", rewrite_query=True)
     with DocumentService(
-        ServiceConfig(database_path=database, document_id=document_id, route="auto"),
+        ServiceConfig(database_path=database, document_id=document_id, mode="auto"),
         config,
         lambda: FakeClient(config),
     ) as service:
@@ -312,7 +312,7 @@ def test_serve_routes_by_default_and_reranks_only_on_the_fixed_route(prepared, m
             raise AssertionError("startup must not execute retrieval")
 
     def run(service, **_kwargs):
-        captured["route"] = service.config.route
+        captured["route"] = service.config.mode
 
     monkeypatch.setenv("PAGE_CITE_RAG_API_TOKEN", "test-local-token")
     monkeypatch.setattr(gpu_retrieval, "StagedGpuSearch", FakeStage)
@@ -335,15 +335,15 @@ def test_serve_routes_by_default_and_reranks_only_on_the_fixed_route(prepared, m
     ]
     # Routing uses the validated retrieval profile, which has no reranker.
     assert cli.main(arguments) == 1 and "route" not in captured
-    assert cli.main([*arguments, "--route", "fixed"]) == 0
-    assert captured["route"] == "fixed"
+    assert cli.main([*arguments, "--mode", "detail"]) == 0
+    assert captured["route"] == "detail"
     assert captured["reranker"] is not None
 
 
 @pytest.mark.parametrize("backend", ["pinned-ollama", "llama"])
 @pytest.mark.parametrize("temperature_limit", [None, 88])
 def test_serve_native_gpu_temperature_policy_reaches_both_backends(
-    prepared, monkeypatch, temperature_limit, backend
+    prepared, monkeypatch, temperature_limit, backend, require_retrieval
 ):
     import uvicorn
 
@@ -406,8 +406,8 @@ def test_serve_native_gpu_temperature_policy_reaches_both_backends(
         "cuda",
         "--gpu-uuid",
         "GPU-12345678-1234-1234-1234-123456789abc",
-        "--route",
-        "fixed",
+        "--mode",
+        "detail",
         "--backend",
         backend,
     ]
@@ -469,7 +469,7 @@ def test_service_passes_and_clears_one_total_request_deadline(prepared):
     assert clients[0].cleared == 1
 
 
-def test_resident_english_rewrite_option_uses_one_bounded_query_call(prepared):
+def test_resident_english_rewrite_option_uses_one_bounded_query_call(prepared, require_retrieval):
     service, clients = make_service(prepared)
     with service:
         answer = service.submit("ask", "result significant", rewrite_query=True)[1].result(
@@ -483,7 +483,9 @@ def test_resident_english_rewrite_option_uses_one_bounded_query_call(prepared):
         assert len(clients) == 1 and len(clients[0].calls) == 2
 
 
-def test_api_opt_in_chinese_rewrite_keeps_original_question_and_records_cost(prepared):
+def test_api_opt_in_chinese_rewrite_keeps_original_question_and_records_cost(
+    prepared, require_retrieval
+):
     class RewriteClient(FakeClient):
         def generate(self, messages, schema_class):
             if schema_class is None and not messages[1].content.startswith("Passages:"):
@@ -532,7 +534,7 @@ def test_api_opt_in_chinese_rewrite_keeps_original_question_and_records_cost(pre
 
 
 @pytest.mark.parametrize("docling_source", [False, True])
-def test_staged_rewrite_runs_once_before_native_search(prepared, docling_source):
+def test_staged_rewrite_runs_once_before_native_search(prepared, docling_source, require_retrieval):
     database, document_id, _ = prepared
     clients = []
     searches = []
@@ -579,7 +581,7 @@ def test_staged_rewrite_runs_once_before_native_search(prepared, docling_source)
     assert searches[0][1].startswith("請說明 result ")
 
 
-def test_staged_retrieval_coexists_with_the_resident_owned_generator(prepared):
+def test_staged_retrieval_coexists_with_the_resident_owned_generator(prepared, require_retrieval):
     database, document_id, _ = prepared
     config = GenerationConfig()
     clients = []
@@ -627,7 +629,9 @@ def test_staged_retrieval_coexists_with_the_resident_owned_generator(prepared):
     assert all(client.close_count == 1 for client in clients)
 
 
-def test_staged_retrieval_receives_deadline_cancel_with_generator_loaded(prepared):
+def test_staged_retrieval_receives_deadline_cancel_with_generator_loaded(
+    prepared, require_retrieval
+):
     database, document_id, _ = prepared
     started = threading.Event()
     cancelled = threading.Event()
@@ -680,7 +684,7 @@ def test_owned_native_server_checks_external_cancel_signal():
         server._check_cancelled()
 
 
-@pytest.mark.parametrize("route", ["fixed", "auto", "agent"])
+@pytest.mark.parametrize("route", ["detail", "auto", "deep"])
 def test_service_always_uses_general_quote_first(prepared, monkeypatch, route):
     from page_cite_rag import application
     from page_cite_rag import service as service_module
@@ -699,11 +703,34 @@ def test_service_always_uses_general_quote_first(prepared, monkeypatch, route):
 
     monkeypatch.setattr(service_module, "document_workflow", workflow)
     monkeypatch.setattr(application, "answer_question", answer)
-    settings = ServiceConfig(database_path=database, document_id=document_id, route=route)
-    assert ServiceConfig(database_path=database, document_id=document_id).route == "fixed"
+    settings = ServiceConfig(database_path=database, document_id=document_id, mode=route)
+    assert ServiceConfig(database_path=database, document_id=document_id).mode == "detail"
     with pytest.raises(ValueError):
         ServiceConfig(database_path=database, document_id=document_id, answer_format="short")
     with DocumentService(settings, config, lambda: FakeClient(config)) as service:
         with pytest.raises(ValueError, match="writer checked"):
             service.submit("ask", "question")[1].result(timeout=5)
     assert captured == [("quote_first", "general")]
+
+
+@pytest.fixture
+def require_retrieval(monkeypatch):
+    """Exercise the fallback for a document that exceeds whole-document admission."""
+    from page_cite_rag.full_answer import FullAnswerWorkflow
+
+    monkeypatch.setattr(FullAnswerWorkflow, "whole_document_fits", lambda *args, **kwargs: False)
+
+
+def test_service_records_resolved_mode_and_keeps_override_per_request(prepared):
+    service, _clients = make_service(prepared)
+    with service:
+        automatic = service.submit("ask", "result significant", mode="auto")[1].result(timeout=5)
+        default = service.submit("ask", "result significant")[1].result(timeout=5)
+        for answer in (automatic, default):
+            assert answer.trace.mode == answer.trace.reading_trace["mode"] == "detail"
+        assert automatic.trace.reading_trace["requested_mode"] == "auto"
+        assert automatic.trace.reading_trace["router"]["error"] == "no_valid_choice"
+        assert default.trace.reading_trace["requested_mode"] == "detail"
+        assert "router" not in default.trace.reading_trace
+        with pytest.raises(ValueError, match="mode must be"):
+            service.submit("ask", "question", mode="fixed")

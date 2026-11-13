@@ -12,6 +12,7 @@ from mcp.server.stdio import stdio_server
 from pydantic import BaseModel, ConfigDict, Field
 
 from page_cite_rag.api import ExplainRequest, QuestionRequest, _failure
+from page_cite_rag.application import Mode
 from page_cite_rag.service import BlockPage, DocumentService
 
 PRIVACY_NOTICE = (
@@ -32,6 +33,10 @@ class _SourceRequest(_EmptyRequest):
     block_id: str = ExplainRequest.model_fields["block_id"]
 
 
+class _AskRequest(QuestionRequest):
+    mode: Mode | None = None
+
+
 _TOOL_REQUESTS = {
     "document_info": (
         _EmptyRequest,
@@ -46,9 +51,9 @@ _TOOL_REQUESTS = {
         "Original text and page/line location of one passage, by block ID.",
     ),
     "ask": (
-        QuestionRequest,
+        _AskRequest,
         "Answer a question about the document; returns the answer, the cited original "
-        "quotes with block IDs and page/line locations, and the route used.",
+        "quotes with block IDs and page/line locations, and the mode used.",
     ),
     "explain": (
         ExplainRequest,
@@ -107,6 +112,7 @@ def create_server(service: DocumentService) -> Server:
                     language=request.language,
                     block_id=getattr(request, "block_id", None),
                     rewrite_query=False,
+                    **({"mode": request.mode} if params.name == "ask" else {}),
                 )
                 try:
                     wrapped = asyncio.wrap_future(future)

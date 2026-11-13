@@ -17,6 +17,8 @@ from typing import Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from page_cite_rag.application import (
+    MODES,
+    Mode,
     RetrievalMethod,
     document_retriever_parts,
     document_workflow,
@@ -57,8 +59,8 @@ class ServiceConfig(BaseModel):
     queue_capacity: int = Field(default=2, ge=0, le=8)
     request_timeout_seconds: float = Field(default=600, gt=1, le=600)
     idle_seconds: float = Field(default=300, gt=0, le=300)
-    # The CLI defaults to auto; direct service callers keep fixed retrieval.
-    route: Literal["auto", "fixed", "agent"] = "fixed"
+    # The CLI defaults to auto; direct service callers use the detail workflow.
+    mode: Mode = "detail"
 
 
 class ServiceTrace(BaseModel):
@@ -76,6 +78,7 @@ class ServiceTrace(BaseModel):
     retrieval_mode: Literal["resident", "staged"]
     gpu_retrieval_trace: dict | None = None
     reading_trace: dict | None = None
+    mode: Mode | None = None
 
 
 class ServiceAnswer(BaseModel):
@@ -110,6 +113,7 @@ class _Job:
     question: str
     language: Language
     rewrite_query: bool
+    answer_mode: Mode
     block_id: str | None
     created: float
     deadline: float
@@ -243,26 +247,30 @@ class DocumentService:
 
     def submit(
         self,
-        mode: Literal["ask", "explain"],
+        operation: Literal["ask", "explain"],
         question: str,
         *,
         language: Language = "zh-Hant",
         block_id: str | None = None,
         rewrite_query: bool = False,
+        mode: Mode | None = None,
     ) -> tuple[str, Future[ServiceAnswer]]:
-        if mode not in ("ask", "explain") or not question.strip() or len(question) > 4000:
+        if operation not in ("ask", "explain") or not question.strip() or len(question) > 4000:
             raise ValueError("invalid mode or question")
         if language not in ("en", "zh-Hant", "auto"):
             raise ValueError("invalid answer language")
         language = resolve_answer_language(question, language)
         if type(rewrite_query) is not bool:
             raise ValueError("query rewrite option must be boolean")
-        if rewrite_query and (mode != "ask" or self.config.method == "dense"):
+        if rewrite_query and (operation != "ask" or self.config.method == "dense"):
             raise ValueError("query rewriting requires BM25 or hybrid ask")
-        if self.config.route != "fixed" and rewrite_query:
-            raise ValueError("--rewrite-query and --rerank apply to --route fixed")
+        answer_mode = self.config.mode if mode is None else mode
+        if answer_mode not in MODES:
+            raise ValueError("mode must be auto, detail, global or deep")
+        if answer_mode != "detail" and rewrite_query:
+            raise ValueError("--rewrite-query and --rerank apply to --mode detail")
         question.encode("utf-8")
-        if mode == "explain":
+        if operation == "explain":
             if block_id is None:
                 raise ValueError("explanation needs a source block")
             read_verified_source(self.store, self.config.document_id, block_id)
@@ -271,7 +279,8 @@ class DocumentService:
         now = time.monotonic()
         job = _Job(
             request_id=uuid.uuid4().hex,
-            mode=mode,
+            mode=operation,
+            answer_mode=answer_mode,
             question=question,
             language=language,
             rewrite_query=rewrite_query,
@@ -401,7 +410,7 @@ class DocumentService:
                 job.question,
                 language=job.language,
                 source_language=self._source_language,
-                route=self.config.route,
+                mode=job.answer_mode,
             )
             reading_trace = routed.trace
             result = routed.result
@@ -433,6 +442,7 @@ class DocumentService:
                 retrieval_mode="staged" if self._staged_search is not None else "resident",
                 gpu_retrieval_trace=gpu_retrieval_trace,
                 reading_trace=reading_trace,
+                mode=reading_trace.get("mode") if reading_trace is not None else None,
             ),
         )
 

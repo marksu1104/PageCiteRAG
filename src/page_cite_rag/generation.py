@@ -259,10 +259,10 @@ class ModelClient(Protocol):
     def generate(
         self,
         messages: Sequence[ChatMessage],
-        response_model: type[T],
+        response_model: type[T] | None,
         *,
         include_schema_in_prompt: bool = True,
-    ) -> GenerationResult[T]: ...
+    ) -> GenerationResult[T | str]: ...
 
     def close(self) -> None: ...
 
@@ -406,10 +406,10 @@ class OllamaModelClient:
     def generate(
         self,
         messages: Sequence[ChatMessage],
-        response_model: type[T],
+        response_model: type[T] | None,
         *,
         include_schema_in_prompt: bool = True,
-    ) -> GenerationResult[T]:
+    ) -> GenerationResult[T | str]:
         if type(include_schema_in_prompt) is not bool:
             raise ValueError("schema prompt inclusion must be boolean")
         messages = tuple(messages)
@@ -419,7 +419,7 @@ class OllamaModelClient:
             message.model_copy(update={"content": guard_chat_delimiters(message.content)})
             for message in messages
         )
-        schema = response_model.model_json_schema()
+        schema = response_model.model_json_schema() if response_model is not None else None
         budget = check_budget(
             messages,
             schema if include_schema_in_prompt else {},
@@ -432,7 +432,7 @@ class OllamaModelClient:
             {
                 "model": self.config.model,
                 "messages": [message.model_dump() for message in messages],
-                "format": schema,
+                **({"format": schema} if schema is not None else {}),
                 "stream": False,
                 "think": False,
                 "truncate": False,
@@ -465,7 +465,14 @@ class OllamaModelClient:
         if type(response.get("load_duration")) is not int:
             raise StructuredOutputError("Ollama load timing is missing or invalid")
         try:
-            value = response_model.model_validate_json(message.get("content", ""), strict=True)
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                raise TypeError("invalid content")
+            value = (
+                content
+                if response_model is None
+                else response_model.model_validate_json(content, strict=True)
+            )
             stats = GenerationStats(
                 **{
                     key: response[key]

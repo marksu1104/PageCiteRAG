@@ -44,7 +44,9 @@ def test_routes_use_fixed_answer_without_planning(monkeypatch, route, reason):
     assert calls == [(workflow, "What happened?", "en")]
     assert answer.result is expected
     assert answer.trace == {
-        "version": "routed-answer/v4",
+        "version": "routed-answer/v5",
+        "requested_mode": "detail",
+        "mode": "detail",
         "requested_route": route,
         "route": "fixed",
         "reason": reason,
@@ -80,13 +82,16 @@ def test_service_rejects_retired_route(tmp_path):
 
     from page_cite_rag.service import ServiceConfig
 
-    for route in ("auto", "fixed"):
+    for route in ("auto", "detail", "global", "deep"):
         assert (
-            ServiceConfig(database_path=tmp_path / "db", document_id="0" * 64, route=route).route
+            ServiceConfig(database_path=tmp_path / "db", document_id="0" * 64, mode=route).mode
             == route
         )
+    for retired in ("fixed", "agent", "whole-document"):
+        with pytest.raises(ValidationError):
+            ServiceConfig(database_path=tmp_path / "db", document_id="0" * 64, mode=retired)
     with pytest.raises(ValidationError):
-        ServiceConfig(database_path=tmp_path / "db", document_id="0" * 64, route="whole-document")
+        ServiceConfig(database_path=tmp_path / "db", document_id="0" * 64, route="auto")
 
 
 @pytest.mark.parametrize("writer", ["structured", "quote_two_step"])
@@ -103,7 +108,7 @@ def test_evidence_agent_rejects_other_writers(writer):
 
 
 @pytest.mark.parametrize("fits", [True, False])
-def test_auto_selects_whole_document_or_reranked(monkeypatch, fits):
+def test_detail_selects_whole_document_or_reranked(monkeypatch, fits):
     from page_cite_rag import application
     from page_cite_rag.gpu_retrieval import StagedGpuSearch
     from page_cite_rag.workflows import WorkflowConfig
@@ -134,10 +139,12 @@ def test_auto_selects_whole_document_or_reranked(monkeypatch, fits):
         return expected
 
     monkeypatch.setattr(application, "ask_document", ask)
-    result = application.answer_question(workflow, "question", language="en")
+    result = application.answer_question(workflow, "question", language="en", mode="detail")
     assert result.result is expected
     assert result.trace == {
-        "version": "routed-answer/v4",
+        "version": "routed-answer/v5",
+        "requested_mode": "detail",
+        "mode": "detail",
         "requested_route": "auto",
         "route": "whole_document_context" if fits else "reranked",
         "reason": "fits_context" if fits else "whole_document_exceeds_context",
@@ -207,11 +214,13 @@ def test_agent_holds_session_and_reports_accounting(monkeypatch):
         )
 
     monkeypatch.setattr(evidence_agent, "run_evidence_agent", run)
-    result = application.answer_question(workflow, "question", language="en", route="agent")
+    result = application.answer_question(workflow, "question", language="en", mode="deep")
     assert events == ["start", "close"]
     assert result.result is expected
     assert result.trace == {
-        "version": "routed-answer/v4",
+        "version": "routed-answer/v5",
+        "requested_mode": "deep",
+        "mode": "deep",
         "requested_route": "agent",
         "route": "agent",
         "reason": "requested",

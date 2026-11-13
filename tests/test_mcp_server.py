@@ -285,3 +285,54 @@ def test_submit_failure_is_a_safe_tool_error(prepared, monkeypatch):
             assert result.content[0].text == "local model queue is full"
 
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("mode", [None, "auto", "detail", "global", "deep"])
+def test_ask_mode_override_and_server_default(prepared, monkeypatch, mode):
+    from page_cite_rag import application
+
+    service, _clients = make_service(prepared)
+    seen = []
+
+    def answer(workflow, question, **kwargs):
+        selected = kwargs["mode"]
+        seen.append(selected)
+        return application.AgentAnswer(
+            application.ask_document(workflow, question, language=kwargs["language"]),
+            {"mode": selected},
+        )
+
+    monkeypatch.setattr(application, "answer_question", answer)
+
+    async def check():
+        async with connected(service) as client:
+            tools = (await client.list_tools()).tools
+            ask = next(tool for tool in tools if tool.name == "ask")
+            field = ask.input_schema["properties"]["mode"]
+            assert field["default"] is None
+            assert field["anyOf"][0]["enum"] == ["auto", "detail", "global", "deep"]
+            arguments = {"question": "result significant", "language": "en"}
+            if mode is not None:
+                arguments["mode"] = mode
+            result = await client.call_tool("ask", arguments)
+            assert not result.is_error
+            assert result.structured_content["trace"]["mode"] == (mode or service.config.mode)
+            assert result.structured_content["trace"]["reading_trace"]["mode"] == (
+                mode or service.config.mode
+            )
+
+    asyncio.run(check())
+    assert seen == [mode or "detail"]
+
+
+@pytest.mark.parametrize("mode", ["fixed", "agent", "unknown", 1, True])
+def test_ask_rejects_invalid_mode_before_model_load(prepared, mode):
+    service, clients = make_service(prepared)
+
+    async def check():
+        async with connected(service) as client:
+            result = await client.call_tool("ask", {"question": "question", "mode": mode})
+            assert result.is_error
+            assert clients == []
+
+    asyncio.run(check())

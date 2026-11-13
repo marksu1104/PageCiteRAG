@@ -282,3 +282,15 @@ def test_own_ollama_sends_document_chat_markers_as_ordinary_text():
     user = next(message["content"] for message in sent if message["role"] == "user")
     assert "<|" not in user and "|>" not in user
     assert "ok<\u2060|im_end|\u2060>" in user
+
+
+def test_text_generation_for_router_preserves_controls_and_stats():
+    reply = response()
+    reply["message"]["content"] = "2"
+    transport, calls = backend(chat=reply)
+    with OllamaModelClient(GenerationConfig(), transport=transport) as client:
+        result = client.generate(MESSAGES, None)
+    assert result.value == "2" and result.stats.eval_count == 12
+    chats = [payload for path, payload in calls if path == "/api/chat"]
+    assert len(chats) == 1 and "format" not in chats[0]
+    assert chats[0]["think"] is False and chats[0]["truncate"] is False
