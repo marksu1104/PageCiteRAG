@@ -160,3 +160,38 @@ def test_findings_take_turns_and_are_capped():
     assert len(findings) == ga.MAX_FINDINGS
     assert all(len(text) == ga.FINDING_CHARS for text, _ in findings)
     assert [pid for _, pid in findings[:6]] == [f"P{i * 3 + 1}" for i in range(6)]
+
+
+def test_a_failed_section_is_skipped_not_fatal():
+    from page_cite_rag.generation import ContextBudgetError, ModelTimeoutError
+
+    blocks = [block(i) for i in range(1, 41)]
+
+    class OneFails(Workflow):
+        def answer_from_context(self, question, blocks, *, language, search_findings=()):
+            if question.startswith("Using only") and blocks[0].ordinal == 1:
+                raise ContextBudgetError("section too long")
+            return super().answer_from_context(
+                question, blocks, language=language, search_findings=search_findings
+            )
+
+    answer = ga.answer_global(OneFails(blocks), "Q? contributions", language="en")
+    statuses = [s["status"] for s in answer.trace["sections"]]
+    assert statuses[0] == "failed" and statuses.count("failed") == 1
+    assert answer.trace["route"] == "map_reduce" and answer.result.status == "answered"
+
+    class Timeout(Workflow):
+        def answer_from_context(self, question, blocks, *, language, search_findings=()):
+            raise ModelTimeoutError("deadline")
+
+    import pytest
+
+    with pytest.raises(ModelTimeoutError):
+        ga.answer_global(Timeout(blocks), "Q? contributions", language="en")
+
+    class AllFail(Workflow):
+        def answer_from_context(self, question, blocks, *, language, search_findings=()):
+            raise ContextBudgetError("too long")
+
+    with pytest.raises(ContextBudgetError):
+        ga.answer_global(AllFail(blocks), "Q? contributions", language="en")

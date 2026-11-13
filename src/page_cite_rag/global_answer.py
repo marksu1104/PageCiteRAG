@@ -19,6 +19,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from page_cite_rag.generation import ContextBudgetError, OutputValidationError
 from page_cite_rag.models import Block
 
 GLOBAL_VERSION = "global-map-reduce/v1"
@@ -147,8 +148,25 @@ def answer_global(workflow, question: str, *, language: str = "zh-Hant") -> Glob
     map_question = MAP_QUESTION[language].format(question=question)
     section_results, section_trace = [], []
     prompt_total = completion_total = 0
+    last_error: Exception | None = None
     for index, section in enumerate(sections, 1):
-        result = workflow.answer_from_context(map_question, section, language=language)
+        try:
+            result = workflow.answer_from_context(map_question, section, language=language)
+        except (OutputValidationError, ContextBudgetError) as exc:
+            last_error = exc
+            # One section's over-long or unparsable reply drops that section's points only;
+            # GPU stops, timeouts and connection failures still end the whole answer.
+            section_trace.append(
+                {
+                    "section": index,
+                    "first_block": section[0].ordinal,
+                    "last_block": section[-1].ordinal,
+                    "status": "failed",
+                    "error": type(exc).__name__,
+                    "points": 0,
+                }
+            )
+            continue
         prompt, completion = _usage(result)
         prompt_total += prompt
         completion_total += completion
@@ -182,6 +200,8 @@ def answer_global(workflow, question: str, *, language: str = "zh-Hant") -> Glob
             prompt_tokens=prompt_total,
             completion_tokens=completion_total,
         )
+        if not section_results:
+            raise last_error
         return GlobalAnswer(section_results[0], trace)
     reduce_blocks = reduce_context(workflow, question, language, sections, cited, order)
     blocks_by_id = {block.block_id: block for block in reduce_blocks}
