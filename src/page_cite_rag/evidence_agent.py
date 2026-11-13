@@ -9,6 +9,7 @@ from typing import Annotated
 
 import httpx
 
+from page_cite_rag.api_backend import ApiChatClient
 from page_cite_rag.full_answer import FullAnswerWorkflow
 from page_cite_rag.generation import ModelError
 from page_cite_rag.models import Block
@@ -70,17 +71,25 @@ SYSTEM_PROMPT = (
 )
 
 
+def _validate_model_calls(model_calls: int) -> None:
+    if type(model_calls) is not int or not 8 <= model_calls <= 12:
+        raise ValueError("model_calls must be an integer from 8 to 12")
+
+
 class GuardedTransport(httpx.BaseTransport):
     """Inspect raw responses before the model adapter can discard reasoning fields."""
 
     def __init__(
         self,
-        client: OllamaGgufClient,
+        client: OllamaGgufClient | ApiChatClient,
         *,
         inner: httpx.BaseTransport | None = None,
+        model_calls: int = LIMITS.model_calls,
         before_model_call: Callable[[], None] | None = None,
         after_model_call: Callable[[dict], None] | None = None,
     ) -> None:
+        _validate_model_calls(model_calls)
+        self.model_call_limit = model_calls
         self.client = client
         self.inner = inner if inner is not None else httpx.HTTPTransport(retries=0)
         self.before_model_call = before_model_call
@@ -91,7 +100,13 @@ class GuardedTransport(httpx.BaseTransport):
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.read())
-        if body.get("reasoning_effort") != "none" or body.get("stream", False):
+        thinking_control = getattr(self.client, "thinking_control", "reasoning_effort_none")
+        if (
+            (thinking_control == "reasoning_effort_none" and body.get("reasoning_effort") != "none")
+            or (thinking_control == "provider_default" and "reasoning_effort" in body)
+            or thinking_control not in ("reasoning_effort_none", "provider_default")
+            or body.get("stream", False)
+        ):
             raise ModelError("Agent request must disable reasoning and streaming")
         # langchain-openai sends max_completion_tokens; the pinned Ollama honours only
         # max_tokens and silently ignores the newer field, which left calls uncapped.
@@ -99,7 +114,7 @@ class GuardedTransport(httpx.BaseTransport):
             body["max_tokens"] = body.pop("max_completion_tokens")
         if body.get("max_tokens") != LIMITS.max_tokens:
             raise ModelError("Agent request must carry its output token cap")
-        if len(self.records) - self.repairs >= LIMITS.model_calls:
+        if len(self.records) - self.repairs >= self.model_call_limit:
             raise ModelError("Agent model-call ceiling reached")
         response, problem = self._dispatch(request, body)
         while problem is not None and self.repairs < LIMITS.tool_call_repairs:
@@ -125,6 +140,9 @@ class GuardedTransport(httpx.BaseTransport):
             request.url,
             headers={k: v for k, v in request.headers.items() if k.lower() != "content-length"},
             content=json.dumps(body).encode("utf-8"),
+            **(
+                {"extensions": request.extensions} if isinstance(self.client, ApiChatClient) else {}
+            ),
         )
         record = {
             "prompt_eval_count": None,
@@ -140,12 +158,28 @@ class GuardedTransport(httpx.BaseTransport):
         }
         self.records.append(record)
         started = time.perf_counter()
+        gate_started = time.perf_counter()
         try:
             self.client.before_agent_dispatch()
+            record["gate_ms"] = (time.perf_counter() - gate_started) * 1000
             if self.before_model_call is not None:
-                self.before_model_call()
-            response = self.inner.handle_request(request)
-            response.read()
+                hook_started = time.perf_counter()
+                try:
+                    self.before_model_call()
+                finally:
+                    record["hook_ms"] = (time.perf_counter() - hook_started) * 1000
+            else:
+                record["hook_ms"] = 0.0
+            http_started = time.perf_counter()
+            try:
+                response = (
+                    self.client.dispatch_agent_request(self.inner, request)
+                    if isinstance(self.client, ApiChatClient)
+                    else self.inner.handle_request(request)
+                )
+                response.read()
+            finally:
+                record["http_ms"] = (time.perf_counter() - http_started) * 1000
             response.request = request
             record["http_status"] = response.status_code
             if response.is_error:
@@ -192,6 +226,9 @@ class GuardedTransport(httpx.BaseTransport):
             self.dispatch_error = exc
             raise
         finally:
+            record.setdefault("gate_ms", (time.perf_counter() - gate_started) * 1000)
+            record.setdefault("hook_ms", 0.0)
+            record.setdefault("http_ms", 0.0)
             record["elapsed_ms"] = (time.perf_counter() - started) * 1000
             if self.after_model_call is not None:
                 try:
@@ -267,7 +304,15 @@ class EvidenceTools:
         blocks: Sequence[Block],
         initial: SearchResult,
         search: Callable[[str], SearchResult],
+        *,
+        handoff_findings: bool = False,
+        model_calls: int = LIMITS.model_calls,
     ) -> None:
+        _validate_model_calls(model_calls)
+        self.model_call_limit = model_calls
+        self.handoff_findings = handoff_findings
+        self.findings: list[dict] = []
+        self.findings_rejected: list[dict] = []
         self.blocks = {f"P{b.ordinal}": b for b in blocks}
         if len(self.blocks) != len(blocks):
             raise ValueError("duplicate ordinals in document")
@@ -305,7 +350,13 @@ class EvidenceTools:
         return "\n".join(lines)
 
     def invoke(self, name: str, arguments: dict) -> str:
-        row = {"name": name, "arguments": arguments, "returned_passage_ids": []}
+        started = time.perf_counter()
+        row = {
+            "name": name,
+            "arguments": arguments,
+            "returned_passage_ids": [],
+            "search_ms": 0.0,
+        }
         self.calls.append(row)
         try:
             if self.finished is not None or len(self.calls) > LIMITS.tool_calls:
@@ -314,15 +365,19 @@ class EvidenceTools:
                 query = arguments["query"]
                 if not query.strip() or len(query) > LIMITS.query_chars:
                     raise ValueError("query must be 1–300 characters")
-                result = self.search(query)
+                search_started = time.perf_counter()
+                try:
+                    result = self.search(query)
+                finally:
+                    row["search_ms"] = (time.perf_counter() - search_started) * 1000
                 ids = [f"P{h.block.ordinal}" for h in result.hits[: LIMITS.passages_per_search]]
                 for hit in result.hits[: LIMITS.passages_per_search]:
                     if self.blocks.get(f"P{hit.block.ordinal}") != hit.block:
                         raise ValueError("search contains a passage outside this document")
                 output = self.passages(ids)
                 used = len(self.calls)
-                hint = f"Steps used: {used} of {LIMITS.model_calls}."
-                if LIMITS.model_calls - used == 1:
+                hint = f"Steps used: {used} of {self.model_call_limit}."
+                if self.model_call_limit - used == 1:
                     hint += " Your next step is the last one: call finish now."
                 output += f"\n{hint}"
             elif name == "finish":
@@ -334,6 +389,8 @@ class EvidenceTools:
                     if identifier not in self.seen:
                         raise ValueError("finish requires a previously searched or read passage")
                 ids = list(dict.fromkeys(ids))
+                if self.handoff_findings:
+                    self._accept_findings(arguments.get("findings", []))
                 self.finished = ids
                 output = "Evidence selection complete."
             else:
@@ -347,6 +404,31 @@ class EvidenceTools:
         except BaseException as exc:
             row.update(status="failed", error_type=type(exc).__name__)
             raise
+        finally:
+            row["elapsed_ms"] = (time.perf_counter() - started) * 1000
+
+    def _accept_findings(self, findings) -> None:
+        if not isinstance(findings, list):
+            self.findings_rejected.append({"finding": findings, "reason": "expected a list"})
+            return
+        for index, item in enumerate(findings):
+            reason = None
+            if index >= 8:
+                reason = "at most 8 findings"
+            elif not isinstance(item, dict):
+                reason = "expected a fact/passage object"
+            elif (
+                not isinstance(item.get("fact"), str)
+                or not item["fact"].strip()
+                or len(item["fact"]) > 200
+            ):
+                reason = "fact must be 1–200 nonblank characters"
+            elif not isinstance(item.get("passage_id"), str) or item["passage_id"] not in self.seen:
+                reason = "passage_id must have been seen"
+            if reason is not None:
+                self.findings_rejected.append({"finding": item, "reason": reason})
+            else:
+                self.findings.append({"fact": item["fact"], "passage_id": item["passage_id"]})
 
     def handoff(self) -> tuple[list[str], list[str], str]:
         selected = self.finished or []
@@ -383,6 +465,31 @@ class EvidenceTools:
             """Finish evidence gathering and hand the selected passages to the writer."""
             return self.invoke("finish", {"passage_ids": passage_ids})
 
+        if self.handoff_findings:
+            # A JSON schema advertises the contract without rejecting the whole finish call:
+            # invoke validates each finding and retains all valid siblings.
+            schema = finish.args_schema.model_json_schema()
+            schema["properties"]["findings"] = {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "fact": {"type": "string", "minLength": 1, "maxLength": 200},
+                        "passage_id": {"type": "string"},
+                    },
+                    "required": ["fact", "passage_id"],
+                },
+            }
+
+            def finish_with_findings(passage_ids, findings=()):
+                """Finish evidence gathering and hand the selected passages to the writer."""
+                arguments = {"passage_ids": passage_ids}
+                if findings != ():
+                    arguments["findings"] = findings
+                return self.invoke("finish", arguments)
+
+            finish = tool("finish", args_schema=schema, return_direct=True)(finish_with_findings)
         return [search_passages, finish]
 
 
@@ -390,12 +497,20 @@ def evidence_agent(llm, state):
     from langchain.agents import create_agent
     from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
 
+    system_prompt = SYSTEM_PROMPT.replace(
+        "at most 8 steps", f"at most {state.model_call_limit} steps"
+    )
+    if state.handoff_findings:
+        system_prompt += (
+            " When calling finish, list in findings each fact found and its passage ID in "
+            'reasoning order, for example "Zentro phone is made by Kalvex Corp" P12.'
+        )
     return create_agent(
         llm,
         state.tools(),
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         middleware=[
-            ModelCallLimitMiddleware(run_limit=LIMITS.model_calls, exit_behavior="end"),
+            ModelCallLimitMiddleware(run_limit=state.model_call_limit, exit_behavior="end"),
             ToolCallLimitMiddleware(run_limit=LIMITS.tool_calls, exit_behavior="end"),
         ],
     )
@@ -403,19 +518,20 @@ def evidence_agent(llm, state):
 
 def run_evidence_agent(
     workflow: FullAnswerWorkflow,
-    client: OllamaGgufClient,
+    client: OllamaGgufClient | ApiChatClient,
     question: str,
     *,
     language: Language,
     initial_search: SearchResult | None = None,
+    handoff_findings: bool = False,
+    model_calls: int = LIMITS.model_calls,
     before_model_call: Callable[[], None] | None = None,
     after_model_call: Callable[[dict], None] | None = None,
 ) -> EvidenceAgentResult:
     """Gather passages, then hand every seen original to the quote-first workflow."""
-    if not isinstance(workflow, FullAnswerWorkflow) or workflow.writer not in (
-        "quote_first",
-        "quote_two_step",
-    ):
+    _validate_model_calls(model_calls)
+    total_started = time.perf_counter()
+    if not isinstance(workflow, FullAnswerWorkflow) or workflow.writer != "quote_first":
         raise ValueError("evidence agent requires a quote-first FullAnswerWorkflow")
     from langchain_openai import ChatOpenAI
 
@@ -428,42 +544,55 @@ def run_evidence_agent(
         workflow._store.get_blocks(workflow.document_id),
         initial_search,
         lambda query: workflow.search_sources(query)[0],
+        handoff_findings=handoff_findings,
+        model_calls=model_calls,
     )
     # The agent follows the owned client's sampling profile so writer and agent never diverge.
     sampling = client.chat_sampling()
     transport = GuardedTransport(
-        client, before_model_call=before_model_call, after_model_call=after_model_call
+        client,
+        before_model_call=before_model_call,
+        after_model_call=after_model_call,
+        model_calls=model_calls,
     )
     with httpx.Client(transport=transport, trust_env=False) as http:
         llm = ChatOpenAI(
             base_url=client.chat_completions_base_url(),
             api_key="local",
-            model=client.ollama_model_name,
+            model=client.chat_model_name,
             **sampling,
             max_tokens=LIMITS.max_tokens,
             timeout=LIMITS.timeout_seconds,
             max_retries=0,
-            reasoning_effort="none",
+            **(
+                {"reasoning_effort": "none"}
+                if client.thinking_control == "reasoning_effort_none"
+                else {}
+            ),
             http_client=http,
             model_kwargs={"parallel_tool_calls": False},
         )
         try:
-            evidence_agent(llm, state).invoke(
-                {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Question: {question}\n\nInitial search results for "
-                                "the question:\n"
-                                f"{state.initial_passages}\n\nSteps used: 0 of 8."
-                            ),
-                        }
-                    ]
-                },
-                # Graph-step safety net only; call-limit middleware enforces the real limits.
-                config={"max_concurrency": 1, "recursion_limit": 100},
-            )
+            agent_started = time.perf_counter()
+            try:
+                evidence_agent(llm, state).invoke(
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Question: {question}\n\nInitial search results for "
+                                    "the question:\n"
+                                    f"{state.initial_passages}\n\nSteps used: 0 of {model_calls}."
+                                ),
+                            }
+                        ]
+                    },
+                    # Graph-step safety net only; call-limit middleware enforces the real limits.
+                    config={"max_concurrency": 1, "recursion_limit": 100},
+                )
+            finally:
+                agent_loop_ms = (time.perf_counter() - agent_started) * 1000
         except BaseException:
             # The OpenAI adapter wraps transport errors; preserve the original guard/hook failure.
             if transport.dispatch_error is not None:
@@ -495,16 +624,31 @@ def run_evidence_agent(
                 else {"status": "not_executed_or_schema_rejected", "returned_passage_ids": []}
             )
             calls.append({**requested, **actual})
+    writer_started = time.perf_counter()
     answer = workflow.answer_from_context(
         question,
         [state.blocks[identifier] for identifier in handoff],
         language=language,
         search_steps=steps,
+        **(
+            {"search_findings": [(f["fact"], f["passage_id"]) for f in state.findings]}
+            if handoff_findings
+            else {}
+        ),
     )
+    writer_ms = (time.perf_counter() - writer_started) * 1000
+    model_gate_ms = sum(record["gate_ms"] for record in transport.records)
+    model_http_ms = sum(record["http_ms"] for record in transport.records)
+    model_elapsed_ms = sum(record["elapsed_ms"] for record in transport.records)
+    tool_ms = sum(row["elapsed_ms"] for row in state.calls)
     return EvidenceAgentResult(
         answer,
         {
             "version": EVIDENCE_AGENT_VERSION,
+            "handoff_findings": handoff_findings,
+            "findings": state.findings,
+            "findings_rejected": state.findings_rejected,
+            "model_call_limit": model_calls,
             "sampling": sampling,
             "model_calls": transport.records,
             "tool_call_repairs": transport.repairs,
@@ -514,5 +658,14 @@ def run_evidence_agent(
             "handoff_passage_ids": handoff,
             "handoff_reason": reason,
             "search_steps": steps,
+            "timing": {
+                "total_ms": (time.perf_counter() - total_started) * 1000,
+                "agent_loop_ms": agent_loop_ms,
+                "writer_ms": writer_ms,
+                "model_gate_ms": model_gate_ms,
+                "model_http_ms": model_http_ms,
+                "tool_ms": tool_ms,
+                "unattributed_ms": agent_loop_ms - model_elapsed_ms - tool_ms,
+            },
         },
     )

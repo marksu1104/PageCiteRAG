@@ -447,3 +447,57 @@ def test_structured_writer_still_fails_on_output_limit(setup, monkeypatch):
     with pytest.raises(OutputValidationError):
         workflow.answer_from_context("Who was excluded?", blocks, language="en")
     assert len(model.calls) == 1
+
+
+@pytest.mark.parametrize("answer_format", ["general", "short_answer"])
+@pytest.mark.parametrize("language", ["en", "zh-Hant"])
+def test_revision_v1_matches_default_and_v3_changes_only_instructions(answer_format, language):
+    args = ("Q?", language, answer_format, (("S12", "season three", None),))
+    default = quote_first_messages(*args)
+    assert quote_first_messages(*args, prompt_revision="v1", search_findings=()) == default
+    revised = quote_first_messages(*args, prompt_revision="v3")
+    assert revised[1] == default[1]
+    assert "preserve the passage's wording" not in revised[0].content
+    assert "only when the passages truly lack the required facts" in revised[0].content
+    assert "reasoning has derived the answer from the cited evidence" in revised[0].content
+    with pytest.raises(ValueError):
+        quote_first_messages(*args, prompt_revision="v2")
+
+
+@pytest.mark.parametrize("writer", ["quote_first", "structured"])
+def test_v3_workflow_version_and_factory(setup, monkeypatch, writer):
+    from page_cite_rag.quote_first import QUOTE_FIRST_V3_PROMPT_VERSION
+
+    store, doc_id, blocks, retriever, model, _ = setup
+    workflow = document_workflow(
+        store,
+        doc_id,
+        retriever,
+        model,
+        model.config,
+        writer=writer,
+        quote_first_revision="v3",
+    )
+    if writer == "quote_first":
+
+        def generate(messages, response_model):
+            model.calls.append((messages, response_model))
+            assert response_model is None
+            output = (
+                f'Evidence:\n[S{blocks[0].ordinal}] "Children were excluded."\n'
+                f"Reasoning: The passage states it.\nAnswer:\n"
+                f"- Children were excluded. [S{blocks[0].ordinal}]"
+            )
+            return GenerationResult(output, stats(), check_budget(messages, None, model.config))
+
+        monkeypatch.setattr(model, "generate", generate)
+        result = workflow.answer_from_context("Who was excluded?", blocks, language="en")
+        assert result.prompt_version == QUOTE_FIRST_V3_PROMPT_VERSION
+        AnswerResult.model_validate_json(result.model_dump_json(), strict=True)
+        assert "reasoning has derived the answer" in model.calls[-1][0][0].content
+    else:
+        baseline = document_workflow(store, doc_id, retriever, model, model.config)
+        assert workflow.prompt_version == baseline.prompt_version
+        assert workflow._messages_with_context_groups(
+            "Q", "en", "ask", blocks, None, ()
+        ) == baseline._messages_with_context_groups("Q", "en", "ask", blocks, None, ())

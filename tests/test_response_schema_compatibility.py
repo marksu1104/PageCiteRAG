@@ -5,12 +5,11 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from page_cite_rag import full_answer, gap_agent
+from page_cite_rag import full_answer
 from page_cite_rag.agent import ReadingReport
 from page_cite_rag.citations import AnswerDraft
 from page_cite_rag.reading_plan import ReadingPlan, RequirementCoverage, ScopedReadingPlan
 from page_cite_rag.span_citations import SpanAnswerDraft
-from tests.test_gap_agent import _markdown_reading, _ScriptedModel, _section_ids
 
 # Union of keywords from HEAD response schemas, generated with git show HEAD:<path>.
 # Property/definition names and discriminator mapping entries are not schema keywords.
@@ -70,11 +69,6 @@ def test_all_response_schema_families_use_head_keywords(monkeypatch, count):
     ids = tuple(f"S{i + 1}" for i in range(count))
     needs = tuple(f"need-{i + 1:02d}" for i in range(count)) or ("need-01",)
     models = [ReadingPlan, ScopedReadingPlan, ReadingReport, AnswerDraft, SpanAnswerDraft]
-    models.append(gap_agent.gap_check_model(needs, ids))
-    if ids:
-        models.append(gap_agent.focus_selection_model(needs, ids))
-        for name in ("OutlineSelection", "FollowUpSelection"):
-            models.append(gap_agent._selection_model(name, needs, ids, 12))
     monkeypatch.setattr(full_answer, "_spans", lambda blocks: dict.fromkeys(ids if blocks else ()))
     for observations in ((), ({"point": "reader note"},)):
         for kind in ("general", "short_answer", "multiple_choice"):
@@ -92,40 +86,6 @@ def test_all_response_schema_families_use_head_keywords(monkeypatch, count):
             )
     for model in models:
         _check_schema(model.model_json_schema())
-
-
-def test_reader_schema_and_received_control_character_validation(tmp_path):
-    workflow, result, _, first = _markdown_reading(
-        tmp_path, "## A\n\nAlpha.\n\n## B\n\nBeta.\n", "Find Alpha", "Alpha"
-    )
-    captured = []
-
-    class CaptureModel(_ScriptedModel):
-        def generate(self, messages, response_model):
-            _check_schema(response_model.model_json_schema(), patterns_allowed=False)
-            if response_model.__name__ == "SectionPoints":
-                captured.append(response_model)
-            return super().generate(messages, response_model)
-
-    workflow._model = CaptureModel(
-        workflow, [lambda p: _section_ids(p, "A"), {"points": []}, {}], "S1"
-    )
-    gap_agent.run_outline_reading(workflow, result.query, "en", result, (first,))
-    assert captured
-    model = captured[0]
-    point_schema = model.model_json_schema()["$defs"]["SectionPoint"]["properties"]
-    source_id = point_schema["source_ids"]["items"].get("const")
-    if source_id is None:
-        source_id = point_schema["source_ids"]["items"]["enum"][0]
-    payload = {"points": [{"need_id": "need-01", "point": "valid", "source_ids": [source_id]}]}
-    for code in range(32):
-        payload["points"][0]["point"] = f"before{chr(code)}after"
-        raw = json.dumps(payload)
-        if code in (9, 10, 13):
-            assert model.model_validate_json(raw).points[0].point == payload["points"][0]["point"]
-        else:
-            with pytest.raises(ValidationError, match="forbidden control characters"):
-                model.model_validate_json(raw)
 
 
 @pytest.mark.parametrize("claim_id", ["C0", "1", ""])

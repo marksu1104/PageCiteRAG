@@ -11,6 +11,9 @@ from typing import Iterator
 
 from page_cite_rag.models import Block, DocumentMetadata, ParsedUnit
 
+# 依據：MuSiQue 與 QASPER 原始段落多在 2,000 字元內；超長段落會讓檢索與引用只剩整份一塊。
+MAX_BLOCK_CHARS = 2000
+
 
 class TokenBlockFactory:
     """Split paragraphs with the prepared tokenizer; retain exact source slices."""
@@ -118,11 +121,9 @@ def iter_blocks(
     offset = 0
     start_offset: int | None = None
     end_offset = 0
-    start_line = 0
-    end_line = 0
 
-    def make_block() -> Block:
-        block_text = unit.text[start_offset:end_offset]
+    def make_block(block_start: int, block_end: int, block_start_line: int, block_end_line: int):
+        block_text = unit.text[block_start:block_end]
         block_id = sha256(f"{document.document_id}\0{ordinal}".encode("utf-8")).hexdigest()
         return Block(
             document_id=document.document_id,
@@ -130,25 +131,69 @@ def iter_blocks(
             ordinal=ordinal,
             unit_index=unit.unit_index,
             page_number=unit.page_number,
-            line_start=start_line,
-            line_end=end_line,
-            char_start=start_offset,
-            char_end=end_offset,
+            line_start=block_start_line,
+            line_end=block_end_line,
+            char_start=block_start,
+            char_end=block_end,
             text=block_text,
         )
+
+    def split_paragraph(paragraph_start: int, paragraph_end: int):
+        cursor = paragraph_start
+        while paragraph_end - cursor > MAX_BLOCK_CHARS:
+            limit = cursor + MAX_BLOCK_CHARS
+            newline_cut = max(
+                (index + 1 for index in range(cursor, limit) if unit.text[index] == "\n"),
+                default=None,
+            )
+            if newline_cut is not None and newline_cut > cursor:
+                cut = newline_cut
+            else:
+                sentence_cuts = []
+                for index in range(cursor, limit):
+                    char = unit.text[index]
+                    if char in "。！？":
+                        sentence_cuts.append(index + 1)
+                    elif (
+                        char in ".!?"
+                        and index + 1 < paragraph_end
+                        and unit.text[index + 1].isspace()
+                    ):
+                        sentence_cuts.append(index + 1)
+                cut = sentence_cuts[-1] if sentence_cuts else limit
+            yield cursor, cut
+            cursor = cut
+        if cursor < paragraph_end:
+            yield cursor, paragraph_end
+
+    line_starts = [0]
+    for source_line in unit.text.splitlines(keepends=True):
+        line_starts.append(line_starts[-1] + len(source_line))
+
+    def emit_paragraph(paragraph_start: int, paragraph_end: int):
+        nonlocal ordinal
+        for block_start, block_end in split_paragraph(paragraph_start, paragraph_end):
+            block_text = unit.text[block_start:block_end]
+            if not block_text.strip():
+                continue
+            block = make_block(
+                block_start,
+                block_end,
+                bisect_right(line_starts, block_start),
+                bisect_right(line_starts, block_end - 1),
+            )
+            yield block
+            ordinal += 1
 
     for line_number, line in enumerate(unit.text.splitlines(keepends=True), start=1):
         if line.strip():
             if start_offset is None:
                 start_offset = offset
-                start_line = line_number
             end_offset = offset + len(line)
-            end_line = line_number
         elif start_offset is not None:
-            yield make_block()
-            ordinal += 1
+            yield from emit_paragraph(start_offset, end_offset)
             start_offset = None
         offset += len(line)
 
     if start_offset is not None:
-        yield make_block()
+        yield from emit_paragraph(start_offset, end_offset)

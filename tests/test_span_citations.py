@@ -132,9 +132,13 @@ def test_line_offsets_follow_original_unit(tmp_path, ending):
     assert citation.line_start == 3 and citation.line_end == 4
 
 
-def test_long_block_is_partitioned_without_deleting_or_rewriting_text(tmp_path):
+def test_long_block_is_partitioned_without_deleting_or_rewriting_text(tmp_path, monkeypatch):
     text = "中文條件" * 1200 + r"$\le $" + "n" * 4000
+    # Other parsers (e.g. Docling) can still yield one block longer than the span limit;
+    # lift the plain-text block limit so this test keeps exercising span partitioning.
+    monkeypatch.setattr("page_cite_rag.text.MAX_BLOCK_CHARS", 10**9)
     store, doc, blocks = fixture_store(tmp_path, text)
+    assert len(blocks) == 1
     spans = source_spans(blocks)
     assert len(spans) == 3 and "".join(span.text for span in spans) == text
     assert all(len(span.text) <= MAX_SPAN_CHARS for span in spans)

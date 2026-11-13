@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
-from time import perf_counter
-from typing import Callable, Literal, Sequence
+from typing import Literal
 
 from page_cite_rag.full_answer import FullAnswerWorkflow
 from page_cite_rag.hybrid import Retriever
-from page_cite_rag.models import Block
 from page_cite_rag.retrieval import SearchResult
 from page_cite_rag.retrieval_profile import FORMAL_RETRIEVAL
 from page_cite_rag.store import SQLiteDocumentStore
 from page_cite_rag.workflows import (
-    AgentUsage,
     AnswerResult,
     AnswerWorkflow,
     Language,
-    RetrievalTrace,
     WorkflowConfig,
     resolve_answer_language,
 )
@@ -160,7 +157,8 @@ def document_workflow(
     *,
     top_k: int = FORMAL_RETRIEVAL.final_k,
     neighbor_blocks: int = 0,
-    writer: Literal["structured", "quote_first", "quote_two_step"] = "structured",
+    writer: Literal["structured", "quote_first"] = "structured",
+    quote_first_revision: Literal["v1", "v3"] = "v1",
     answer_format: Literal["general", "short_answer", "multiple_choice"] = "general",
     prompt_revision: Literal["contract-consistent", "task-aligned-v5"] = ("contract-consistent"),
 ) -> AnswerWorkflow:
@@ -175,6 +173,7 @@ def document_workflow(
         answer_format=answer_format,
         writer=writer,
         prompt_revision=prompt_revision,
+        quote_first_revision=quote_first_revision,
     )
 
 
@@ -182,61 +181,6 @@ def ask_document(
     workflow: AnswerWorkflow, question: str, *, language: Language = "zh-Hant"
 ) -> AnswerResult:
     return workflow.ask(question, language=language)
-
-
-def plan_document_question(
-    workflow: FullAnswerWorkflow,
-    question: str,
-    *,
-    language: Language,
-    source_language: str,
-    scoped: bool = False,
-):
-    """Create the same answer-free ReadingPlan used by the quality evaluator.
-
-    ``scoped`` also asks whether the question needs the whole document (``ScopedReadingPlan``),
-    which routes it to section reading instead of the fixed retrieval path.
-    """
-    from page_cite_rag.reading_plan import ReadingPlan, ScopedReadingPlan, reading_plan_messages
-
-    outline = workflow.source_outline()
-    titles = tuple(
-        item.title for item in (outline.sections if outline is not None else ()) if item.title
-    )[:80]
-    messages = reading_plan_messages(
-        question,
-        source_language=(
-            source_language if source_language in {"en", "zh-Hant", "zh-Hans"} else "unknown"
-        ),
-        output_language=language,
-        outline_titles=titles,
-        with_scope=scoped,
-    )
-    model = workflow._model
-    if model is None:
-        raise ValueError("a model is required to create a reading plan")
-    generated = model.generate(messages, ScopedReadingPlan if scoped else ReadingPlan)
-    return generated.value
-
-
-def search_with_reading_plan(
-    workflow: FullAnswerWorkflow,
-    question: str,
-    plan,
-    *,
-    candidates_per_query: int = 2 * FORMAL_RETRIEVAL.candidates_per_branch,
-    fused_pool_size: int = 100,
-):
-    """Run the shared planned-query retrieval and materialize writer source blocks."""
-    search, _results, trace = search_planned_hybrid(
-        workflow._retriever,
-        question,
-        plan,
-        candidates_per_query=candidates_per_query,
-        fused_pool_size=fused_pool_size,
-    )
-    blocks = workflow._context_blocks(search, workflow._read_hits(search, question))
-    return search, blocks, trace
 
 
 def search_planned_hybrid(
@@ -307,44 +251,14 @@ def search_planned_hybrid(
     return search, results, trace
 
 
-def prepare_agent_question(
-    workflow: FullAnswerWorkflow,
-    question: str,
-    *,
-    language: Language,
-    source_language: str,
-):
-    """Use the shared planner, hybrid query routes and RRF before Agent navigation."""
-    if not _is_hybrid_retriever(workflow._retriever):
-        raise ValueError("the reading Agent requires an existing hybrid BM25+dense index")
-    plan = plan_document_question(
-        workflow,
-        question,
-        language=language,
-        source_language=source_language,
-    )
-    planned_workflow = workflow.with_reading_plan(plan)
-    search, blocks, retrieval_trace = search_with_reading_plan(planned_workflow, question, plan)
-    return (
-        planned_workflow,
-        search,
-        blocks,
-        {
-            "plan": plan.model_dump(mode="json"),
-            "plan_deviations": list(getattr(plan, "_deviations", ())),
-            "retrieval": retrieval_trace,
-        },
-    )
-
-
 @dataclass(frozen=True)
 class AgentAnswer:
     result: AnswerResult
     trace: dict
 
 
-Route = Literal["auto", "fixed", "whole-document"]
-ROUTES: tuple[str, ...] = ("auto", "fixed", "whole-document")
+Route = Literal["auto", "fixed", "agent"]
+ROUTES: tuple[str, ...] = ("auto", "fixed", "agent")
 
 
 def answer_question(
@@ -355,614 +269,64 @@ def answer_question(
     source_language: str = "unknown",
     route: Route = "auto",
 ) -> AgentAnswer:
-    """The single product entry, routed as in the plan 5.13 evaluation.
-
-    ``auto`` asks the scoped planner whether the question needs the whole document: a
-    lookup goes to fixed retrieval with the original question, a whole-document task to
-    section-note reading with the planned retrieval. A failed planner falls back to the
-    fixed path and says so in the trace, as in the evaluation. ``fixed`` skips the planner;
-    ``whole-document`` always reads by sections.
-    """
-    from page_cite_rag.generation import ModelError
+    """Select evidence using the shared writer admission and retrieval contracts."""
+    from page_cite_rag.gpu_retrieval import StagedGpuSearch
+    from page_cite_rag.retrieval_profile import RERANK_KEEP
 
     if route not in ROUTES:
-        raise ValueError("route must be auto, fixed or whole-document")
+        raise ValueError("route must be auto, fixed or agent")
     language = resolve_answer_language(question, language)
-    started = perf_counter()
-    from page_cite_rag.reading_plan import READING_PLAN_VERSION
-
-    trace: dict = {
-        "version": "routed-answer/v2",
-        "reading_plan_version": READING_PLAN_VERSION,
+    trace = {
+        "version": "routed-answer/v4",
         "requested_route": route,
+        "route": "fixed",
+        "reason": "requested" if route == "fixed" else "rerank_unavailable",
     }
-    if route == "fixed":
-        result = ask_document(workflow, question, language=language)
-        trace.update(route="fixed", reason="requested")
-        return AgentAnswer(result, trace)
-    if not _is_hybrid_retriever(workflow._retriever):
-        from page_cite_rag.retrieval import RetrievalError
+    if route == "agent":
+        from page_cite_rag.evidence_agent import run_evidence_agent
+        from page_cite_rag.ollama_backend import OllamaGgufClient
 
-        raise RetrievalError(
-            "routing and whole-document reading need the hybrid BM25+dense index; "
-            "build it or ask with route fixed"
-        )
-    outline = workflow.source_outline()
-    if outline is None or len(outline.sections) < 2:
-        # Section reading was validated on documents with an outline (Docling PDFs, Markdown
-        # headings); without one, never substitute another reader under its name.
-        if route == "whole-document":
-            from page_cite_rag.retrieval import RetrievalError
-
-            raise RetrievalError(
-                "whole-document reading needs the document's section outline; ingest PDFs "
-                "with Docling or ask with route fixed"
-            )
-        result = ask_document(workflow, question, language=language)
-        trace.update(route="fixed", reason="no_outline")
-        return AgentAnswer(result, trace)
-    try:
-        plan = plan_document_question(
-            workflow,
-            question,
-            language=language,
-            source_language=source_language
-            if source_language in {"en", "zh-Hant", "zh-Hans"}
-            else "unknown",
-            scoped=True,
-        )
-    except ModelError as error:
-        if route == "whole-document":
-            raise
-        result = ask_document(workflow, question, language=language)
-        trace.update(route="fixed", reason="planner_failed", planner_error=type(error).__name__)
-        return AgentAnswer(result, trace)
-    trace["plan"] = plan.model_dump(mode="json")
-    trace["plan_deviations"] = list(getattr(plan, "_deviations", ()))
-    from page_cite_rag.reading_plan import is_foreign_language_query
-
-    trace["dropped_foreign_queries"] = [
-        query
-        for need in plan.requirements
-        for query in need.queries
-        if is_foreign_language_query(query, question)
-    ]
-    if route == "auto" and plan.scope == "lookup":
-        result = ask_document(workflow, question, language=language)
-        trace.update(route="fixed", reason="planner_scope_lookup")
-        return AgentAnswer(result, trace)
-    planned = workflow.with_reading_plan(plan)
-    search, blocks, retrieval_trace = search_with_reading_plan(planned, question, plan)
-    reading = ask_with_agent(
-        planned,
-        question,
-        language=language,
-        initial_search=search,
-        initial_blocks=blocks,
-        strategy="outline",
-    )
-    agent = reading.trace["agent"]
-    titles = {s.section_id: s.title or "(untitled)" for s in outline.sections}
-
-    def named(key: str) -> list[str]:
-        return [titles.get(section_id, section_id) for section_id in agent.get(key, ())]
-
-    coverage = agent.get("point_coverage") or {}
-    trace.update(
-        route="whole_document",
-        reason="planner_scope_whole_document" if route == "auto" else "requested",
-        planned_retrieval=retrieval_trace,
-        reading_summary={
-            "sections_chosen": named("selected_section_ids"),
-            "sections_from_search": named("seed_section_ids"),
-            "sections_followed_up": named("follow_up_section_ids"),
-            "sections_read": named("read_section_ids"),
-            "notes": agent.get("reading_point_count", 0),
-            "notes_handed_to_writer": agent.get(
-                "writer_reading_point_count", agent.get("reading_point_count", 0)
-            ),
-            "notes_rejected_for_scope": sum(
-                p["reason"] == "requirement_scope" for p in agent.get("reader_rejected_points", ())
-            ),
-            "notes_not_in_answer": coverage.get("uncovered", 0),
-            "sources_skipped_for_read_limit": agent.get("sources_skipped_for_read_limit", 0),
-            "sources_skipped_for_budget": agent.get("sources_skipped_for_budget", 0),
-            "notes_omitted_for_writer_budget": agent.get("writer_omitted_point_count", 0),
-            # The scoped planner call plus every reading and writer call.
-            "model_calls": 1 + (agent.get("model_calls_attempted") or 0),
-            "navigation_degraded": agent.get("navigation_degraded", False),
-            "elapsed_seconds": round(perf_counter() - started, 1),
-        },
-        reading=reading.trace,
-    )
-    return AgentAnswer(reading.result, trace)
-
-
-def ask_with_agent(
-    workflow: FullAnswerWorkflow,
-    question: str,
-    *,
-    language: Language = "zh-Hant",
-    max_model_calls: int | None = None,
-    initial_search: SearchResult | None = None,
-    initial_blocks: Sequence[Block] | None = None,
-    on_model_call: Callable[[dict], bool | None] | None = None,
-    strategy: Literal["gap", "focus", "outline"] = "outline",
-) -> AgentAnswer:
-    """Read with one program-driven reader, then use the shared cited-answer writer.
-
-    ``outline`` (the product path) reads the sections chosen from the document outline and
-    notes, per window, what the task asks for; ``gap`` asks only which question parts are
-    missing and lets the program search and read; ``focus`` narrows the writer to the few
-    sources that state each need. One budget ledger covers reading and the writer.
-    """
-    from page_cite_rag.agent import (
-        AGENT_WRITER_RESERVE_SECONDS,
-        MAX_INTEGRATED_AGENT_CALL_INPUT_TOKENS,
-        MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS,
-        AgentRunFailure,
-        _AgentBudgetLedger,
-        _AgentBudgetStop,
-        _spans,
-    )
-    from page_cite_rag.gap_agent import (
-        READING_VERSION,
-        run_focus_reading,
-        run_gap_reading,
-        run_outline_reading,
-    )
-
-    if (initial_search is None) != (initial_blocks is None):
-        raise ValueError("initial search and source blocks must be supplied together")
-    language = resolve_answer_language(question, language)
-    search, blocks = (
-        workflow.search_sources(question)
-        if initial_search is None
-        else (initial_search, initial_blocks)
-    )
-    if search.document_id != workflow.document_id or search.query != question:
-        raise ValueError("initial search does not match the bound document and question")
-    blocks = workflow._context_blocks(search, blocks)
-    disable_rewrites = getattr(workflow._retriever, "disable_rewrites", None)
-    if callable(disable_rewrites):
-        disable_rewrites()
-    model = workflow._model
-    started = perf_counter()
-
-    def navigation_cooldown() -> float:
-        remaining_timeout = getattr(model, "remaining_request_timeout_seconds", None)
-        wait_for_headroom = getattr(model, "wait_for_gpu_headroom", None)
-        # A navigation call must afford its bounded GPU wait without spending the
-        # writer's reservation. Recheck after waiting: cooling is wall time too.
-        wait_limit = 120.0
-        gpu_wait = (
-            wait_limit
-            if callable(wait_for_headroom)
-            and getattr(getattr(model, "config", None), "device", None) != "cpu"
-            else 0.0
-        )
-        if (
-            callable(remaining_timeout)
-            and remaining_timeout() <= AGENT_WRITER_RESERVE_SECONDS + gpu_wait
-        ):
-            raise _AgentBudgetStop("writer_reserve_deadline")
-        waited = (
-            wait_for_headroom(timeout_seconds=wait_limit) if callable(wait_for_headroom) else 0.0
-        )
-        if callable(remaining_timeout) and remaining_timeout() <= AGENT_WRITER_RESERVE_SECONDS:
-            raise _AgentBudgetStop("writer_reserve_deadline")
-        return waited
-
-    output_limit = min(MAX_INTEGRATED_AGENT_CALL_OUTPUT_TOKENS, workflow._budget_config.num_predict)
-    if max_model_calls is not None and (type(max_model_calls) is not int or max_model_calls < 1):
-        raise ValueError("an optional reading model-call limit must be positive")
-    ledger = _AgentBudgetLedger(
-        model_call_limit=max_model_calls + 1 if max_model_calls is not None else None,
-        call_input_limit=MAX_INTEGRATED_AGENT_CALL_INPUT_TOKENS,
-        total_input_limit=None,
-        call_output_limit=output_limit,
-        total_output_limit=None,
-        tool_call_limit=None,
-    )
-    readers = {"gap": run_gap_reading, "focus": run_focus_reading, "outline": run_outline_reading}
-    if strategy not in readers:
-        raise ValueError("unknown reading strategy")
-    reading = readers[strategy](
-        workflow, question, language, search, blocks, cooldown=navigation_cooldown
-    )
-    for call in reading.trace["gap_model_calls"]:
-        ledger.admit(call["input_tokens"], workflow._budget_config.num_ctx)
-        ledger.complete(call["output_tokens"])
-    retrieval_trace = RetrievalTrace(
-        method=search.method,
-        index_id=search.index_id,
-        query=search.query,
-        hit_count=len(search.hits),
-        elapsed_ms=search.elapsed_ms,
-        query_plan=workflow._query_plan(),
-        branches=search.branches,
-    )
-    acquired = reading.acquired_context or reading.context
-    report = reading.structured_response
-    report_block_ids = {id for finding in report.requirements for id in finding.source_ids}
-    initial_writer_ids = tuple(reading.trace["initial_answer_block_ids"])
-    eligible_ids = set(initial_writer_ids)
-    read_ids: set[str] = set()
-    lookups: list[dict] = []
-    for event in reading.trace.get("tool_trace", ()):
-        if not isinstance(event, dict):
-            continue
-        need = event.get("information_need")
-        need_id = event.get("need_id")
-        source_ids = []
-        if event.get("tool") == "read_source" and event.get("status") in {
-            "ok",
-            "partial",
-            "invalid",
-            "skipped_prompt_budget",
-        }:
-            source_ids = [
-                value for value in event.get("returned_block_ids", ()) if isinstance(value, str)
-            ]
-            eligible_ids.update(source_ids)
-            read_ids.update(source_ids)
-        if isinstance(need, str) and need.strip():
-            lookups.append(
-                {
-                    "need_id": need_id if isinstance(need_id, str) else None,
-                    "need": need.strip()[:240],
-                    "acquired_block_ids": source_ids,
-                }
-            )
-
-    block_by_id = {block.block_id: block for block in acquired.blocks}
-    if reading.trace.get("navigation_degraded"):
-        eligible_ids.update(block.block_id for block in acquired.blocks)
-        read_ids.update(
-            block.block_id for block in acquired.blocks if block.block_id not in initial_writer_ids
-        )
-    # Successful reads are authoritative originals; fail closed if the agent trace
-    # claims a read that is absent from the returned, source-bound context.
-    try:
-        for block_id in eligible_ids:
-            if block_id not in block_by_id:
-                block_by_id[block_id] = workflow._read_block(block_id)
-        writer_blocks = tuple(
-            block_by_id[block_id]
-            for block_id in dict.fromkeys(
-                [
-                    *initial_writer_ids,
-                    *(
-                        block_id
-                        for event in reading.trace.get("tool_trace", ())
-                        if isinstance(event, dict)
-                        and event.get("tool") == "read_source"
-                        and event.get("status")
-                        in {"ok", "partial", "invalid", "skipped_prompt_budget"}
-                        for block_id in event.get("returned_block_ids", ())
-                        if isinstance(block_id, str)
-                    ),
-                    *(
-                        block.block_id
-                        for block in acquired.blocks
-                        if reading.trace.get("navigation_degraded")
-                    ),
-                ]
-            )
-            if block_id in eligible_ids
-        )
-    except Exception as exc:
-        failure_trace = dict(reading.trace)
-        failure_trace.update(failure_stage="writer_source_scope", failure_type=type(exc).__name__)
-        raise AgentRunFailure(type(exc).__name__, failure_trace) from exc
-    groups_by_id = {
-        group.chunk_index: group
-        for group in (*search.context_groups, *acquired.context_groups)
-        if set(group.source_block_ids).issubset(eligible_ids)
-    }
-    required_ids = set(report_block_ids)
-    if report_block_ids:
-        # Report anchors are required, but initial context remains available to
-        # fill the budget. Preserve complete native groups around those anchors.
-        required_ids.update(
-            id
-            for group in groups_by_id.values()
-            if report_block_ids.intersection(group.source_block_ids)
-            for id in group.source_block_ids
-        )
-        new_required_ids = report_block_ids - set(initial_writer_ids)
-        groups_by_id = dict(
-            sorted(
-                groups_by_id.items(),
-                key=lambda item: (
-                    not bool(new_required_ids.intersection(item[1].source_block_ids)),
-                    not bool(report_block_ids.intersection(item[1].source_block_ids)),
-                    not bool(read_ids.intersection(item[1].source_block_ids)),
-                ),
-            )
-        )
-        writer_blocks = tuple(
-            sorted(
-                writer_blocks,
-                key=lambda block: (
-                    block.block_id not in new_required_ids,
-                    block.block_id not in required_ids,
-                    block.block_id not in read_ids,
-                ),
-            )
-        )
-    writer_context_groups = tuple(groups_by_id.values())
-    if writer_context_groups:
-        grouped_ids = {
-            block_id for group in writer_context_groups for block_id in group.source_block_ids
-        }
-        if grouped_ids != {block.block_id for block in writer_blocks}:
-            # Do not mix contextual chunk text with partial source groups. Plain
-            # blocks remain complete originals and retain their exact citations.
-            writer_context_groups = ()
-    spans = _spans(writer_blocks)
-    source_ids_by_block: dict[str, list[str]] = {}
-    for source_id, span in spans.items():
-        source_ids_by_block.setdefault(span.block_id, []).append(source_id)
-    initial_ids = set(initial_writer_ids)
-    for finding in report.requirements:
-        available = {
-            source_id
-            for block_id in finding.source_ids
-            for source_id in source_ids_by_block[block_id]
-        }
-        if finding.source_span_ids and not set(finding.source_span_ids).issubset(available):
-            # T4 H14 hard: reader spans and inference citations must belong to document originals.
-            raise ValueError("reader span handles do not belong to its handed-off originals")
-    handoff = {
-        "version": "navigation-handoff/v2",
-        "status": "unverified",
-        "navigation_degraded": reading.trace.get("navigation_degraded", False),
-        "navigation_failure_type": reading.trace.get("navigation_failure_type"),
-        "reading_report": {
-            "requirements": [
-                {
-                    "need_id": finding.need_id,
-                    "need": finding.need,
-                    "observation": finding.observation,
-                    "source_ids": finding.source_span_ids
-                    or [
-                        source_id
-                        for block_id in finding.source_ids
-                        for source_id in source_ids_by_block[block_id]
-                    ],
-                }
-                for finding in report.requirements
-            ],
-            "unresolved": report.unresolved,
-        },
-        "reader_note_status": reading.trace.get("navigation_handoff_note_status"),
-        "reader_note_sha256": reading.trace.get("navigation_handoff_note_sha256"),
-        "initial_source_ids": [
-            source_id
-            for block in writer_blocks
-            if block.block_id in initial_ids
-            for source_id in source_ids_by_block.get(block.block_id, ())
-        ],
-        "lookups": [
+        retriever = workflow._retriever
+        if not isinstance(retriever, StagedGpuSearch) or retriever.method != "hybrid":
+            raise ValueError("agent requires --native-gpu and --method hybrid")
+        if retriever.reranker_model_path is not None:
+            raise ValueError("agent requires retrieval without reranking")
+        if not isinstance(workflow._model, OllamaGgufClient):
+            raise ValueError("agent requires --backend pinned-ollama (OllamaGgufClient)")
+        with retriever.session():
+            run = run_evidence_agent(workflow, workflow._model, question, language=language)
+        trace.update(route="agent", reason="requested")
+        trace.update(
             {
-                "need_id": item["need_id"],
-                "need": item["need"],
-                "acquired_source_ids": [
-                    source_id
-                    for block_id in item["acquired_block_ids"]
-                    for source_id in source_ids_by_block.get(block_id, ())
-                ],
-                "state": (
-                    "acquired_unverified"
-                    if any(
-                        block_id in source_ids_by_block for block_id in item["acquired_block_ids"]
+                "agent_version": run.trace["version"],
+                "model_calls": len(run.trace["model_calls"]),
+                **{
+                    key: run.trace[key]
+                    for key in (
+                        "tool_call_repairs",
+                        "handoff_reason",
+                        "search_steps",
+                        "token_usage",
                     )
-                    else "not_read_or_unresolved"
-                ),
+                },
             }
-            for item in lookups[:8]
-        ],
-    }
-    writer_call: dict = {"role": "writer", "status": "not_started"}
-
-    def before_writer(budget) -> None:
-        if type(budget.exact_input_tokens) is not int:
-            raise ValueError("writer input token count is not exact")
-        if budget.output_reserved != ledger.call_output_limit:
-            raise ValueError("writer output reservation differs from the shared agent ledger")
-        writer_call.update(
-            call_index=ledger.model_calls + 1,
-            input_tokens_exact=budget.exact_input_tokens,
-            output_token_limit=budget.output_reserved,
-            status="ready_to_dispatch",
         )
-        if on_model_call is not None and on_model_call(dict(writer_call)) is False:
-            writer_call["status"] = "blocked_before_dispatch"
-            on_model_call(dict(writer_call))
-            raise _AgentBudgetStop("global_generation_budget")
-        ledger.admit(budget.exact_input_tokens, workflow._budget_config.num_ctx)
-        writer_call.update(
-            call_index=ledger.model_calls,
-            input_tokens_exact=budget.exact_input_tokens,
-            output_token_limit=budget.output_reserved,
-            status="dispatched",
-        )
-        if on_model_call is not None:
-            on_model_call(dict(writer_call))
-
-    def after_writer(stats) -> None:
-        ledger.input_tokens += stats.prompt_eval_count - writer_call["input_tokens_exact"]
-        ledger.complete(stats.eval_count)
-        writer_call.update(
-            input_tokens_local=writer_call["input_tokens_exact"],
-            input_tokens_exact=stats.prompt_eval_count,
-            output_tokens_observed=stats.eval_count,
-            elapsed_ms=stats.elapsed_ms,
-            status="completed",
-        )
-        if on_model_call is not None:
-            on_model_call(dict(writer_call))
-
-    # Preserve need coverage while the writer reasons from the original evidence;
-    # free-text reader notes remain available in the trace only.
-    writer_workflow = (
-        workflow.with_requirement_coverage(True) if strategy == "outline" else workflow
-    )
-    try:
-        if writer_blocks:
-            result = writer_workflow.answer_from_agent_context(
-                question,
-                writer_blocks,
-                navigation_handoff=handoff,
-                language=language,
-                context_groups=writer_context_groups,
-                required_block_ids=tuple(required_ids),
-                before_generation=before_writer,
-                after_generation=after_writer,
+        return AgentAnswer(run.answer, trace)
+    if route == "auto":
+        if workflow.whole_document_fits(question, language=language):
+            result = workflow.answer_from_context(
+                question, workflow._store.get_blocks(workflow.document_id), language=language
             )
-        else:
-            result = workflow.answer_from_context(question, (), language=language)
-        if reading.trace.get("navigation_report_partial"):
-            if reading.trace.get("navigation_failure_type") == "writer_reserve_deadline":
-                limitation = (
-                    "為保留作答時間，閱讀已提前結束；本回答依已讀原文生成，可能未涵蓋全部內容。"
-                    if language == "zh-Hant"
-                    else (
-                        "Reading ended early to reserve time for the answer; this answer "
-                        "uses the sources already read and may be incomplete."
-                    )
-                )
-            else:
-                limitation = (
-                    "Agent 未能完成結構化閱讀報告；本回答僅依可驗證原文生成，內容可能不完整。"
-                    if language == "zh-Hant"
-                    else (
-                        "The Agent could not complete its structured reading report; this answer "
-                        "uses verified originals and may be incomplete."
-                    )
-                )
-            # Keep the writer's own status; degradation is a separate trace field.
-            result = result.model_copy(update={"limitations": (*result.limitations, limitation)})
-        result = result.model_copy(
-            update={
-                "retrieval": retrieval_trace,
-                "elapsed_ms": (perf_counter() - started) * 1000,
-            }
-        )
-    except Exception as exc:
-        failure_trace = dict(reading.trace)
-        failure_trace.update(
-            failure_stage="common_writer",
-            failure_type=type(exc).__name__,
-            writer_call=writer_call,
-            writer_source_block_ids=[block.block_id for block in writer_blocks],
-            navigation_handoff=handoff,
-            agent_input_tokens_exact=ledger.input_tokens,
-            agent_output_tokens_observed=(
-                ledger.output_tokens if ledger.output_usage_complete else None
-            ),
-            agent_output_tokens_reserved=ledger.output_tokens + ledger.output_reserved_tokens,
-            agent_output_tokens_unobserved_reserved=ledger.output_reserved_tokens,
-            model_calls_attempted=ledger.model_calls,
-        )
-        if accounting := getattr(exc, "accounting", None):
-            failure_trace["writer_failure_accounting"] = accounting.model_dump(mode="json")
-        raise AgentRunFailure(type(exc).__name__, failure_trace) from exc
-
-    # Plan 5.13: a code check of which reading notes reached the answer. Recorded only; a
-    # one-shot rewrite (5.13) and an add-only supplement call (5.15) by the same 9B writer
-    # both failed their development checks.
-    points = reading.trace.get("writer_reading_points", reading.trace.get("reading_points")) or ()
-    coverage = (
-        _point_coverage(result, points)
-        if strategy == "outline" and writer_call["status"] == "completed" and points
-        else None
-    )
-
-    if writer_call["status"] == "completed":
-        usage = AgentUsage(
-            model_calls=ledger.model_calls,
-            tool_calls=reading.trace["tool_calls_recorded"],
-            input_tokens=ledger.input_tokens,
-            output_tokens=ledger.output_tokens if ledger.output_usage_complete else None,
-            output_tokens_reserved=ledger.output_reserved_tokens,
-            output_usage_complete=ledger.output_usage_complete,
-            final_input_tokens=writer_call["input_tokens_exact"],
-            final_output_tokens=writer_call["output_tokens_observed"],
-            final_output_limit=writer_call["output_token_limit"],
-        )
-        result = result.model_copy(
-            update={
-                "agent_usage": usage,
-                "prompt_version": (
-                    READING_VERSION if strategy == "outline" else "agentic-reading-v2"
-                ),
-            }
-        )
-
-    agent_trace = dict(reading.trace)
-    writer_completed = writer_call["status"] == "completed"
-    agent_trace.update(
-        {
-            "architecture": "single_agent_navigation_with_shared_writer",
-            "response_strategy": "navigation_handoff_then_common_writer",
-            "agent_budget_scope": "single_agent_navigation_and_shared_writer",
-            "model_calls_attempted": ledger.model_calls,
-            "model_calls_completed": reading.trace["model_calls_completed"] + int(writer_completed),
-            "model_call_limit": ledger.model_call_limit,
-            "agent_input_tokens_exact": ledger.input_tokens,
-            "agent_output_tokens_observed": (
-                ledger.output_tokens if ledger.output_usage_complete else None
-            ),
-            "agent_output_tokens_reserved": ledger.output_tokens + ledger.output_reserved_tokens,
-            "agent_output_tokens_unobserved_reserved": ledger.output_reserved_tokens,
-            "writer_call": writer_call,
-            "point_coverage": coverage,
-            "claim_ids": [claim.claim_id for claim in result.claims],
-            "requirement_coverage": [
-                item.model_dump(mode="json") for item in result.requirement_coverage
-            ],
-            "claim_duplicates_removed": result.claim_duplicates_removed,
-            "output_deviations": list(result.output_deviations),
-            "writer_source_block_ids": [block.block_id for block in writer_blocks],
-            "writer_context_group_ids": [group.chunk_index for group in writer_context_groups],
-            "navigation_handoff": handoff,
-            "final_model_call": writer_call if writer_completed else None,
-            "final_answer_input_tokens": writer_call.get("input_tokens_exact"),
-            "selected_block_ids": list(result.included_block_ids),
-            "omitted_block_ids": list(result.omitted_block_ids),
-            "total_elapsed_ms": result.elapsed_ms,
-        }
-    )
-    return AgentAnswer(
-        result,
-        {
-            "version": "agentic-reading-v2",
-            "strategy": "single_agent_navigation_then_shared_writer",
-            "agent": agent_trace,
-        },
-    )
-
-
-def _cited_block_ids(result: AnswerResult) -> set[str]:
-    return {citation.block_id for claim in result.claims for citation in claim.citations}
-
-
-def _point_coverage(result: AnswerResult, points) -> dict:
-    """Which reading notes the answer cites at least one source of (code check, no model)."""
-    cited = _cited_block_ids(result)
-    uncovered = [
-        index
-        for index, point in enumerate(points)
-        if point["block_ids"] and not cited.intersection(point["block_ids"])
-    ]
-    return {
-        "version": "reading-point-coverage/v2",
-        "points": len(points),
-        "uncovered": len(uncovered),
-        "uncovered_point_indices": uncovered,
-    }
+            trace.update(route="whole_document_context", reason="fits_context")
+            return AgentAnswer(result, trace)
+        if (
+            isinstance(workflow._retriever, StagedGpuSearch)
+            and workflow._retriever.reranker_model_path is not None
+        ):
+            workflow = copy(workflow)
+            workflow.config = workflow.config.model_copy(update={"top_k": RERANK_KEEP})
+            trace.update(route="reranked", reason="whole_document_exceeds_context")
+    return AgentAnswer(ask_document(workflow, question, language=language), trace)
 
 
 def explain_source(

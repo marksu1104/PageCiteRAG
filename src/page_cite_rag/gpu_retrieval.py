@@ -17,6 +17,7 @@ from page_cite_rag.embedding import DEFAULT_MODEL_DIR
 from page_cite_rag.embedding_native import NativeEmbeddingEncoder
 from page_cite_rag.embedding_server import NativeEmbeddingServer, verify_native_model
 from page_cite_rag.retrieval import SearchResult
+from page_cite_rag.retrieval_profile import RERANK_POOL
 from page_cite_rag.store import SQLiteDocumentStore
 
 
@@ -121,7 +122,7 @@ class StagedGpuSearch:
             cancel = self._rerank_cancel = threading.Event()
         try:
             # Exit embedding before starting reranking; cancellation covers both stages.
-            result = self._query(question, max(top_k, 40), lexical_query=lexical_query)
+            result = self._query(question, max(top_k, RERANK_POOL), lexical_query=lexical_query)
             if cancel.is_set():
                 raise RuntimeError("reranked search was cancelled")
             with NativeRerankerServer(

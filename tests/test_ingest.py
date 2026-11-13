@@ -12,6 +12,7 @@ from page_cite_rag.cli import main
 from page_cite_rag.ingest import DocumentIngestError, prepare_source
 from page_cite_rag.models import DocumentMetadata, ParsedUnit
 from page_cite_rag.store import SQLiteDocumentStore, StoreError
+from page_cite_rag.text import MAX_BLOCK_CHARS, iter_blocks
 
 
 @pytest.mark.parametrize(
@@ -172,6 +173,56 @@ def test_text_ingestion_preserves_source_and_block_offsets(
     assert duplicate.duplicate is True
     assert reopened_store.count_documents() == 1
     assert len(reopened_store.get_blocks(prepared.document.document_id)) == 3
+    assert prepared.document.parser_version == "utf8-paragraph-v2"
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".md"])
+def test_long_single_newline_paragraphs_are_split_with_exact_offsets(tmp_path, suffix):
+    source_text = "\n".join(f"Paragraph {index}: " + ("detail " * 20) for index in range(30))
+    source = tmp_path / f"long{suffix}"
+    source.write_text(source_text, encoding="utf-8", newline="")
+    prepared = prepare_source(source)
+    unit = next(prepared.iter_units())
+    blocks = list(iter_blocks(prepared.document, unit, 1))
+
+    assert len(blocks) > 1
+    assert all(len(block.text) <= MAX_BLOCK_CHARS for block in blocks)
+    assert all(unit.text[block.char_start : block.char_end] == block.text for block in blocks)
+    covered_counts = [0] * len(unit.text)
+    for block in blocks:
+        for index in range(block.char_start, block.char_end):
+            covered_counts[index] += 1
+    for index, char in enumerate(unit.text):
+        if not char.isspace():
+            assert covered_counts[index] == 1
+    assert prepared.document.parser_version == "utf8-paragraph-v2"
+
+
+def test_long_single_line_splits_at_sentence_boundaries_and_hard_cuts(tmp_path):
+    source_text = "First sentence. " + ("Useful sentence! " * 180) + "尾句。"
+    source = tmp_path / "one-line.txt"
+    source.write_text(source_text, encoding="utf-8", newline="")
+    prepared = prepare_source(source)
+    unit = next(prepared.iter_units())
+    blocks = list(iter_blocks(prepared.document, unit, 1))
+
+    assert len(blocks) > 1
+    assert all(len(block.text) <= MAX_BLOCK_CHARS for block in blocks)
+    assert all(source_text[block.char_start : block.char_end] == block.text for block in blocks)
+    assert any(block.text.endswith("!") for block in blocks[:-1])
+    assert all(block.line_start == block.line_end == 1 for block in blocks)
+
+    chinese = "中文句子。" * 500
+    unit = unit.model_copy(update={"text": chinese})
+    blocks = list(iter_blocks(prepared.document, unit, 1))
+    assert all(len(block.text) <= MAX_BLOCK_CHARS for block in blocks)
+    assert all(block.text.endswith("。") for block in blocks[:-1])
+
+    hard = "x" * (MAX_BLOCK_CHARS + 17)
+    unit = unit.model_copy(update={"text": hard})
+    blocks = list(iter_blocks(prepared.document, unit, 1))
+    assert [len(block.text) for block in blocks] == [MAX_BLOCK_CHARS, 17]
+    assert "".join(block.text for block in blocks) == hard
 
 
 def test_empty_text_is_stored_as_visible_no_text_status(tmp_path) -> None:
@@ -292,6 +343,7 @@ def test_pdf_spacing_default_and_stream_order_have_distinct_source_identity(
     assert geometric_ratio.document.document_id == default.document.document_id
     assert "use-text-flow-false;x-tolerance-ratio-0.15" in default.document.parser_version
     assert "use-text-flow-true;x-tolerance-ratio-0.15" in flowed.document.parser_version
+    assert default.document.parser_version.endswith(";blocks-v2")
     assert list(default.iter_units())[0].text.splitlines()[0] == "LEFT first. RIGHT first."
     assert list(flowed.iter_units())[0].text == (
         "LEFT first.\nLEFT NOT 65.\nRIGHT first.\nRIGHT 90."

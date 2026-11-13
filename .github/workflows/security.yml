@@ -52,7 +52,7 @@ jobs:
         run: |
           requirements_file="$RUNNER_TEMP/requirements-${AUDIT_PROFILE}.txt"
           if [ "$AUDIT_PROFILE" = ci ]; then
-            uv -q export --locked --no-default-groups --group dev --group eval --extra api --extra gpu-embed --extra agent --no-emit-project --output-file "$requirements_file" >/dev/null
+            uv -q export --locked --no-default-groups --group dev --group eval --extra api --extra gpu-embed --extra agent --extra mcp --no-emit-project --output-file "$requirements_file" >/dev/null
             uv run --no-sync pip-audit --strict --disable-pip --require-hashes --requirement "$requirements_file"
           else
             uv -q export --locked --no-default-groups --extra "$AUDIT_PROFILE" --no-emit-project --output-file "$requirements_file" >/dev/null

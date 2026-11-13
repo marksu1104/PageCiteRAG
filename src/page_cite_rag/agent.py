@@ -1,8 +1,6 @@
 """Shared reading-agent primitives: budgets, findings, admission and citation handles.
 
-The section-note reader (gap_agent.py) and the evaluation runner use these. The earlier
-LangChain tool-calling loop and the source-review agents were removed after plan 5.13/5.14
-validated section reading; their code and results remain in git history and outputs.
+The evaluation runner and retained evidence workflows use these shared primitives.
 """
 
 from __future__ import annotations

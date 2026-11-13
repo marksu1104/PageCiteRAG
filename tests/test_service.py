@@ -140,14 +140,15 @@ def test_service_routes_asks_through_the_shared_entry(prepared, monkeypatch):
         answer = service.submit("ask", "significant")[1].result(timeout=5)
         assert answer.trace.reading_trace["version"] == "routed-answer/v1"
         assert calls[0]["route"] == "auto" and calls[0]["source_language"] == "en"
-        with pytest.raises(ValueError, match="validated retrieval profile"):
+        with pytest.raises(ValueError, match="--rewrite-query and --rerank apply to --route fixed"):
             service.submit("ask", "significant", rewrite_query=True)
-    with pytest.raises(ValueError, match="routing needs the hybrid index"):
-        DocumentService(
-            ServiceConfig(database_path=database, document_id=document_id, route="auto"),
-            config,
-            lambda: FakeClient(config),
-        )
+    with DocumentService(
+        ServiceConfig(database_path=database, document_id=document_id, route="auto"),
+        config,
+        lambda: FakeClient(config),
+    ) as service:
+        answer = service.submit("ask", "significant")[1].result(timeout=5)
+        assert answer.result.status == "answered"
 
 
 def test_queue_full_cancel_waiter_and_active_owned_model_only(prepared):
@@ -677,3 +678,39 @@ def test_owned_native_server_checks_external_cancel_signal():
     server._cancel_event.set()
     with pytest.raises(RetrievalError, match="cancelled"):
         server._check_cancelled()
+
+
+@pytest.mark.parametrize("answer_format", ["general", "short"])
+@pytest.mark.parametrize("route", ["fixed", "auto", "agent"])
+def test_service_answer_format_reaches_shared_workflow(prepared, monkeypatch, answer_format, route):
+    from page_cite_rag import application
+    from page_cite_rag import service as service_module
+
+    database, document_id, _ = prepared
+    config = GenerationConfig()
+    captured = []
+    original = service_module.document_workflow
+
+    def workflow(*args, **kwargs):
+        captured.append((kwargs["writer"], kwargs["answer_format"]))
+        return original(*args, **kwargs)
+
+    def answer(workflow, question, **kwargs):
+        raise ValueError("writer checked")
+
+    monkeypatch.setattr(service_module, "document_workflow", workflow)
+    monkeypatch.setattr(application, "answer_question", answer)
+    settings = ServiceConfig(
+        database_path=database, document_id=document_id, route=route, answer_format=answer_format
+    )
+    assert ServiceConfig(database_path=database, document_id=document_id).route == "fixed"
+    assert ServiceConfig(database_path=database, document_id=document_id).answer_format == "general"
+    with DocumentService(settings, config, lambda: FakeClient(config)) as service:
+        with pytest.raises(ValueError, match="writer checked"):
+            service.submit("ask", "question")[1].result(timeout=5)
+    assert captured == [
+        (
+            "quote_first" if route == "agent" or answer_format == "short" else "structured",
+            "short_answer" if answer_format == "short" else "general",
+        )
+    ]

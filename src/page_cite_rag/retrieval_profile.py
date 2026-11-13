@@ -10,6 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 MAX_CONTEXT_GROUPS = 100
+# 2026-11-13 開發資料零生成檢查：池 200 取 20 段證據全到 0.417，
+# 舊池 40 取 20 段 0.350。
+RERANK_POOL = 200
+RERANK_CANDIDATES_PER_BRANCH = 100
+RERANK_KEEP = 20
 
 
 @dataclass(frozen=True)

@@ -97,11 +97,11 @@ def prepare_source(
     if suffix == ".txt":
         media_type = "text/plain"
         parser_name = "plain_text"
-        parser_version = "utf8-paragraph-v1"
+        parser_version = "utf8-paragraph-v2"
     elif suffix in {".md", ".markdown"}:
         media_type = "text/markdown"
         parser_name = "markdown"
-        parser_version = "utf8-paragraph-v1"
+        parser_version = "utf8-paragraph-v2"
     elif suffix == ".pdf":
         media_type = "application/pdf"
         parser_name = "pdfplumber"
@@ -111,7 +111,7 @@ def prepare_source(
             parser_version = (
                 f"pdfplumber-{version('pdfplumber')};extract-v2;"
                 f"use-text-flow-{str(pdf_reading_order == 'text-flow').lower()};"
-                f"x-tolerance-ratio-{effective_ratio:g};y-tolerance-3;layout-false"
+                f"x-tolerance-ratio-{effective_ratio:g};y-tolerance-3;layout-false;blocks-v2"
             )
             with pdfplumber.open(path) as pdf:
                 page_count = len(pdf.pages)

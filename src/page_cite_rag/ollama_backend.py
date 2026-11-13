@@ -98,6 +98,13 @@ class OllamaGgufClient(LlamaModelClient):
             ),
         }
 
+    thinking_control = "reasoning_effort_none"
+
+    @property
+    def chat_model_name(self) -> str:
+        """The pinned model name for OpenAI-compatible chat consumers."""
+        return self._ollama_model
+
     def chat_completions_base_url(self) -> str:
         """Return the owned server's OpenAI-compatible endpoint after a health check."""
         self._ensure_running()

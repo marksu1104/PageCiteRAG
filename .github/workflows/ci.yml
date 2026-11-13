@@ -31,7 +31,7 @@ jobs:
           python-version: "3.11"
           enable-cache: false
       - name: Install tested CPU features
-        run: uv sync --locked --no-default-groups --group dev --group eval --extra api --extra gpu-embed --extra agent --no-editable
+        run: uv sync --locked --no-default-groups --group dev --group eval --extra api --extra gpu-embed --extra agent --extra mcp --no-editable
       - name: Lint and formatting
         run: |
           uv run --no-sync ruff check --no-cache src scripts tests

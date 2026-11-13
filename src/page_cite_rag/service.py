@@ -57,9 +57,9 @@ class ServiceConfig(BaseModel):
     queue_capacity: int = Field(default=2, ge=0, le=8)
     request_timeout_seconds: float = Field(default=600, gt=1, le=600)
     idle_seconds: float = Field(default=300, gt=0, le=300)
-    # Plan 5.13/5.14: auto routes whole-document questions to section reading. The product
-    # default (auto) is set by `page-cite-rag serve`; a bare config stays on fixed retrieval.
-    route: Literal["auto", "fixed", "whole-document"] = "fixed"
+    # The CLI defaults to auto; direct service callers keep fixed retrieval.
+    route: Literal["auto", "fixed", "agent"] = "fixed"
+    answer_format: Literal["general", "short"] = "general"
 
 
 class ServiceTrace(BaseModel):
@@ -147,8 +147,6 @@ class DocumentService:
         staged_search: Retriever | Callable[[str, int], SearchResult] | None = None,
     ) -> None:
         self.config = config
-        if config.route != "fixed" and config.method != "hybrid":
-            raise ValueError("routing needs the hybrid index; serve with hybrid or route fixed")
         self.model_config = model_config
         self._model_factory = model_factory
         self._staged_search = (
@@ -263,7 +261,7 @@ class DocumentService:
         if rewrite_query and (mode != "ask" or self.config.method == "dense"):
             raise ValueError("query rewriting requires BM25 or hybrid ask")
         if self.config.route != "fixed" and rewrite_query:
-            raise ValueError("routing uses the validated retrieval profile; disable rewrite_query")
+            raise ValueError("--rewrite-query and --rerank apply to --route fixed")
         question.encode("utf-8")
         if mode == "explain":
             if block_id is None:
@@ -391,29 +389,25 @@ class DocumentService:
             self.model_config,
             top_k=self.config.top_k,
             neighbor_blocks=(self.config.neighbor_blocks if job.mode == "explain" else 0),
+            writer=(
+                "quote_first"
+                if self.config.route == "agent" or self.config.answer_format == "short"
+                else "structured"
+            ),
+            answer_format=("short_answer" if self.config.answer_format == "short" else "general"),
         )
         started = time.perf_counter()
         reading_trace = None
         if job.mode == "ask":
-            from contextlib import nullcontext
-
             from page_cite_rag.application import answer_question
 
-            session = (
-                self._staged_search.session()
-                if self.config.route != "fixed"
-                and self._staged_search is not None
-                and self._staged_search.reranker_model_path is None
-                else nullcontext()
+            routed = answer_question(
+                workflow,
+                job.question,
+                language=job.language,
+                source_language=self._source_language,
+                route=self.config.route,
             )
-            with session:
-                routed = answer_question(
-                    workflow,
-                    job.question,
-                    language=job.language,
-                    source_language=self._source_language,
-                    route=self.config.route,
-                )
             reading_trace = routed.trace
             result = routed.result
             if self._staged_search is not None:

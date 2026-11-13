@@ -21,7 +21,7 @@ from page_cite_rag.ingest import (
     DocumentIngestError,
     prepare_source,
 )
-from page_cite_rag.retrieval_profile import FORMAL_RETRIEVAL
+from page_cite_rag.retrieval_profile import FORMAL_RETRIEVAL, RERANK_CANDIDATES_PER_BRANCH
 from page_cite_rag.store import SQLiteDocumentStore, StoreError
 from page_cite_rag.text import TokenBlockFactory
 
@@ -80,7 +80,7 @@ def _run_doctor(as_json: bool) -> int:
 def _run_ingest(args: argparse.Namespace) -> int:
     try:
         # PDFs default to Docling, the validated parser: it keeps the outline that
-        # whole-document reading needs. pdfplumber stays available on request.
+        # document navigation uses. pdfplumber stays available on request.
         parser = args.parser
         if parser == "auto":
             parser = "docling" if Path(args.source).suffix.lower() == ".pdf" else "text"
@@ -508,40 +508,14 @@ def _run_model(args: argparse.Namespace) -> int:
 
 # Plan 5.13 validated the pinned GGUF on the owned Ollama server; it is the default.
 OWNED_BACKENDS = ("pinned-ollama", "llama")
-# One CLI request may run up to an hour on a CPU-only machine (whole-document reading
-# makes about 10-20 model calls); the default stays 600 s and the local API stays at 600 s.
+# The CLI permits up to an hour; its default and the local API limit stay at 600 s.
 MAX_CLI_REQUEST_SECONDS = 3600
-_PROGRESS_LABELS = {
-    "ScopedReadingPlan": "planning the question",
-    "ReadingPlan": "planning the question",
-    "OutlineSelection": "choosing sections from the outline",
-    "SectionPoints": "reading sections and taking notes",
-    "FollowUpSelection": "checking what the notes refer back to",
-}
-
-
-class _ProgressModel:
-    """Forward to the model client and, on a terminal, say what each model call is for."""
-
-    def __init__(self, model, stream) -> None:
-        self._model = model
-        self._stream = stream
-        self._calls = 0
-
-    def __getattr__(self, name):
-        return getattr(self._model, name)
-
-    def generate(self, messages, response_model, *args, **kwargs):
-        self._calls += 1
-        label = _PROGRESS_LABELS.get(response_model.__name__, "writing the cited answer")
-        print(f"[{self._calls}] {label}...", file=self._stream, flush=True)
-        return self._model.generate(messages, response_model, *args, **kwargs)
 
 
 def _generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--backend",
-        choices=("pinned-ollama", "llama", "ollama"),
+        choices=("pinned-ollama", "llama", "ollama", "api"),
         default="pinned-ollama",
         help=(
             "pinned-ollama (default) and llama serve the pinned, hash-checked GGUF from an "
@@ -549,6 +523,10 @@ def _generation_options(parser: argparse.ArgumentParser) -> None:
             "your own Ollama server and --llm-model: an unvalidated configuration."
         ),
     )
+    parser.add_argument("--api-base", help="Explicit OpenAI-compatible HTTPS API base URL.")
+    parser.add_argument("--api-model", help="Explicit cloud model name (--backend api).")
+    parser.add_argument("--api-key-env", default="PAGECITE_API_KEY")
+    parser.add_argument("--api-max-calls", type=_positive_integer, default=100)
     parser.add_argument(
         "--token-budget",
         choices=("conservative", "exact"),
@@ -593,17 +571,45 @@ def _generation_config(args: argparse.Namespace):
     from page_cite_rag.generation import DEFAULT_LLM, GenerationConfig
 
     if args.token_budget is None:
-        args.token_budget = "exact" if args.backend in OWNED_BACKENDS else "conservative"
+        args.token_budget = (
+            "exact"
+            if args.backend in OWNED_BACKENDS
+            or (args.command in ("serve", "mcp") and args.backend != "api")
+            else "conservative"
+        )
     if args.token_budget == "exact" and args.backend not in OWNED_BACKENDS:
         raise ValueError("exact token budget requires an owned backend (pinned-ollama or llama)")
     if args.llm_model is not None and args.backend != "ollama":
         raise ValueError("--llm-model selects a model on your own Ollama (--backend ollama)")
 
-    if args.gpu_temperature_limit is not None and (
-        args.backend not in OWNED_BACKENDS or args.device != "cuda"
+    api_retrieval = args.backend == "api" and (
+        getattr(args, "native_gpu", False)
+        or getattr(args, "embedding_backend", None) == "native-gpu"
+    )
+    if (
+        args.gpu_temperature_limit is not None
+        and not api_retrieval
+        and (args.backend not in OWNED_BACKENDS or args.device != "cuda")
     ):
         raise ValueError("--gpu-temperature-limit requires an owned backend on CUDA")
 
+    if args.backend == "api":
+        from page_cite_rag.api_backend import validate_api_base
+        from page_cite_rag.generation import ModelError
+
+        if not args.api_base:
+            raise ModelError("--api-base is required for --backend api")
+        validate_api_base(args.api_base)
+        if not args.api_model or not args.api_model.strip():
+            raise ModelError("--api-model is required for --backend api")
+        if args.bundle_dir is not None or args.llm_host != "http://127.0.0.1:11435":
+            raise ModelError("--backend api does not use --bundle-dir or --llm-host")
+        return GenerationConfig(
+            num_ctx=args.context_window,
+            num_predict=args.output_tokens,
+            timeout_seconds=args.generation_timeout,
+            num_thread=args.llm_threads,
+        )
     if args.backend == "ollama":
         if args.device != "cpu" or args.gpu_uuid is not None or args.bundle_dir is not None:
             raise ValueError("your own Ollama runs as configured there; CUDA/bundle need owned")
@@ -633,6 +639,22 @@ def _generation_config(args: argparse.Namespace):
 
 
 def _open_generation_client(args: argparse.Namespace, config):
+    if args.backend == "api":
+        from page_cite_rag.api_backend import ApiChatClient
+
+        client = ApiChatClient(
+            config,
+            api_base=args.api_base,
+            model=args.api_model,
+            api_key_env=args.api_key_env,
+            max_calls=args.api_max_calls,
+        )
+        print(
+            "Document passages and questions will be sent to "
+            f"{client.identity['api_host']} (--backend api).",
+            file=sys.stderr,
+        )
+        return client
     if args.backend == "ollama":
         from page_cite_rag.generation import OllamaModelClient
 
@@ -676,9 +698,31 @@ def _terminal_safe(value: str) -> str:
     )
 
 
-def _print_answer(result, output_format: str) -> None:
+def _closest_passages(result, store) -> list[dict]:
+    if result.status != "insufficient_evidence" or store is None:
+        return []
+    passages = []
+    for block_id in result.included_block_ids[:3]:
+        block = store.get_block(result.document_id, block_id)
+        if block is not None:
+            passages.append(
+                {
+                    "block_id": block.block_id,
+                    "page_number": block.page_number,
+                    "line_start": block.line_start,
+                    "line_end": block.line_end,
+                    "text": block.text[:300],
+                }
+            )
+    return passages
+
+
+def _print_answer(result, output_format: str, store=None) -> None:
     if output_format == "json":
-        print(_terminal_safe(result.model_dump_json(indent=2)))
+        report = result.model_dump(mode="json")
+        if result.status == "insufficient_evidence":
+            report["closest_passages"] = _closest_passages(result, store)
+        print(_terminal_safe(json.dumps(report, ensure_ascii=False, indent=2)))
         return
 
     def print_claim(claim, label: str) -> None:
@@ -716,57 +760,45 @@ def _print_answer(result, output_format: str) -> None:
     for limitation in result.limitations:
         print(f"Note: {_terminal_safe(limitation)}")
 
+    if result.status == "insufficient_evidence":
+        print("Most relevant passages:")
+        for passage in _closest_passages(result, store):
+            page = passage["page_number"]
+            location = f"page {page}, " if page is not None else ""
+            print(
+                f"- {location}lines {passage['line_start']}-{passage['line_end']}; "
+                f"block {passage['block_id']}: {_terminal_safe(passage['text'])}"
+            )
+
 
 _ROUTE_REASONS = {
     "requested": "requested with --route",
-    "planner_scope_lookup": "the question asks for a specific answer",
-    "planner_scope_whole_document": "the question needs reading across the document",
-    "planner_failed": "the question planner failed, so fixed retrieval answered",
-    "no_outline": "the document has no section outline for whole-document reading",
+    "auto": "auto",
 }
 
 
 def _print_route(trace: dict) -> None:
-    """Show how the answer was produced; reading notes stay in --format json."""
-    reason = _ROUTE_REASONS.get(trace.get("reason"), str(trace.get("reason")))
-    if trace.get("route") != "whole_document":
-        print(f"Route: fixed retrieval ({reason}).")
-        return
-    summary = trace["reading_summary"]
-    print(f"Route: whole-document reading ({reason}).")
-    sections = summary.get(
-        "sections_read",
-        [
-            *summary["sections_chosen"],
-            *summary["sections_from_search"],
-            *summary["sections_followed_up"],
-        ],
-    )
-    shown = "; ".join(_terminal_safe(title) for title in sections[:12])
-    more = f" and {len(sections) - 12} more" if len(sections) > 12 else ""
-    print(f"Sections read ({len(sections)}): {shown}{more}")
-    handed = summary.get("notes_handed_to_writer", summary["notes"])
-    note_counts = f"Reading notes: {summary['notes']}"
-    if handed != summary["notes"]:
-        note_counts += f"; handed to writer: {handed}"
-    print(
-        f"{note_counts}, of which {summary['notes_not_in_answer']} are not "
-        "cited in the answer (see --format json); notes are unverified, citations are checked."
-    )
-    print(f"Model calls: {summary['model_calls']}; elapsed {summary['elapsed_seconds']} s.")
-    if skipped := summary.get("sources_skipped_for_read_limit", 0):
+    route = trace.get("route")
+    if route == "whole_document_context":
+        print("Route: whole document (fits the context).")
+    elif route == "reranked":
+        print("Route: reranked top 20 of 200.")
+    elif route == "agent":
         print(
-            f"Note: {skipped} source passages were skipped "
-            "because the reading call limit was reached."
+            f"Route: evidence agent ({trace['model_calls']} model calls, "
+            f"{len(trace['search_steps'])} searches)."
         )
-    if summary["navigation_degraded"]:
-        print("Note: section reading stopped early; the answer may be incomplete.")
-    if skipped := summary.get("sources_skipped_for_budget", 0):
-        print(f"Note: {skipped} source passages exceeded the reading budget.")
-    if omitted := summary.get("notes_omitted_for_writer_budget", 0):
-        print(f"Note: {omitted} reading notes were omitted because of the writer budget.")
-    if rejected := summary.get("notes_rejected_for_scope", 0):
-        print(f"Note: {rejected} reading notes were rejected for crossing requirement scope.")
+    else:
+        reason = (
+            "no reranker"
+            if trace.get("reason") == "rerank_unavailable"
+            else _ROUTE_REASONS.get(trace.get("reason"), str(trace.get("reason")))
+        )
+        print(f"Route: fixed retrieval ({reason}).")
+
+
+class _RouteConfigurationError(ValueError):
+    """Safe, fixed route guidance that contains no user input or local paths."""
 
 
 def _run_answer(args: argparse.Namespace) -> int:
@@ -781,7 +813,6 @@ def _run_answer(args: argparse.Namespace) -> int:
     from page_cite_rag.workflows import WorkflowConfig
 
     client = None
-    retrieval_session = None
     retrieval_owner = [None]
     route = getattr(args, "route", "fixed") if args.command == "ask" else "fixed"
     native_gpu = getattr(args, "native_gpu", False)
@@ -843,23 +874,28 @@ def _run_answer(args: argparse.Namespace) -> int:
             store, args.document_id
         )
         if args.command == "ask" and args.method is None:
-            args.method = "hybrid" if docling_source or native_gpu or route != "fixed" else "bm25"
+            args.method = "hybrid" if docling_source or native_gpu else "bm25"
         if args.command == "ask":
             # RetrievalError messages are shown to the user; they carry no input or paths.
-            if route != "fixed" and args.method != "hybrid":
-                raise RetrievalError(
-                    "routing needs the hybrid index; use --method hybrid or --route fixed"
-                )
             if route != "fixed" and (args.rewrite_query or args.rerank):
-                raise RetrievalError(
-                    "routing uses the validated retrieval profile; use --route fixed for query "
-                    "rewriting or reranking"
+                raise _RouteConfigurationError(
+                    "--rewrite-query and --rerank apply to --route fixed"
                 )
+            if route == "agent" and (
+                not native_gpu
+                or args.method != "hybrid"
+                or args.backend not in ("pinned-ollama", "api")
+            ):
+                raise _RouteConfigurationError(
+                    "agent requires --native-gpu, --method hybrid and --backend pinned-ollama"
+                )
+            if route == "auto" and native_gpu:
+                args.method = "hybrid"
             if args.rerank and not native_gpu:
                 raise ValueError("--rerank requires --native-gpu")
             if native_gpu and (
-                args.backend not in OWNED_BACKENDS
-                or args.device != "cuda"
+                args.backend not in (*OWNED_BACKENDS, "api")
+                or (args.backend != "api" and args.device != "cuda")
                 or not args.gpu_uuid
                 or args.method not in ("dense", "hybrid")
             ):
@@ -880,8 +916,16 @@ def _run_answer(args: argparse.Namespace) -> int:
                     args.gpu_uuid,
                     tokenizer_directory=args.model_dir or DEFAULT_MODEL_DIR,
                     gpu_temperature_limit_c=_gpu_temperature_limit(args),
-                    reranker_model_path=DEFAULT_MODEL_PATH if args.rerank else None,
-                    candidates=FORMAL_RETRIEVAL.candidates_per_branch,
+                    reranker_model_path=(
+                        DEFAULT_MODEL_PATH
+                        if args.rerank or (route == "auto" and DEFAULT_MODEL_PATH.is_file())
+                        else None
+                    ),
+                    candidates=(
+                        RERANK_CANDIDATES_PER_BRANCH
+                        if args.rerank or (route == "auto" and DEFAULT_MODEL_PATH.is_file())
+                        else FORMAL_RETRIEVAL.candidates_per_branch
+                    ),
                 )
                 retrieval_owner[0] = gpu_retriever
                 if args.rewrite_query:
@@ -897,9 +941,6 @@ def _run_answer(args: argparse.Namespace) -> int:
                     retriever = RewritingRetriever(None, rewriter, search_backend=gpu_retriever)
                 else:
                     retriever = gpu_retriever
-                if route != "fixed" and not args.rerank:
-                    retrieval_session = gpu_retriever.session()
-                    retrieval_session.__enter__()
                 lexical, dense = None, None
             elif docling_source:
                 if args.method != "hybrid":
@@ -983,22 +1024,24 @@ def _run_answer(args: argparse.Namespace) -> int:
                 retriever = lexical if lexical is not None else dense
         if retrieval_owner[0] is None:
             retrieval_owner[0] = retriever
-        interactive = route != "fixed" and sys.stderr.isatty()
-        if interactive and args.device == "cpu" and args.backend in OWNED_BACKENDS:
-            print(
-                "page-cite-rag: the model runs on CPU; a question that needs the whole "
-                "document makes 10-20 model calls and can take tens of minutes. Use "
-                "--route fixed for one call, or a GPU with --device cuda --gpu-uuid.",
-                file=sys.stderr,
-            )
         workflow = document_workflow(
             store,
             args.document_id,
             retriever,
-            _ProgressModel(client, sys.stderr) if interactive else client,
+            client,
             config,
             top_k=workflow_config.top_k,
             neighbor_blocks=workflow_config.neighbor_blocks,
+            writer=(
+                "quote_first"
+                if route == "agent" or getattr(args, "answer_format", "general") == "short"
+                else "structured"
+            ),
+            answer_format=(
+                "short_answer"
+                if getattr(args, "answer_format", "general") == "short"
+                else "general"
+            ),
         )
         if route != "fixed":
             from page_cite_rag.application import answer_question
@@ -1011,12 +1054,14 @@ def _run_answer(args: argparse.Namespace) -> int:
                 route=route,
             )
             ensure_request_time()
-            if retrieval_session is not None:
-                retrieval_session.__exit__(None, None, None)
-                retrieval_session = None
             result = routed.result
             if args.format == "json":
                 report = {"answer": result.model_dump(mode="json"), "routing": routed.trace}
+                if (
+                    result.status == "insufficient_evidence"
+                    and routed.trace.get("route") != "whole_document_context"
+                ):
+                    report["closest_passages"] = _closest_passages(result, store)
                 if initial_gpu_search_trace is not None:
                     report["initial_gpu_search_trace"] = initial_gpu_search_trace
                 if (
@@ -1031,7 +1076,9 @@ def _run_answer(args: argparse.Namespace) -> int:
                     )
                 )
             else:
-                _print_answer(result, args.format)
+                # Passages of a whole-document read are in document order, not by relevance.
+                whole = routed.trace.get("route") == "whole_document_context"
+                _print_answer(result, args.format, None if whole else store)
                 _print_route(routed.trace)
         else:
             if args.command == "ask" and precomputed_search is not None:
@@ -1050,6 +1097,8 @@ def _run_answer(args: argparse.Namespace) -> int:
             ensure_request_time()
             if args.format == "json" and (initial_gpu_search_trace or args.device == "cuda"):
                 report = result.model_dump(mode="json")
+                if result.status == "insufficient_evidence":
+                    report["closest_passages"] = _closest_passages(result, store)
                 if initial_gpu_search_trace is not None:
                     report["gpu_retrieval_trace"] = initial_gpu_search_trace
                 if (
@@ -1064,14 +1113,14 @@ def _run_answer(args: argparse.Namespace) -> int:
                     )
                 )
             else:
-                _print_answer(result, args.format)
+                _print_answer(result, args.format, store)
         ensure_request_time()
         return 0  # Evidence insufficiency is a visible result, not a transport error.
     except (ModelError, RetrievalError, StoreError, OSError, sqlite3.Error, ValueError) as exc:
         # ValidationError/OS errors can contain raw user input or paths; don't dump them.
         detail = (
             "invalid configuration or local resource"
-            if not isinstance(exc, (ModelError, RetrievalError))
+            if not isinstance(exc, (ModelError, RetrievalError, _RouteConfigurationError))
             else str(exc)
         )
         print(f"page-cite-rag: {args.command} failed: {detail}", file=sys.stderr)
@@ -1080,89 +1129,114 @@ def _run_answer(args: argparse.Namespace) -> int:
         deadline_timer.cancel()
         if deadline_timer is not threading.current_thread():
             deadline_timer.join(timeout=5)
-        if retrieval_session is not None:
-            retrieval_session.__exit__(None, None, None)
         if client is not None:
             client.close()
 
 
+def _create_document_service(args: argparse.Namespace):
+    """Shared configuration and runtime construction for API and MCP transports."""
+    store = SQLiteDocumentStore(args.db, read_only=True)
+    if args.method is None:
+        record = store.get_document(args.document_id)
+        args.method = (
+            "hybrid"
+            if args.embedding_backend == "native-gpu"
+            or (
+                record is not None
+                and record.parser_name == "docling"
+                and _has_native_docling_source(store, args.document_id)
+            )
+            else "bm25"
+        )
+    config = _generation_config(args)
+    if args.backend != "api" and (
+        args.backend not in OWNED_BACKENDS or args.token_budget != "exact"
+    ):
+        raise ValueError("local API requires an owned backend with exact token budgeting")
+    from page_cite_rag.service import DocumentService, ServiceConfig
+
+    if args.rerank and args.route != "fixed":
+        raise _RouteConfigurationError("--rewrite-query and --rerank apply to --route fixed")
+    if args.rerank and args.embedding_backend != "native-gpu":
+        raise ValueError("--rerank requires --embedding-backend native-gpu")
+    if args.route == "agent" and (
+        args.embedding_backend != "native-gpu"
+        or args.method != "hybrid"
+        or args.backend not in ("pinned-ollama", "api")
+    ):
+        raise _RouteConfigurationError(
+            "agent requires --native-gpu, --method hybrid and --backend pinned-ollama"
+        )
+    if args.route == "auto" and args.embedding_backend == "native-gpu":
+        args.method = "hybrid"
+    if args.embedding_backend == "native-gpu" and (
+        args.method == "bm25"
+        or (args.backend != "api" and args.device != "cuda")
+        or not args.gpu_uuid
+    ):
+        raise ValueError("native GPU embedding needs dense/hybrid and CUDA generation")
+    encoder = (
+        _load_encoder(args) if args.method != "bm25" and args.embedding_backend == "cpu" else None
+    )
+    staged_search = None
+    if args.embedding_backend == "native-gpu":
+        from page_cite_rag.embedding import DEFAULT_MODEL_DIR
+        from page_cite_rag.embedding_server import DEFAULT_GGUF_PATH
+        from page_cite_rag.gpu_retrieval import StagedGpuSearch
+        from page_cite_rag.reranker_server import DEFAULT_MODEL_PATH
+
+        staged_search = StagedGpuSearch(
+            SQLiteDocumentStore(args.db, read_only=True),
+            args.document_id,
+            args.method,
+            args.embedding_gguf or DEFAULT_GGUF_PATH,
+            args.gpu_uuid,
+            tokenizer_directory=args.model_dir or DEFAULT_MODEL_DIR,
+            gpu_temperature_limit_c=_gpu_temperature_limit(args),
+            reranker_model_path=(
+                DEFAULT_MODEL_PATH
+                if args.rerank or (args.route == "auto" and DEFAULT_MODEL_PATH.is_file())
+                else None
+            ),
+            candidates=(
+                RERANK_CANDIDATES_PER_BRANCH
+                if args.rerank or (args.route == "auto" and DEFAULT_MODEL_PATH.is_file())
+                else FORMAL_RETRIEVAL.candidates_per_branch
+            ),
+        )
+    return DocumentService(
+        ServiceConfig(
+            database_path=args.db,
+            document_id=args.document_id,
+            method=args.method,
+            top_k=args.top_k,
+            queue_capacity=args.queue_capacity,
+            idle_seconds=args.idle_seconds,
+            request_timeout_seconds=args.request_timeout_seconds,
+            route=args.route,
+            answer_format=args.answer_format,
+        ),
+        config,
+        lambda: _open_generation_client(args, config),
+        encoder=encoder,
+        staged_search=staged_search,
+    )
+
+
 def _run_serve(args: argparse.Namespace) -> int:
     """One bound document and one worker; never expose a network-facing listener."""
+    from page_cite_rag.generation import ModelError
     from page_cite_rag.retrieval import RetrievalError
 
     try:
         api_token = os.environ.get("PAGE_CITE_RAG_API_TOKEN")
         if api_token is None or not api_token.strip():
             raise ValueError("PAGE_CITE_RAG_API_TOKEN must contain a local API secret")
-        store = SQLiteDocumentStore(args.db, read_only=True)
-        if args.method is None:
-            record = store.get_document(args.document_id)
-            args.method = (
-                "hybrid"
-                if args.route != "fixed"
-                or args.embedding_backend == "native-gpu"
-                or (
-                    record is not None
-                    and record.parser_name == "docling"
-                    and _has_native_docling_source(store, args.document_id)
-                )
-                else "bm25"
-            )
         if not 1 <= args.port <= 65535:
             raise ValueError("invalid loopback port")
-        config = _generation_config(args)
-        if args.backend not in OWNED_BACKENDS or args.token_budget != "exact":
-            raise ValueError("local API requires an owned backend with exact token budgeting")
         from page_cite_rag.api import create_app
-        from page_cite_rag.service import DocumentService, ServiceConfig
 
-        if args.rerank and args.embedding_backend != "native-gpu":
-            raise ValueError("--rerank requires --embedding-backend native-gpu")
-        if args.rerank and args.route != "fixed":
-            raise ValueError("routing uses the validated retrieval profile; rerank needs fixed")
-        if args.embedding_backend == "native-gpu" and (
-            args.method == "bm25" or args.device != "cuda" or not args.gpu_uuid
-        ):
-            raise ValueError("native GPU embedding needs dense/hybrid and CUDA generation")
-        encoder = (
-            _load_encoder(args)
-            if args.method != "bm25" and args.embedding_backend == "cpu"
-            else None
-        )
-        staged_search = None
-        if args.embedding_backend == "native-gpu":
-            from page_cite_rag.embedding import DEFAULT_MODEL_DIR
-            from page_cite_rag.embedding_server import DEFAULT_GGUF_PATH
-            from page_cite_rag.gpu_retrieval import StagedGpuSearch
-            from page_cite_rag.reranker_server import DEFAULT_MODEL_PATH
-
-            staged_search = StagedGpuSearch(
-                SQLiteDocumentStore(args.db, read_only=True),
-                args.document_id,
-                args.method,
-                args.embedding_gguf or DEFAULT_GGUF_PATH,
-                args.gpu_uuid,
-                tokenizer_directory=args.model_dir or DEFAULT_MODEL_DIR,
-                gpu_temperature_limit_c=_gpu_temperature_limit(args),
-                reranker_model_path=DEFAULT_MODEL_PATH if args.rerank else None,
-                candidates=FORMAL_RETRIEVAL.candidates_per_branch,
-            )
-        runtime = DocumentService(
-            ServiceConfig(
-                database_path=args.db,
-                document_id=args.document_id,
-                method=args.method,
-                top_k=args.top_k,
-                queue_capacity=args.queue_capacity,
-                idle_seconds=args.idle_seconds,
-                request_timeout_seconds=args.request_timeout_seconds,
-                route=args.route,
-            ),
-            config,
-            lambda: _open_generation_client(args, config),
-            encoder=encoder,
-            staged_search=staged_search,
-        )
+        runtime = _create_document_service(args)
         import uvicorn
 
         uvicorn.run(
@@ -1174,9 +1248,66 @@ def _run_serve(args: argparse.Namespace) -> int:
             log_level="warning",
         )
         return 0
-    except (ImportError, ValueError, OSError, StoreError, RetrievalError) as exc:
-        print(f"page-cite-rag: local service failed: {type(exc).__name__}", file=sys.stderr)
+    except (ImportError, ValueError, OSError, StoreError, RetrievalError, ModelError) as exc:
+        detail = (
+            str(exc)
+            if isinstance(exc, (_RouteConfigurationError, ModelError))
+            else type(exc).__name__
+        )
+        print(f"page-cite-rag: local service failed: {detail}", file=sys.stderr)
         return 1
+
+
+def _run_mcp(args: argparse.Namespace) -> int:
+    from page_cite_rag.generation import ModelError
+    from page_cite_rag.retrieval import RetrievalError
+
+    try:
+        from page_cite_rag.mcp_server import run_stdio
+    except ImportError:
+        print("page-cite-rag: MCP requires uv sync --extra mcp", file=sys.stderr)
+        return 1
+    try:
+        run_stdio(_create_document_service(args))
+        return 0
+    except (ImportError, ValueError, OSError, StoreError, RetrievalError, ModelError) as exc:
+        detail = (
+            str(exc)
+            if isinstance(exc, (_RouteConfigurationError, ModelError))
+            else type(exc).__name__
+        )
+        print(f"page-cite-rag: local service failed: {detail}", file=sys.stderr)
+        return 1
+
+
+_ROUTE_HELP = (
+    "Validated auto: use the whole document if it fits, otherwise with --native-gpu "
+    "rerank 200 candidates and keep 20, otherwise fixed retrieval. "
+    "agent: LangChain evidence Agent for multi-step questions; slower, requires --native-gpu."
+)
+
+
+def _document_service_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("document_id", help="The only document accessible to this API.")
+    parser.add_argument("--db", type=Path, default=_DEFAULT_DATABASE)
+    parser.add_argument("--method", choices=("bm25", "dense", "hybrid"), default=None)
+    parser.add_argument("--rerank", action="store_true", help="Rerank native GPU candidates.")
+    parser.add_argument(
+        "--route",
+        choices=("auto", "fixed", "agent"),
+        default="auto",
+        help=_ROUTE_HELP,
+    )
+    parser.add_argument("--answer-format", choices=("general", "short"), default="general")
+    parser.add_argument("--top-k", type=_positive_integer, default=FORMAL_RETRIEVAL.final_k)
+    parser.add_argument("--queue-capacity", type=int, default=2)
+    parser.add_argument("--idle-seconds", type=float, default=300.0)
+    parser.add_argument("--embedding-backend", choices=("cpu", "native-gpu"), default="cpu")
+    parser.add_argument("--embedding-gguf", type=Path)
+    _embedding_options(parser)
+    _generation_options(parser)
+    parser.set_defaults(output_tokens=3072)
+    parser.set_defaults(token_budget=None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1245,8 +1376,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "docling", "pdfplumber"),
         default="auto",
         help=(
-            "auto (default) parses PDFs with Docling, which keeps the section outline used by "
-            "whole-document reading and needs prepared local models; pdfplumber has no outline."
+            "auto (default) parses PDFs with Docling, which keeps the section outline and "
+            "needs prepared local models; pdfplumber has no outline."
         ),
     )
     ingest_parser.add_argument(
@@ -1373,14 +1504,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ask_parser.add_argument(
         "--route",
-        choices=("auto", "fixed", "whole-document"),
+        choices=("auto", "fixed", "agent"),
         default="auto",
-        help=(
-            "auto (default) sends questions that need the whole document (list every..., "
-            "compare..., trace back...) to section-by-section reading and other questions "
-            "to fixed retrieval, as validated; fixed or whole-document forces one path."
-        ),
+        help=_ROUTE_HELP,
     )
+    ask_parser.add_argument("--answer-format", choices=("general", "short"), default="general")
     _embedding_options(ask_parser)
     ask_parser.add_argument(
         "--native-gpu",
@@ -1412,26 +1540,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser = subparsers.add_parser(
         "serve", help="Run one bound document's local-only API with a bounded model worker."
     )
-    serve_parser.add_argument("document_id", help="The only document accessible to this API.")
-    serve_parser.add_argument("--db", type=Path, default=_DEFAULT_DATABASE)
-    serve_parser.add_argument("--method", choices=("bm25", "dense", "hybrid"), default=None)
-    serve_parser.add_argument("--rerank", action="store_true", help="Rerank native GPU candidates.")
-    serve_parser.add_argument(
-        "--route",
-        choices=("auto", "fixed", "whole-document"),
-        default="auto",
-        help="Same routing as ask: auto (default), fixed or whole-document.",
-    )
-    serve_parser.add_argument("--top-k", type=_positive_integer, default=FORMAL_RETRIEVAL.final_k)
+    _document_service_options(serve_parser)
     serve_parser.add_argument("--port", type=_positive_integer, default=8765)
-    serve_parser.add_argument("--queue-capacity", type=int, default=2)
-    serve_parser.add_argument("--idle-seconds", type=float, default=300.0)
-    serve_parser.add_argument("--embedding-backend", choices=("cpu", "native-gpu"), default="cpu")
-    serve_parser.add_argument("--embedding-gguf", type=Path)
-    _embedding_options(serve_parser)
-    _generation_options(serve_parser)
-    serve_parser.set_defaults(output_tokens=3072)
-    serve_parser.set_defaults(token_budget="exact")
+    mcp_parser = subparsers.add_parser("mcp", help="Serve one document over MCP stdio.")
+    _document_service_options(mcp_parser)
 
     return parser
 
@@ -1456,6 +1568,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_model(args)
     if args.command in ("ask", "explain"):
         return _run_answer(args)
+    if args.command == "mcp":
+        return _run_mcp(args)
     if args.command == "serve":
         return _run_serve(args)
     if args.command is None:

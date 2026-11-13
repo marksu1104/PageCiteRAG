@@ -1,6 +1,8 @@
 """Evidence-agent integration using synthetic sources and mock HTTP only."""
 
+import hashlib
 import json
+import math
 from types import SimpleNamespace
 
 import httpx
@@ -49,7 +51,8 @@ def setup(tmp_path, monkeypatch):
     checks = []
     client = SimpleNamespace(
         chat_completions_base_url=lambda: "http://synthetic/v1",
-        ollama_model_name="synthetic",
+        chat_model_name="synthetic",
+        thinking_control="reasoning_effort_none",
         before_agent_dispatch=lambda: checks.append("dispatch"),
         chat_sampling=lambda: {"temperature": 0.0, "seed": 42},
     )
@@ -101,6 +104,7 @@ def test_search_search_finish(setup, monkeypatch):
     workflow, client, blocks, retriever, model, checks = setup
     pids = [f"P{b.ordinal}" for b in blocks]
     requests = []
+    request_bodies = []
     initial = workflow.search_sources("Who was excluded?")[0]
     initial = initial.model_copy(update={"hits": initial.hits[:1]})
     searches = iter([blocks[1:2], blocks[2:]])
@@ -116,7 +120,9 @@ def test_search_search_finish(setup, monkeypatch):
     ]
 
     def handler(request):
-        requests.append(json.loads(request.read()))
+        raw_body = request.read()
+        request_bodies.append(raw_body)
+        requests.append(json.loads(raw_body))
         name, arguments = sequence[len(requests) - 1]
         return response(request, name, arguments)
 
@@ -145,10 +151,47 @@ def test_search_search_finish(setup, monkeypatch):
     assert all(
         r["max_tokens"] == LIMITS.max_tokens and "max_completion_tokens" not in r for r in requests
     )
+    assert request_bodies == [json.dumps(request).encode("utf-8") for request in requests]
+    # Captured before adding the API backend: all three local requests remain byte-identical.
+    assert [hashlib.sha256(body).hexdigest() for body in request_bodies] == [
+        "2fc9df0963d9c8400df80961c90521141d798e0a9a2f3ed909652709f5363408",
+        "518f885f030566f06728b4e9a22c4f1bb52036887b8dbc617a003d870ba8e49f",
+        "c0cc60b28576dfa902751600c02d35acb9d6142f2c13916d66707cf1b2e70553",
+    ]
     assert trace["selected_passage_ids"] == [pids[2], pids[0]]
     assert trace["handoff_passage_ids"] == [pids[2], pids[0], pids[1]]
     assert trace["handoff_reason"] == "finish_called"
     assert [r["status"] for r in trace["tool_calls"]] == ["ok"] * 3
+    timing = trace["timing"]
+    assert set(timing) == {
+        "total_ms",
+        "agent_loop_ms",
+        "writer_ms",
+        "model_gate_ms",
+        "model_http_ms",
+        "tool_ms",
+        "unattributed_ms",
+    }
+    assert all(
+        isinstance(timing[key], (int, float)) and math.isfinite(timing[key]) and timing[key] >= 0
+        for key in timing
+        if key != "unattributed_ms"
+    )
+    assert math.isfinite(timing["unattributed_ms"])
+    assert timing["model_gate_ms"] == sum(r["gate_ms"] for r in trace["model_calls"])
+    assert timing["model_http_ms"] == sum(r["http_ms"] for r in trace["model_calls"])
+    assert timing["tool_ms"] == sum(r["elapsed_ms"] for r in trace["tool_calls"])
+    assert all(
+        isinstance(record[key], (int, float)) and math.isfinite(record[key]) and record[key] >= 0
+        for record in trace["model_calls"]
+        for key in ("gate_ms", "hook_ms", "http_ms", "elapsed_ms")
+    )
+    assert all(
+        isinstance(record[key], (int, float)) and math.isfinite(record[key]) and record[key] >= 0
+        for record in trace["tool_calls"]
+        for key in ("elapsed_ms", "search_ms")
+    )
+    assert all(record["search_ms"] <= record["elapsed_ms"] for record in trace["tool_calls"])
     assert all(r["prompt_eval_count"] == 10 and r["eval_count"] == 2 for r in after)
     expected = (
         "\n\nSearch steps that found these passages (unverified hints, not evidence):\n"
@@ -342,7 +385,8 @@ def test_client_public_endpoints_and_order(monkeypatch):
     monkeypatch.setattr(client, "_check_gpu", lambda: calls.append("gpu"))
     assert client.chat_completions_base_url() == "http://synthetic/v1"
     assert calls == ["running"]
-    assert client.ollama_model_name == "pinned-local"
+    assert client.ollama_model_name == client.chat_model_name == "pinned-local"
+    assert client.thinking_control == "reasoning_effort_none"
     with pytest.raises(AttributeError):
         client.ollama_model_name = "other"
     calls.clear()
@@ -614,3 +658,246 @@ def test_token_usage_bounds_calls_without_reported_usage():
     }
     last_unknown = agent_module.agent_token_usage([{"prompt_eval_count": None, "eval_count": None}])
     assert last_unknown["input_tokens_upper_bound"] is None
+
+
+def test_api_agent_omits_reasoning_authenticates_and_accounts(setup, monkeypatch):
+    from page_cite_rag.api_backend import ApiChatClient
+    from page_cite_rag.generation import GenerationConfig
+
+    workflow, _, blocks, _, _, _ = setup
+    monkeypatch.setenv("PAGECITE_API_KEY", "agent-key-canary")
+    monkeypatch.setattr(ApiChatClient, "_process_calls", 0)
+    monkeypatch.setattr(ApiChatClient, "_process_prompt_tokens", 0)
+    monkeypatch.setattr(ApiChatClient, "_process_completion_tokens", 0)
+    requests = []
+    with ApiChatClient(
+        GenerationConfig(),
+        api_base="https://provider.invalid/v1",
+        model="cloud-model",
+        transport=httpx.MockTransport(lambda r: pytest.fail("writer uses workflow's fake client")),
+    ) as client:
+
+        def handler(request):
+            body = json.loads(request.read())
+            requests.append(body)
+            assert "reasoning_effort" not in body
+            assert body["model"] == "cloud-model"
+            assert body["max_tokens"] == 512
+            assert body["parallel_tool_calls"] is False
+            assert request.headers["authorization"] == "Bearer agent-key-canary"
+            return response(request, "finish", {"passage_ids": [f"P{blocks[0].ordinal}"]})
+
+        mock_agent_http(monkeypatch, client, handler)
+        result = run_evidence_agent(workflow, client, "Who was excluded?", language="en")
+        assert result.answer.status == "answered"
+        assert len(requests) == client.calls_used == 1
+        assert client.token_totals == {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+        }
+        assert "agent-key-canary" not in json.dumps(result.trace)
+
+
+@pytest.mark.parametrize("failure", ["reasoning", "reasoning_content", "http", "limit"])
+def test_api_agent_failures_preserve_guards_and_safe_errors(monkeypatch, failure):
+    from page_cite_rag.api_backend import ApiChatClient
+    from page_cite_rag.generation import GenerationConfig
+
+    secret = "api-agent-secret-canary"
+    monkeypatch.setenv("PAGECITE_API_KEY", secret)
+    monkeypatch.setattr(ApiChatClient, "_process_calls", 1 if failure == "limit" else 0)
+    sent, after = [], []
+
+    def handler(request):
+        sent.append(request)
+        if failure == "http":
+            return server_error(request, secret)
+        return response(request, **{failure: "hidden reasoning"})
+
+    with ApiChatClient(
+        GenerationConfig(),
+        api_base="https://provider.invalid/v1",
+        model="cloud",
+        max_calls=1,
+        transport=httpx.MockTransport(lambda r: pytest.fail("unused")),
+    ) as client:
+        guard = GuardedTransport(
+            client,
+            inner=httpx.MockTransport(handler),
+            after_model_call=after.append,
+        )
+        with pytest.raises(ModelError) as caught:
+            guard.handle_request(
+                httpx.Request(
+                    "POST",
+                    "https://provider.invalid/v1/chat/completions",
+                    json={
+                        "max_tokens": 512,
+                        "parallel_tool_calls": False,
+                    },
+                )
+            )
+        assert len(sent) == (0 if failure == "limit" else 1)
+        assert len(after) == 1
+        assert secret not in str(caught.value) + repr(caught.value) + json.dumps(after)
+        if sent:
+            assert "authorization" not in sent[0].headers
+
+
+def test_findings_handoff_validates_individually_and_maps_sources(setup, monkeypatch):
+    workflow, client, blocks, _, model, _ = setup
+    pid = f"P{blocks[0].ordinal}"
+    good = {"fact": "Children were excluded", "passage_id": pid}
+    bad = [
+        {"fact": "", "passage_id": pid},
+        {"fact": " " * 3, "passage_id": pid},
+        {"fact": "x" * 201, "passage_id": pid},
+        {"fact": 3, "passage_id": pid},
+        {"fact": "unknown", "passage_id": "P999"},
+        "malformed",
+    ]
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.read()))
+        return response(request, "finish", {"passage_ids": [pid], "findings": [good, *bad]})
+
+    mock_agent_http(monkeypatch, client, handler)
+    result = run_evidence_agent(
+        workflow, client, "Who was excluded?", language="en", handoff_findings=True
+    )
+    schema = requests[0]["tools"][-1]["function"]["parameters"]
+    assert schema["properties"]["findings"]["maxItems"] == 8
+    assert "findings" not in schema["required"]
+    assert "Zentro phone is made by Kalvex Corp" in requests[0]["messages"][0]["content"]
+    assert result.trace["findings"] == [good]
+    assert [r["finding"] for r in result.trace["findings_rejected"]] == bad
+    assert result.trace["handoff_findings"] is True
+    assert result.trace["model_call_limit"] == 8
+    assert result.answer.status == "answered"
+    user = model.calls[-1][0][1].content
+    assert (
+        "Findings reported by the search (unverified hints, not evidence):\n"
+        f"Children were excluded [S{blocks[0].ordinal}]" in user
+    )
+    assert workflow._search_findings == ()
+    workflow.answer_from_context(
+        "Who was excluded?",
+        blocks,
+        language="en",
+        search_steps=["entity"],
+        search_findings=[(good["fact"], pid)],
+    )
+    user = model.calls[-1][0][1].content
+    assert user.index("Search steps") < user.index("Findings reported") < user.index("Question:")
+    workflow.answer_from_context("Who was excluded?", blocks, language="en")
+    assert "Findings reported" not in model.calls[-1][0][1].content
+
+
+def test_findings_schema_disabled_and_bounds(setup):
+    workflow, _, blocks, _, _, _ = setup
+    initial = workflow.search_sources("Question?")[0]
+    state = EvidenceTools(blocks, initial, lambda q: initial)
+    assert "findings" not in state.tools()[-1].args_schema.model_json_schema()["properties"]
+    state = EvidenceTools(blocks, initial, lambda q: initial, handoff_findings=True)
+    pid = state.initial_ids[0]
+    good = {"fact": "f" * 200, "passage_id": pid}
+    state.tools()[-1].invoke({"passage_ids": [], "findings": [good] * 9})
+    assert state.findings == [good] * 8
+    assert len(state.findings_rejected) == 1
+    assert state.handoff()[2] == "finish_empty"
+
+
+def test_twelve_model_calls_and_thirteenth_blocked(setup, monkeypatch):
+    workflow, client, _, _, model, _ = setup
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.read()))
+        return response(request)
+
+    guards = mock_agent_http(monkeypatch, client, handler)
+    result = run_evidence_agent(
+        workflow, client, "Who was excluded?", language="en", model_calls=12
+    )
+    assert len(requests) == 12
+    assert result.trace["model_call_limit"] == 12
+    assert "at most 12 steps" in requests[0]["messages"][0]["content"]
+    assert "Steps used: 0 of 12." in requests[0]["messages"][1]["content"]
+    assert (
+        "Steps used: 11 of 12. Your next step is the last one"
+        in requests[11]["messages"][-1]["content"]
+    )
+    with pytest.raises(ModelError, match="ceiling"):
+        guards[0].handle_request(httpx.Request("POST", "http://synthetic", json=CAPPED))
+    assert len(requests) == 12
+    assert len(model.calls) == 1
+
+
+@pytest.mark.parametrize("limit", [7, 13, 8.5, True, None])
+def test_invalid_model_call_limit_sends_nothing(setup, limit):
+    workflow, client, _, _, model, checks = setup
+    with pytest.raises(ValueError):
+        run_evidence_agent(workflow, client, "Question?", language="en", model_calls=limit)
+    assert not model.calls and not checks
+
+
+@pytest.mark.parametrize(
+    "findings",
+    [
+        None,
+        "fact",
+        [("", "P1")],
+        [("x" * 201, "P1")],
+        [("fact", "P999")],
+        [123],
+        [("fact",)],
+        [("fact", [])],
+    ],
+)
+def test_invalid_writer_findings(setup, findings):
+    workflow, _, blocks, _, model, _ = setup
+    with pytest.raises(ValueError):
+        workflow.answer_from_context("Question?", blocks, search_findings=findings)
+    assert not model.calls
+
+
+def test_optional_findings_omitted_preserves_writer_and_trace(setup, monkeypatch):
+    workflow, client, blocks, _, model, _ = setup
+    pid = f"P{blocks[0].ordinal}"
+    mock_agent_http(
+        monkeypatch,
+        client,
+        lambda request: response(request, "finish", {"passage_ids": [pid]}),
+    )
+    baseline = run_evidence_agent(workflow, client, "Who was excluded?", language="en")
+    baseline_messages = model.calls[-1][0]
+    candidate = run_evidence_agent(
+        workflow,
+        client,
+        "Who was excluded?",
+        language="en",
+        handoff_findings=True,
+    )
+    assert baseline.trace["handoff_findings"] is False
+    assert baseline.trace["findings"] == baseline.trace["findings_rejected"] == []
+    assert baseline.trace["model_call_limit"] == LIMITS.model_calls
+    assert candidate.trace["findings"] == candidate.trace["findings_rejected"] == []
+    assert len(candidate.trace["tool_calls"]) == 1
+    assert candidate.trace["tool_calls"][0]["status"] == "ok"
+    assert model.calls[-1][0] == baseline_messages
+
+
+def test_findings_unseen_passage_and_invalid_container_do_not_break_finish(setup):
+    workflow, _, blocks, _, _, _ = setup
+    initial = workflow.search_sources("Question?")[0]
+    initial = initial.model_copy(update={"hits": initial.hits[:1]})
+    for findings in ([{"fact": "unseen", "passage_id": f"P{blocks[1].ordinal}"}], None):
+        state = EvidenceTools(blocks, initial, lambda q: initial, handoff_findings=True)
+        assert (
+            state.tools()[-1].invoke({"passage_ids": state.initial_ids, "findings": findings})
+            == "Evidence selection complete."
+        )
+        assert not state.findings and len(state.findings_rejected) == 1
+        assert state.handoff()[2] == "finish_called"

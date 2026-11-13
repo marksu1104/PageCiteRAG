@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import BaseModel
 
+from page_cite_rag.generation import GenerationStats
 from page_cite_rag.models import Block
 from page_cite_rag.retrieval import SearchBranchTrace, SearchContextGroup, SearchHit, SearchResult
 from page_cite_rag.source_outline import OUTLINE_KIND, SourceOutline
@@ -2873,7 +2874,6 @@ def test_failure_diagnostics_bound_messages_and_redact_document_text():
 
 def test_runner_counts_server_usage_without_unknown_on_token_difference(tmp_path):
     from page_cite_rag.generation import ChatMessage, GenerationResult
-    from tests.test_gap_agent import _stats
 
     class Schema(BaseModel):
         answer: str
@@ -2900,7 +2900,6 @@ def test_runner_counts_server_usage_without_unknown_on_token_difference(tmp_path
 @pytest.mark.parametrize("reservation", [None, "*", "PlainText"])
 def test_counting_client_plain_text_reservation_and_usage(tmp_path, reservation):
     from page_cite_rag.generation import ChatMessage, GenerationResult
-    from tests.test_gap_agent import _stats
     from tests.test_workflows import FakeModel
 
     model = FakeModel()
@@ -2930,3 +2929,29 @@ def test_counting_client_plain_text_reservation_and_usage(tmp_path, reservation)
     assert len(rows) == 2 and rows[0]["response_model"] == "PlainText"
     assert rows[1]["input_tokens"] == 98 and rows[1]["output_tokens"] == 20
     assert wrapper.generate_calls == 1
+
+
+def _stats(prompt=120, output=30):
+    return GenerationStats(
+        prompt_eval_count=prompt,
+        eval_count=output,
+        total_duration=1,
+        load_duration=None,
+        prompt_eval_duration=1,
+        eval_duration=1,
+        done_reason="stop",
+        elapsed_ms=1.0,
+    )
+
+
+def test_runner_retains_shared_import_contract():
+    names = (
+        "ContextBudgetError CONTEXT_TOKENS _CountingModelClient document_workflow "
+        "EXACT_INPUT_LIMIT _failure_details FORMAL_RETRIEVAL FrozenSearchRetriever "
+        "_generator_client GPU_TEMPERATURE_LIMIT_C GPU_UUID _llama_config "
+        "MAX_GPU_MEMORY_MIB ModelError model_spec OUTPUT_TOKENS SearchResult "
+        "_search_result_from_json _search_result_to_json SQLiteDocumentStore "
+        "TEMPLATE_RESERVE TOP_K AnswerPrediction AnswerReference score_prediction "
+        "_qasper_evidence_texts"
+    ).split()
+    assert all(hasattr(run_reading_eval, name) for name in names)

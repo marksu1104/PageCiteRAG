@@ -62,11 +62,16 @@ from page_cite_rag.answer_metrics import (  # noqa: E402
     AnswerReference,
     score_prediction,
 )
+from page_cite_rag.application import (  # noqa: E402
+    FrozenSearchRetriever as FrozenSearchRetriever,
+)
+from page_cite_rag.application import (  # noqa: E402
+    document_workflow as document_workflow,
+)
 from page_cite_rag.dense import DenseRetriever, build_dense_index, dense_index_kind  # noqa: E402
 from page_cite_rag.embedding import DEFAULT_MODEL_DIR  # noqa: E402
 from page_cite_rag.embedding_native import NativeEmbeddingEncoder  # noqa: E402
 from page_cite_rag.embedding_server import DEFAULT_GGUF_PATH, NativeEmbeddingServer  # noqa: E402
-from page_cite_rag.gap_agent import quote_is_verbatim  # noqa: E402
 from page_cite_rag.generation import (  # noqa: E402
     ContextBudgetError,
     ModelError,
@@ -101,6 +106,7 @@ from page_cite_rag.retrieval import (  # noqa: E402
     build_bm25_index,
 )
 from page_cite_rag.retrieval_profile import FORMAL_RETRIEVAL, MAX_CONTEXT_GROUPS  # noqa: E402
+from page_cite_rag.span_citations import quote_is_verbatim  # noqa: E402
 from page_cite_rag.store import SQLiteDocumentStore  # noqa: E402
 
 READING_PLAN_VERSION = getattr(
@@ -7538,7 +7544,7 @@ def _run_arm(
     selected = _select_run_cases(inputs, case_id=case_id, run_case_ids=run_case_ids)
 
     from page_cite_rag.agent import AgentRunFailure, ReadingReport, _admit
-    from page_cite_rag.application import FrozenSearchRetriever, ask_with_agent, document_workflow
+    from page_cite_rag.application import FrozenSearchRetriever, document_workflow
     from page_cite_rag.workflows import RetrievalTrace
 
     arm_dir = run_root / arm
@@ -8035,14 +8041,8 @@ def _run_arm(
                             else nullcontext()
                         )
                         with retrieval_session:
-                            navigation_answer = ask_with_agent(
-                                workflow,
-                                case["question"],
-                                language=case["language"],
-                                initial_search=search,
-                                initial_blocks=blocks,
-                                strategy=AGENT_STRATEGIES[behavior],
-                                on_model_call=record_agent_model_call,
+                            raise RuntimeError(
+                                "retired section reader; replay it from its code snapshot"
                             )
                         result = navigation_answer.result
                     final_attempted = counted_model.generate_calls > final_calls_before

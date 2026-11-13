@@ -68,7 +68,13 @@ def test_cli_and_api_reranking_share_order_and_release_embedding_first(monkeypat
     staged, search = build_search(monkeypatch)
     staged.reranker_model_path = Path("reranker.gguf")
     source = result([1, 2, 3])
-    monkeypatch.setattr(search, "search", lambda query, **kwargs: source)
+    pools = []
+
+    def retrieve(query, *, top_k):
+        pools.append(top_k)
+        return source
+
+    monkeypatch.setattr(search, "search", retrieve)
     seen = []
 
     class Ranker:
@@ -95,6 +101,9 @@ def test_cli_and_api_reranking_share_order_and_release_embedding_first(monkeypat
     assert cli_result.hits == api_result.hits
     assert [hit.block.ordinal for hit in cli_result.hits] == [3, 2]
     assert len(seen) == 2
+    assert pools == [200, 200]
+    staged.search("q", top_k=250)
+    assert pools[-1] == 250
     assert staged.last_trace["reranker"] == {"ranked": True}
 
 

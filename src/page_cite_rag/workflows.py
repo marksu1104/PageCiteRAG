@@ -266,6 +266,7 @@ class AnswerResult(BaseModel):
     prompt_version: Literal[
         "quote-two-step-answer/v1",
         "quote-first-answer/v2",
+        "quote-first-answer/v3",
         "quote-first-answer/v1",
         "complete-cited-answer-v1",
         "complete-cited-answer-v2",
