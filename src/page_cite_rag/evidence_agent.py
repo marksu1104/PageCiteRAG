@@ -16,13 +16,16 @@ from page_cite_rag.ollama_backend import OllamaGgufClient
 from page_cite_rag.retrieval import SearchResult
 from page_cite_rag.workflows import AnswerResult, Language
 
-EVIDENCE_AGENT_VERSION = "evidence-agent/v4"
+EVIDENCE_AGENT_VERSION = "evidence-agent/v5"
 
 
 @dataclass(frozen=True)
 class EvidenceAgentLimits:
     model_calls: int = 8
-    # Extra dispatches per question for re-asking after the server rejected tool-call arguments.
+    # Extra dispatches per question for re-asking after the server rejected tool-call arguments
+    # (seen when text before the call used up max_tokens and cut its JSON). A reply cut before
+    # any tool call is not an error: it ends the search as in LangChain, and is only recorded;
+    # re-asking it did not help on dev data (fix-check 2026-11-13: one same, one worse).
     tool_call_repairs: int = 1
     tool_calls: int = 16
     passages_per_search: int = 5
@@ -35,7 +38,8 @@ class EvidenceAgentLimits:
 LIMITS = EvidenceAgentLimits()
 
 # Pinned Ollama 0.35 answers HTTP 500 with this message and drops the model text when the
-# generated tool-call arguments are not valid JSON (observed in dev3c, 2026-11-13).
+# generated tool-call arguments are not valid JSON. Observed rejections took as long as a full
+# 512-token reply: text before the call used up the cap and cut its JSON (2026-11-13).
 TOOL_CALL_REJECTED = re.compile(r'invalid tool call arguments for "([^"]+)"')
 
 
@@ -97,23 +101,16 @@ class GuardedTransport(httpx.BaseTransport):
             raise ModelError("Agent request must carry its output token cap")
         if len(self.records) - self.repairs >= LIMITS.model_calls:
             raise ModelError("Agent model-call ceiling reached")
-        response, rejected = self._dispatch(request, body)
-        if rejected is not None and self.repairs < LIMITS.tool_call_repairs:
-            # The server kept the faulty text, so tell the model what failed and ask once more.
+        response, problem = self._dispatch(request, body)
+        while problem is not None and self.repairs < LIMITS.tool_call_repairs:
+            # The cut reply is not resent; say what failed and ask for the tool call alone.
             self.repairs += 1
-            correction = {
-                "role": "user",
-                "content": (
-                    f"Your previous reply was rejected: the arguments of your {rejected} call "
-                    "were not valid JSON. Reply again with one tool call whose arguments are "
-                    "valid JSON."
-                ),
-            }
+            correction = {"role": "user", "content": _correction(problem)}
             body = {**body, "messages": [*body["messages"], correction]}
-            response, rejected = self._dispatch(request, body, repair=True)
-        if rejected is not None:
+            response, problem = self._dispatch(request, body, repair=True)
+        if problem is not None:
             error = AgentToolCallError(
-                f"server rejected the {rejected} tool-call arguments and no correction is left"
+                f"server rejected the {problem} tool-call arguments and no correction is left"
             )
             self.dispatch_error = error
             raise error
@@ -136,6 +133,7 @@ class GuardedTransport(httpx.BaseTransport):
             "error_type": None,
             "http_status": None,
             "error_message": None,
+            "finish_reason": None,
             "repair": repair,
             "requested_tool_calls": [],
             "thinking_detected": False,
@@ -165,7 +163,9 @@ class GuardedTransport(httpx.BaseTransport):
             )
             if type(record["eval_count"]) is not int or record["eval_count"] > LIMITS.max_tokens:
                 raise ModelError("Agent output exceeded its token cap or omitted usage")
-            message = payload["choices"][0]["message"]
+            choice = payload["choices"][0]
+            message = choice["message"]
+            record["finish_reason"] = choice.get("finish_reason")
             for call in message.get("tool_calls") or []:
                 function = call.get("function") or {}
                 arguments = function.get("arguments", "")
@@ -183,7 +183,9 @@ class GuardedTransport(httpx.BaseTransport):
                 raise ModelError("thinking observed in raw Agent response; stop entire question")
             if len(record["requested_tool_calls"]) > 1:
                 raise ModelError("Agent returned parallel tools despite serial-call policy")
-            record["status"] = "completed"
+            # Recorded only: LangChain ends the search on a reply without a tool call.
+            cut = record["finish_reason"] == "length" and not record["requested_tool_calls"]
+            record["status"] = "cut_without_tool_call" if cut else "completed"
             return response, None
         except BaseException as exc:
             record.update(status="failed", error_type=type(exc).__name__)
@@ -200,6 +202,50 @@ class GuardedTransport(httpx.BaseTransport):
 
     def close(self) -> None:
         self.inner.close()
+
+
+def _correction(tool: str) -> str:
+    return (
+        f"Your previous reply was rejected: the arguments of your {tool} call were cut off or "
+        f"not valid JSON (each reply is limited to {LIMITS.max_tokens} tokens). Reply again with "
+        "only one tool call and no other text."
+    )
+
+
+def agent_token_usage(records: Sequence[dict]) -> dict:
+    """Known agent tokens, plus upper bounds that also cover calls without reported usage.
+
+    A rejected call reports no usage. The next dispatch resends its whole prompt plus at most a
+    correction, so that prompt bounds its input; its output is bounded by max_tokens.
+    """
+    known_in = known_out = bound_in = bound_out = 0
+    exact = True
+    for index, record in enumerate(records):
+        prompt, output = record.get("prompt_eval_count"), record.get("eval_count")
+        if type(prompt) is int and type(output) is int:
+            known_in, known_out = known_in + prompt, known_out + output
+            if bound_in is not None:
+                bound_in += prompt
+            bound_out += output
+            continue
+        exact = False
+        later = next(
+            (
+                r["prompt_eval_count"]
+                for r in records[index + 1 :]
+                if type(r.get("prompt_eval_count")) is int
+            ),
+            None,
+        )
+        bound_in = None if later is None or bound_in is None else bound_in + later
+        bound_out += LIMITS.max_tokens
+    return {
+        "exact": exact,
+        "input_tokens": known_in,
+        "output_tokens": known_out,
+        "input_tokens_upper_bound": bound_in,
+        "output_tokens_upper_bound": bound_out,
+    }
 
 
 def _error_message(response: httpx.Response) -> str:
@@ -462,6 +508,7 @@ def run_evidence_agent(
             "sampling": sampling,
             "model_calls": transport.records,
             "tool_call_repairs": transport.repairs,
+            "token_usage": agent_token_usage(transport.records),
             "tool_calls": calls + pending,
             "selected_passage_ids": selected,
             "handoff_passage_ids": handoff,

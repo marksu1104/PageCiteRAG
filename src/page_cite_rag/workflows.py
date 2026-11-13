@@ -25,6 +25,7 @@ from page_cite_rag.generation import (
     ModelClient,
     ModelError,
     OutputFailureAccounting,
+    OutputValidationError,
     PromptBudget,
     budget_for_model,
     has_chat_delimiters,
@@ -942,13 +943,16 @@ class AnswerWorkflow:
                 generation_stats=None,
                 elapsed_ms=(time.perf_counter() - start) * 1000,
             )
-        generated = self._generate_checked(
-            messages,
-            self._response_model_for(selected),
-            budget,
-            before_generation,
-            after_generation,
-        )
+        try:
+            generated = self._generate_checked(
+                messages,
+                self._response_model_for(selected),
+                budget,
+                before_generation,
+                after_generation,
+            )
+        except OutputValidationError as error:
+            generated = self._recover_output_limit(error, selected)
         # validate_claims rereads source again and rejects any citation outside the admitted set.
         try:
             generated, draft, writer_deviations, writer_steps = self._writer_output(
@@ -1044,6 +1048,10 @@ class AnswerWorkflow:
         return GenerationResult(
             generated.value, generation_stats, generated.budget, generated.raw_model_output
         )
+
+    def _recover_output_limit(self, error, blocks):
+        """Writers that can answer from a truncated reply return it here; others fail as before."""
+        raise error
 
     def _writer_output(
         self, generated, blocks, question, language, before_generation, after_generation

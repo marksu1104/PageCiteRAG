@@ -29,6 +29,7 @@ from page_cite_rag.generation import (
     ContextBudgetError,
     GenerationResult,
     GenerationStats,
+    OutputFailureAccounting,
     PromptBudget,
     budget_for_model,
 )
@@ -36,8 +37,10 @@ from page_cite_rag.models import Block
 from page_cite_rag.quote_first import (
     QUOTE_FIRST_PROMPT_VERSION,
     QUOTE_TWO_STEP_PROMPT_VERSION,
+    QuoteFirstParse,
     parse_quote_extract,
     parse_quote_first,
+    parse_truncated_evidence,
     quote_answer_sources,
     quote_extract_messages,
     quote_first_draft,
@@ -270,10 +273,48 @@ class EvidenceSelectionDraft(BaseModel):
     uncovered_parts: tuple[str, ...] = Field(default=(), max_length=8)
 
 
+def _drop_detail_inference_without_basis(json_data):
+    """Remove detail claims marked limited_inference that omit their inference_basis.
+
+    An inference must state its premises (T4 H07). The JSON schema cannot require
+    inference_basis only for limited_inference, so such a detail claim is dropped and counted
+    instead of voiding the whole answer. Answer claims stay hard failures. Input without such a
+    claim is returned unchanged.
+    """
+    try:
+        data = json.loads(json_data)
+    except (TypeError, ValueError):
+        return json_data, 0
+    claims = data.get("detail_claims") if isinstance(data, dict) else None
+    if not isinstance(claims, list):
+        return json_data, 0
+    dropped = {
+        str(claim.get("claim_id"))
+        for claim in claims
+        if isinstance(claim, dict)
+        and claim.get("support") == "limited_inference"
+        and not str(claim.get("inference_basis") or "").strip()
+    }
+    if not dropped:
+        return json_data, 0
+    data["detail_claims"] = [
+        claim
+        for claim in claims
+        if not (isinstance(claim, dict) and str(claim.get("claim_id")) in dropped)
+        or claim.get("support") != "limited_inference"
+        or str(claim.get("inference_basis") or "").strip()
+    ]
+    for item in data.get("requirement_coverage") or []:
+        if isinstance(item, dict) and isinstance(item.get("claim_ids"), list):
+            item["claim_ids"] = [cid for cid in item["claim_ids"] if cid not in dropped]
+    return json.dumps(data, ensure_ascii=False), len(claims) - len(data["detail_claims"])
+
+
 class _StatusDiscriminatedDraft(BaseModel):
     """Base for answer drafts whose JSON schema is a status-discriminated union."""
 
     __schema_variants__: ClassVar[tuple[type[BaseModel], ...]] = ()
+    _deviations: list[dict] = PrivateAttr(default_factory=list)
 
     @classmethod
     def _schema_adapter(cls) -> TypeAdapter:
@@ -292,6 +333,16 @@ class _StatusDiscriminatedDraft(BaseModel):
 
     @classmethod
     def model_validate_json(cls, json_data, **kwargs):
+        json_data, dropped = _drop_detail_inference_without_basis(json_data)
+        result = cls._validate_variant_json(json_data, **kwargs)
+        if dropped:
+            result._deviations.append(
+                {"type": "detail_inference_without_basis_dropped", "count": dropped}
+            )
+        return result
+
+    @classmethod
+    def _validate_variant_json(cls, json_data, **kwargs):
         variants = cls.__dict__.get("__schema_variants__", ())
         if not variants:
             return super().model_validate_json(json_data, **kwargs)
@@ -306,6 +357,16 @@ class _StatusDiscriminatedDraft(BaseModel):
             if deviation not in result._deviations:
                 result._deviations.append(deviation)
         return result
+
+
+@dataclass(frozen=True)
+class _TruncatedReply:
+    """Verified quotes from a quote-first reply that hit the output limit before answering."""
+
+    extracted: QuoteFirstParse
+    verified_ids: tuple[str, ...]
+    deviations: tuple[dict, ...]
+    accounting: OutputFailureAccounting
 
 
 @dataclass(frozen=True)
@@ -1677,9 +1738,40 @@ class FullAnswerWorkflow(AnswerWorkflow):
             raise WorkflowError("evidence selection exceeded the explicit generation budget")
         return stats
 
+    def _recover_output_limit(self, error, blocks):
+        """A quote-first reply cut at the output limit keeps the quotes it verified."""
+        if self.writer != "quote_first" or error.reason != "output_limit":
+            raise error
+        extracted = parse_truncated_evidence(error.raw_model_output or "")
+        verified, deviations = verify_quotes(extracted, _spans(blocks))
+        if not verified:
+            raise error
+        return _TruncatedReply(extracted, tuple(verified), tuple(deviations), error.accounting)
+
     def _writer_output(
         self, generated, blocks, question, language, before_generation, after_generation
     ):
+        if isinstance(generated, _TruncatedReply):
+            # One answer call from the quotes the cut reply verified (the two-step answer step).
+            deviations = [{"type": "quote_first_output_limit", "count": 1}, *generated.deviations]
+            step = {
+                "step": "truncated",
+                "prompt_eval_count": generated.accounting.prompt_eval_count,
+                "eval_count": generated.accounting.eval_count,
+                "exact_input_tokens": None,
+                "deviations": list(deviations),
+            }
+            return self._answer_from_quotes(
+                generated.extracted,
+                list(generated.verified_ids),
+                _spans(blocks),
+                question,
+                language,
+                before_generation,
+                after_generation,
+                deviations,
+                [step],
+            )
         if self.writer != "quote_two_step":
             return super()._writer_output(
                 generated, blocks, question, language, before_generation, after_generation
@@ -1703,6 +1795,31 @@ class FullAnswerWorkflow(AnswerWorkflow):
         if reason:
             draft = FullAnswerDraft(status="insufficient_evidence")
             return generated, draft, tuple(extract_deviations), tuple(steps)
+        return self._answer_from_quotes(
+            extracted,
+            extracted_ids,
+            spans,
+            question,
+            language,
+            before_generation,
+            after_generation,
+            extract_deviations,
+            steps,
+        )
+
+    def _answer_from_quotes(
+        self,
+        extracted,
+        extracted_ids,
+        spans,
+        question,
+        language,
+        before_generation,
+        after_generation,
+        prior_deviations,
+        steps,
+    ):
+        """Answer from verified quotes only; citations stay inside those sources."""
         messages = quote_first_messages(
             question,
             language,
@@ -1725,7 +1842,7 @@ class FullAnswerWorkflow(AnswerWorkflow):
         return (
             generated,
             FullAnswerDraft.model_validate(payload, strict=True),
-            (*extract_deviations, *deviations),
+            (*prior_deviations, *deviations),
             tuple(steps),
         )
 

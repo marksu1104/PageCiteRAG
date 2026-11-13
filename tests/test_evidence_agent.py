@@ -139,7 +139,7 @@ def test_search_search_finish(setup, monkeypatch):
         f"{pids[0]}: {blocks[0].text.replace(chr(10), chr(32))}\n\nSteps used: 0 of 8."
     )
     trace = result.trace
-    assert trace["version"] == "evidence-agent/v4"
+    assert trace["version"] == "evidence-agent/v5"
     assert trace["tool_call_repairs"] == 0
     assert trace["sampling"] == {"temperature": 0.0, "seed": 42}
     assert all(
@@ -502,6 +502,7 @@ def test_rejected_tool_call_is_corrected_once(setup, monkeypatch):
     assert requests[1]["messages"][:-1] == requests[0]["messages"]
     correction = requests[1]["messages"][-1]
     assert correction["role"] == "user" and "finish call" in correction["content"]
+    assert "512 tokens" in correction["content"] and "only one tool call" in correction["content"]
     rejected, repaired = result.trace["model_calls"]
     assert rejected["status"] == "tool_call_rejected" and rejected["http_status"] == 500
     assert rejected["error_message"] == REJECTED_FINISH and rejected["eval_count"] is None
@@ -511,7 +512,7 @@ def test_rejected_tool_call_is_corrected_once(setup, monkeypatch):
     assert result.answer.status == "answered" and len(model.calls) == 1
 
 
-def test_second_rejection_fails_the_question_without_writer(setup, monkeypatch):
+def test_rejections_beyond_the_repair_budget_fail_without_writer(setup, monkeypatch):
     workflow, client, _, _, model, _ = setup
     after = []
     mock_agent_http(monkeypatch, client, lambda request: server_error(request, REJECTED_FINISH))
@@ -520,8 +521,8 @@ def test_second_rejection_fails_the_question_without_writer(setup, monkeypatch):
             workflow, client, "Who was excluded?", language="en", after_model_call=after.append
         )
     assert issubclass(agent_module.AgentToolCallError, ModelError)
-    assert [r["status"] for r in after] == ["tool_call_rejected"] * 2
-    assert [r["repair"] for r in after] == [False, True]
+    assert [r["status"] for r in after] == ["tool_call_rejected"] * (LIMITS.tool_call_repairs + 1)
+    assert [r["repair"] for r in after] == [False] + [True] * LIMITS.tool_call_repairs
     assert model.calls == []
 
 
@@ -561,3 +562,55 @@ def test_correction_does_not_use_an_agent_step():
     assert len(guard.records) == LIMITS.model_calls + 1 and guard.repairs == 1
     with pytest.raises(ModelError, match="ceiling"):
         guard.handle_request(request)
+
+
+def cut_reply(request, content="Let me think about which passages matter most"):
+    message = {"role": "assistant", "content": content, "tool_calls": None}
+    return httpx.Response(
+        200,
+        json={
+            "id": "synthetic",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "synthetic",
+            "choices": [{"index": 0, "finish_reason": "length", "message": message}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": LIMITS.max_tokens},
+        },
+        request=request,
+    )
+
+
+def test_reply_cut_before_any_tool_call_ends_search_without_repair(setup, monkeypatch):
+    workflow, client, _, _, model, _ = setup
+    requests = []
+
+    def handler(request):
+        requests.append(True)
+        return cut_reply(request)
+
+    mock_agent_http(monkeypatch, client, handler)
+    result = run_evidence_agent(workflow, client, "Who was excluded?", language="en")
+    (call,) = result.trace["model_calls"]
+    assert call["status"] == "cut_without_tool_call" and call["finish_reason"] == "length"
+    assert len(requests) == 1 and result.trace["tool_call_repairs"] == 0
+    assert result.trace["handoff_reason"] == "finish_not_called"
+    assert len(model.calls) == 1
+
+
+def test_token_usage_bounds_calls_without_reported_usage():
+    usage = agent_module.agent_token_usage(
+        [
+            {"prompt_eval_count": 100, "eval_count": 20},
+            {"prompt_eval_count": None, "eval_count": None, "status": "tool_call_rejected"},
+            {"prompt_eval_count": 180, "eval_count": 30},
+        ]
+    )
+    assert usage == {
+        "exact": False,
+        "input_tokens": 280,
+        "output_tokens": 50,
+        "input_tokens_upper_bound": 460,
+        "output_tokens_upper_bound": 50 + LIMITS.max_tokens,
+    }
+    last_unknown = agent_module.agent_token_usage([{"prompt_eval_count": None, "eval_count": None}])
+    assert last_unknown["input_tokens_upper_bound"] is None

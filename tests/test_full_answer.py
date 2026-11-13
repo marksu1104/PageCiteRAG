@@ -967,3 +967,57 @@ def test_a_source_repeated_within_one_claim_is_cited_once_and_counted(tmp_path):
         "Only under con",
     ]
     assert result.citation_duplicates_removed == 1
+
+
+def _claim(cid, source, support="direct", basis=None):
+    claim = {"claim_id": cid, "text": f"Claim {cid}.", "citations": [{"source_id": source}]}
+    claim["support"] = support
+    if basis is not None:
+        claim["inference_basis"] = basis
+    return claim
+
+
+def test_detail_inference_without_basis_is_dropped_not_voiding_the_answer():
+    from page_cite_rag.full_answer import FullAnswerDraft, FullAnswerWorkflow
+
+    short = FullAnswerWorkflow._short_answer_model_for(["S1", "S2"])
+    payload = {
+        "status": "answered",
+        "short_answer": _claim("C1", "S1"),
+        "detail_claims": [
+            _claim("C2", "S2"),
+            _claim("C3", "S2", "limited_inference"),
+            _claim("C4", "S1", "limited_inference", "S1 states the premise."),
+        ],
+        "limitations": [],
+    }
+    draft = short.model_validate_json(json.dumps(payload), strict=True)
+    assert [c.claim_id for c in draft.detail_claims] == ["C2", "C4"]
+    assert draft._deviations == [{"type": "detail_inference_without_basis_dropped", "count": 1}]
+    # The same output with the basis present is validated unchanged.
+    payload["detail_claims"][1]["inference_basis"] = "S2 implies it."
+    assert short.model_validate_json(json.dumps(payload), strict=True)._deviations == []
+    general = {
+        "status": "answered",
+        "answer_claims": [_claim("C1", "S1")],
+        "detail_claims": [_claim("C2", "S2", "limited_inference", "  ")],
+    }
+    kept = FullAnswerDraft.model_validate_json(json.dumps(general), strict=True)
+    assert kept.detail_claims == ()
+    assert kept._deviations == [{"type": "detail_inference_without_basis_dropped", "count": 1}]
+
+
+def test_answer_claim_inference_without_basis_still_fails():
+    from pydantic import ValidationError
+
+    from page_cite_rag.full_answer import FullAnswerWorkflow
+
+    short = FullAnswerWorkflow._short_answer_model_for(["S1"])
+    payload = {
+        "status": "answered",
+        "short_answer": _claim("C1", "S1", "limited_inference"),
+        "detail_claims": [],
+        "limitations": [],
+    }
+    with pytest.raises(ValidationError, match="inference_basis"):
+        short.model_validate_json(json.dumps(payload), strict=True)

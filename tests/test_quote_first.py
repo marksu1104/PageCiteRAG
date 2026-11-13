@@ -356,3 +356,94 @@ def test_marker_only_line_is_dropped_not_a_validation_failure(spans):
     draft = FullAnswerDraft.model_validate(payload, strict=True)
     assert [claim.text for claim in draft.answer_claims] == ["120 adults"]
     assert deviations == [{"type": "quote_first_empty_line", "count": 1}]
+
+
+def _output_limit(raw, model):
+    from page_cite_rag.generation import OutputFailureAccounting, OutputValidationError
+
+    return OutputValidationError(
+        "output_limit",
+        OutputFailureAccounting(
+            prompt_eval_count=50,
+            eval_count=model.config.num_predict,
+            elapsed_ms=1.0,
+            stop_type="limit",
+        ),
+        raw_model_output=raw,
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    ["Reasoning: It keeps going and going", '[S999] "cut mid quo'],
+)
+def test_output_limit_answers_from_the_verified_quotes(setup, monkeypatch, tail):
+    store, doc_id, blocks, retriever, model, _ = setup
+    s1 = f"S{blocks[0].ordinal}"
+    truncated = f'Evidence:\n[{s1}] "Children were excluded."\n[S998] "not a source"\n{tail}'
+
+    def generate(messages, response_model):
+        model.calls.append((messages, response_model))
+        if len(model.calls) == 1:
+            raise _output_limit(truncated, model)
+        text = f'Evidence:\n[{s1}] "Children were excluded."\nReasoning: stated.\nAnswer: Children'
+        return GenerationResult(text, stats(), check_budget(messages, None, model.config))
+
+    monkeypatch.setattr(model, "generate", generate)
+    workflow = document_workflow(
+        store,
+        doc_id,
+        retriever,
+        model,
+        model.config,
+        writer="quote_first",
+        answer_format="short_answer",
+    )
+    result = workflow.answer_from_context("Who was excluded?", blocks, language="en")
+    assert result.status == "answered" and result.answer == "Children"
+    assert [s["step"] for s in result.writer_steps] == ["truncated", "answer"]
+    assert result.writer_steps[0]["eval_count"] == model.config.num_predict
+    assert {"type": "quote_first_output_limit", "count": 1} in result.output_deviations
+    # The answer call sees only the verified quote, never the cut reply or unknown sources.
+    answer_prompt = model.calls[1][0][1].content
+    assert "Children were excluded." in answer_prompt and "S998" not in answer_prompt
+    assert "keeps going" not in answer_prompt
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [None, "Reasoning: no evidence section at all", 'Evidence:\n[S998] "invented"\nReasoning: x'],
+)
+def test_output_limit_without_verified_quotes_still_fails(setup, monkeypatch, raw):
+    from page_cite_rag.generation import OutputValidationError
+
+    store, doc_id, blocks, retriever, model, _ = setup
+
+    def generate(messages, response_model):
+        model.calls.append((messages, response_model))
+        raise _output_limit(raw, model)
+
+    monkeypatch.setattr(model, "generate", generate)
+    workflow = document_workflow(
+        store, doc_id, retriever, model, model.config, writer="quote_first"
+    )
+    with pytest.raises(OutputValidationError):
+        workflow.answer_from_context("Who was excluded?", blocks, language="en")
+    assert len(model.calls) == 1
+
+
+def test_structured_writer_still_fails_on_output_limit(setup, monkeypatch):
+    from page_cite_rag.generation import OutputValidationError
+
+    store, doc_id, blocks, retriever, model, _ = setup
+    s1 = f"S{blocks[0].ordinal}"
+
+    def generate(messages, response_model):
+        model.calls.append((messages, response_model))
+        raise _output_limit(f'Evidence:\n[{s1}] "Children were excluded."\nReasoning: x', model)
+
+    monkeypatch.setattr(model, "generate", generate)
+    workflow = document_workflow(store, doc_id, retriever, model, model.config)
+    with pytest.raises(OutputValidationError):
+        workflow.answer_from_context("Who was excluded?", blocks, language="en")
+    assert len(model.calls) == 1

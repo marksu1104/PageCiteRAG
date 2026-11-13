@@ -141,6 +141,26 @@ def _parse_evidence(area: str) -> list[tuple[str, tuple[str, ...]]]:
     return evidence
 
 
+def parse_truncated_evidence(text: str) -> QuoteFirstParse:
+    """Evidence lines a quote-first reply wrote before it hit the output limit.
+
+    Only the first Evidence section counts (later sections are reasoning or a restart). When the
+    reply ends inside that section, its last line may be cut mid-quote and is dropped.
+    """
+    lines = text.splitlines()
+    headers = [(i, match) for i, line in enumerate(lines) if (match := _HEADER.match(line))]
+    starts = [(i, m) for i, m in headers if m[1].lower() == "evidence"]
+    if not starts:
+        return QuoteFirstParse((), "", (), False, False)
+    start, header = starts[0]
+    end = next((i for i, _ in headers if i > start), None)
+    body = [header[2], *lines[start + 1 : end if end is not None else len(lines)]]
+    if end is None:
+        body = body[:-1]
+    evidence = _parse_evidence("\n".join(body))
+    return QuoteFirstParse(tuple(evidence), "", (), False, bool(evidence))
+
+
 def parse_quote_extract(text: str) -> QuoteFirstParse:
     evidence = _parse_evidence(text)
     none = text.strip().casefold() == "none"
