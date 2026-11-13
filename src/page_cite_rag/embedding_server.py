@@ -373,7 +373,7 @@ class NativeEmbeddingServer:
                 raise RetrievalError("native embedding server startup exceeded 60 seconds")
             time.sleep(0.2)
         self._log.flush()
-        self._verify_offload((session / "server.log").read_text(errors="replace"))
+        self._verify_offload((session / "server.log").read_text(errors="replace", encoding="utf-8"))
         self.startup_ms = (time.perf_counter() - started) * 1000
 
     def _append_sample(self, sample: dict) -> None:

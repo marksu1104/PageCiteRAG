@@ -42,7 +42,7 @@ def make_client(tmp_path, monkeypatch, *, result=None, log=b"", startup_failure=
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "fake-model").write_bytes(b"synthetic weights")
-    (bundle / "manifest.json").write_text("{}")
+    (bundle / "manifest.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
         llama,
         "verify_bundle",
@@ -83,7 +83,7 @@ def make_client(tmp_path, monkeypatch, *, result=None, log=b"", startup_failure=
         state.code = -sig
 
     monkeypatch.setattr(llama.LlamaModelClient, "_start", start)
-    monkeypatch.setattr(llama.os, "killpg", killpg)
+    monkeypatch.setattr(llama.os, "killpg", killpg, raising=False)
     return lambda: llama.LlamaModelClient(llama.LlamaConfig(bundle_dir=bundle)), state
 
 

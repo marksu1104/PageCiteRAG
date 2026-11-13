@@ -14,6 +14,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.20"
+          python-version: "3.11"
+          enable-cache: false
+      - name: Install tested CPU features
+        run: uv sync --locked --no-default-groups --group dev --group eval --extra api --extra gpu-embed --extra agent --extra mcp --no-editable
+      - name: Lint
+        run: uv run --no-sync ruff check --no-cache src scripts tests
+      - name: Windows regression tests
+        run: uv run --no-sync python -m pytest -q -p no:cacheprovider
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

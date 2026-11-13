@@ -2032,7 +2032,7 @@ def test_reading_planner_records_failures_and_never_retries_failed_cases(
     if failure_kind == "terminal":
         with pytest.raises(ModelError, match="unstarted case"):
             run_reading_eval._run_reading_plans(tmp_path / "run", static, cases)
-        failed = json.loads(results_path.read_text().splitlines()[0])
+        failed = json.loads(results_path.read_text(encoding="utf-8").splitlines()[0])
         assert failed["case_id"] == "first"
         assert failed["failure_type"] == "ModelError"
         assert not (tmp_path / "run/reading-plans/ready.json").exists()
@@ -2041,7 +2041,7 @@ def test_reading_planner_records_failures_and_never_retries_failed_cases(
     else:
         ready = run_reading_eval._run_reading_plans(tmp_path / "run", static, cases)
 
-    completed = [json.loads(line) for line in results_path.read_text().splitlines()]
+    completed = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines()]
     assert [row["case_id"] for row in completed] == ["first", "second"]
     assert [model.calls for model in models] == ([1, 1] if failure_kind == "terminal" else [2])
     assert ready["successful_plans"] == 1
@@ -2088,7 +2088,7 @@ def test_same_pool_reranker_freezes_candidates_and_admits_exact_contexts(tmp_pat
     }
     run_root = tmp_path / "run"
     run_root.mkdir()
-    (run_root / "configuration.json").write_text(json.dumps({"static": static}))
+    (run_root / "configuration.json").write_text(json.dumps({"static": static}), encoding="utf-8")
     grid_dir = run_root / "retrieval-grid"
     grid_dir.mkdir()
     grid_path = grid_dir / "retrieval-grid.jsonl"
@@ -2625,7 +2625,8 @@ def test_official_longbench_keeps_healthy_client_but_stops_on_fatal_failure(
                 "generator_identity": Model.identity,
                 "cases": preflight,
             }
-        )
+        ),
+        encoding="utf-8",
     )
     monkeypatch.setattr(run_reading_eval, "LlamaModelClient", Model)
     monkeypatch.setattr(run_reading_eval, "_llama_config", lambda *a, **kw: None)
@@ -2634,7 +2635,7 @@ def test_official_longbench_keeps_healthy_client_but_stops_on_fatal_failure(
     assert Model.calls == (2 if failure_kind == "output_limit" else 1)
     assert result["stopped"] == (None if failure_kind == "output_limit" else "model_client_failed")
     assert result["remaining_slots"] == (0 if failure_kind == "output_limit" else 1)
-    failed = json.loads((tmp_path / arm / "first.json").read_text())
+    failed = json.loads((tmp_path / arm / "first.json").read_text(encoding="utf-8"))
     assert failed["failure"]["error_message"]
     assert failed["failure"]["failure_stage"] == "generation"
 

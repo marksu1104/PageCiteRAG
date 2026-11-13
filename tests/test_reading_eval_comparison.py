@@ -275,9 +275,11 @@ def test_paired_run_builder_rejects_incomplete_or_mismatched_case_runs(tmp_path)
     frozen.mkdir()
     reference_root.mkdir()
     candidate_root.mkdir()
-    (frozen / "manifest.json").write_text(json.dumps({"cases": [{"case_id": "a"}]}))
-    (frozen / "inputs.jsonl").write_text("{}\n")
-    (frozen / "gold.jsonl").write_text("{}\n")
+    (frozen / "manifest.json").write_text(
+        json.dumps({"cases": [{"case_id": "a"}]}), encoding="utf-8"
+    )
+    (frozen / "inputs.jsonl").write_text("{}\n", encoding="utf-8")
+    (frozen / "gold.jsonl").write_text("{}\n", encoding="utf-8")
     for root in (reference_root, candidate_root):
         shared_static = {
             "models": {"generator": "pinned-model"},
@@ -299,7 +301,8 @@ def test_paired_run_builder_rejects_incomplete_or_mismatched_case_runs(tmp_path)
                     "evaluation_scope": {"arms": ["routed-reading"], "case_ids": ["other"]},
                     "arms": {"routed-reading": {"datasets": {}}},
                 }
-            )
+            ),
+            encoding="utf-8",
         )
 
     with pytest.raises(ValueError, match="same cases"):

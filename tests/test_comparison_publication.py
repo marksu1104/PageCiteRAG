@@ -81,11 +81,13 @@ def test_publication_recomputes_metrics_and_exports_only_query_record_fields(tmp
     for method in ("bm25", "dense", "hybrid"):
         rows = [
             json.loads(line)
-            for line in (destination / (method + ".jsonl")).read_text().splitlines()
+            for line in (destination / (method + ".jsonl")).read_text(encoding="utf-8").splitlines()
         ]
         assert len(rows) == 2
         assert all(set(row) == set(evaluation.QueryRecord.model_fields) for row in rows)
-        assert "Synthetic alpha." not in (destination / (method + ".jsonl")).read_text()
+        assert "Synthetic alpha." not in (destination / (method + ".jsonl")).read_text(
+            encoding="utf-8"
+        )
     with pytest.raises(ValueError, match="overwrite"):
         publisher()(comparison, destination)
 
@@ -95,17 +97,17 @@ def test_publication_refuses_unexpected_text_or_inconsistent_results(tmp_path, c
     directory = next(p for p in comparison.iterdir() if p.is_dir() and len(p.name) == 64)
     if damage == "metric":
         path = directory / "summary.json"
-        summary = json.loads(path.read_text())
+        summary = json.loads(path.read_text(encoding="utf-8"))
         summary["results"]["validation"]["metrics_at_k"]["5"]["macro_evidence_recall"] = 0.1
-        path.write_text(json.dumps(summary))
+        path.write_text(json.dumps(summary), encoding="utf-8")
     else:
         path = directory / "results.jsonl"
-        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
         if damage == "text":
             rows[0]["question_text"] = "must not be published"
         else:
             rows[0]["retrieved_passage_ids"] = ["other-paper/a"]
-        path.write_text("\n".join(json.dumps(r) for r in rows))
+        path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
     with pytest.raises(ValueError):
         publisher()(comparison, tmp_path / "public")
     assert not (tmp_path / "public").exists()

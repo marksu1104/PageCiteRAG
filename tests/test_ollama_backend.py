@@ -42,7 +42,7 @@ def make_ollama(
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "fake-model").write_bytes(b"fake weights")
-    (bundle / "manifest.json").write_text("{}")
+    (bundle / "manifest.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
         ollama_backend, "verify_bundle", lambda *_: {"files": {"fake-model": "test"}}
     )
@@ -164,7 +164,8 @@ def test_ollama_client_starts_from_model_only_bundle_without_llama_server(monkey
                 "model_sha256": spec["sha256"],
                 "files": {spec["file"]: spec["sha256"]},
             }
-        )
+        ),
+        encoding="utf-8",
     )
     monkeypatch.setattr(llama, "model_spec", lambda _size: spec)
     monkeypatch.setattr(llama.LlamaModelClient, "_capture_process_status", lambda _self: None)

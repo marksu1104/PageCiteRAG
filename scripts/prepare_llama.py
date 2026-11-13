@@ -145,13 +145,17 @@ def prepare_with_runtime(
                     str(p.relative_to(bundle)): sha256(p) for p in bundle.rglob("*") if p.is_file()
                 },
             }
-            (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            (bundle / "manifest.json").write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+            )
             verify_bundle(bundle, model_size)
             bundle.rename(target)
         report["prepared"] = True
         report["bundle_dir"] = str(target)
     finally:
-        (output / "preparation.json").write_text(json.dumps(report, indent=2) + "\n")
+        (output / "preparation.json").write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8"
+        )
     print(
         f"Pinned {model_size.upper()} bundle prepared; existing runtime reused without rebuilding.",
         flush=True,
@@ -223,14 +227,17 @@ def prepare_gguf_only(target: Path, output: Path, source_model: Path | None = No
                     },
                     indent=2,
                 )
-                + "\n"
+                + "\n",
+                encoding="utf-8",
             )
             verify_gguf_only(staged)
             staged.rename(target)
         report["prepared"] = True
         report["model_dir"] = str(target)
     finally:
-        (output / "preparation.json").write_text(json.dumps(report, indent=2) + "\n")
+        (output / "preparation.json").write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8"
+        )
 
 
 def main() -> None:
@@ -451,7 +458,9 @@ def main() -> None:
                         if p.is_file()
                     },
                 }
-                (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+                (bundle / "manifest.json").write_text(
+                    json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+                )
                 verify_bundle(bundle)
                 bundle.rename(target)
             report["prepared"] = True
@@ -460,7 +469,9 @@ def main() -> None:
         report["temporary_directory_removed"] = not Path(
             report.get("temporary_directory", "/path-not-created")
         ).exists()
-        (output / "preparation.json").write_text(json.dumps(report, indent=2) + "\n")
+        (output / "preparation.json").write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8"
+        )
     print("Pinned bundle prepared; temporary build environment removed.", flush=True)
 
 

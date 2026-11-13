@@ -207,7 +207,10 @@ def test_search_search_finish(setup, monkeypatch):
 def test_eight_searches_no_ninth_and_all_passages(setup, tmp_path, monkeypatch):
     workflow, client, _, retriever, model, _ = setup
     source = tmp_path / "many.txt"
-    source.write_text("\n\n".join(f"Passage {i} contains synthetic evidence." for i in range(45)))
+    source.write_text(
+        "\n\n".join(f"Passage {i} contains synthetic evidence." for i in range(45)),
+        encoding="utf-8",
+    )
     prepared = prepare_source(source, usage_scope="self-authored-test")
     store = SQLiteDocumentStore(tmp_path / "many.sqlite3")
     store.ingest(prepared.document, prepared.iter_units())

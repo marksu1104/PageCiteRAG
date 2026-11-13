@@ -115,8 +115,8 @@ def test_calibration_uses_frozen_ranks_and_changes_no_baseline_files(
     assert before == {p.name: p.read_bytes() for p in source.iterdir()}
     output = tmp_path / "calibration"
     write_diagnostic(output, report, rows)
-    assert "Alpha sample" not in (output / "records.jsonl").read_text()
-    assert "Alpha samples?" not in (output / "report.json").read_text()
+    assert "Alpha sample" not in (output / "records.jsonl").read_text(encoding="utf-8")
+    assert "Alpha samples?" not in (output / "report.json").read_text(encoding="utf-8")
     with pytest.raises(EvaluationError, match="exists"):
         write_diagnostic(output, report, rows)
     assert encoder.document_calls == 2
@@ -128,9 +128,9 @@ def test_calibration_uses_frozen_ranks_and_changes_no_baseline_files(
 def test_calibration_rejects_corrupt_or_unexpected_baseline(tmp_path, baseline, damage):
     source, _, _ = baseline
     path = source / "dense.jsonl"
-    records = [json.loads(line) for line in path.read_text().splitlines()]
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     summary_path = source / "summary.json"
-    summary = json.loads(summary_path.read_text())
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
     if damage == "gold":
         records[0]["gold_passage_ids"] = ["unknown"]
     elif damage == "extra":
@@ -147,8 +147,8 @@ def test_calibration_rejects_corrupt_or_unexpected_baseline(tmp_path, baseline, 
         summary["selection_sha256"] = "0" * 64
     else:
         summary["methods"]["bm25"]["configuration"]["revision"] = "not-pinned"
-    path.write_text("\n".join(json.dumps(row) for row in records))
-    summary_path.write_text(json.dumps(summary))
+    path.write_text("\n".join(json.dumps(row) for row in records), encoding="utf-8")
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
     with pytest.raises((EvaluationError, ValueError)):
         load_comparison(source, tmp_path)
 

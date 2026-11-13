@@ -69,7 +69,7 @@ class NativeEmbeddingEncoder:
 
         largest_input = max(max_tokens, query_max_tokens)
         if largest_input > 512:
-            capacity = json.loads((directory / "config.json").read_text()).get(
+            capacity = json.loads((directory / "config.json").read_text(encoding="utf-8")).get(
                 "max_position_embeddings"
             )
             if type(capacity) is not int or largest_input > capacity:
@@ -77,7 +77,9 @@ class NativeEmbeddingEncoder:
         context_size = getattr(transport, "_context_size", None)
         if callable(context_size) and context_size() < largest_input:
             raise RetrievalError("embedding server context is smaller than encoder allowance")
-        prompt_info = json.loads((directory / "config_sentence_transformers.json").read_text())
+        prompt_info = json.loads(
+            (directory / "config_sentence_transformers.json").read_text(encoding="utf-8")
+        )
         prompt = prompt_info["prompts"]["query"]
         if not prompt or prompt_info["prompts"].get("document") != "":
             raise RetrievalError("local embedding query/document prompt changed")

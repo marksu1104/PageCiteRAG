@@ -143,7 +143,7 @@ def test_invalid_custom_block_factory_rolls_back(tmp_path):
     from page_cite_rag.models import Block
 
     path = tmp_path / "source.txt"
-    path.write_text("Actual source.")
+    path.write_text("Actual source.", encoding="utf-8")
     prepared = prepare_source(path)
     store = SQLiteDocumentStore(tmp_path / "docs.sqlite3")
 

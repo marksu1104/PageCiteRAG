@@ -29,14 +29,14 @@ def publish(source: Path, destination: Path) -> None:
     for directory in sorted(source.iterdir()):
         if not directory.is_dir() or len(directory.name) != 64:
             continue
-        summary = json.loads((directory / "summary.json").read_text())
+        summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
         if set(summary) != summary_fields:
             raise ValueError("unexpected summary fields")
         config = summary["configuration"]
         method = config["retriever"]["method"]
         if method not in ("bm25", "dense", "hybrid") or method in methods:
             raise ValueError("expected exactly one complete run for each method")
-        selection = json.loads((directory / "selection.json").read_text())
+        selection = json.loads((directory / "selection.json").read_text(encoding="utf-8"))
         if (
             _json_hash(selection) != summary["selection_sha256"]
             or _json_hash({"configuration": config, "selection": selection}) != summary["run_id"]
@@ -50,7 +50,7 @@ def publish(source: Path, destination: Path) -> None:
             (r["split"], r["paper_id"], r["question_id"]): r["gold_passage_ids"] for r in selection
         }
         seen = set()
-        for line in (directory / "results.jsonl").read_text().splitlines():
+        for line in (directory / "results.jsonl").read_text(encoding="utf-8").splitlines():
             row = json.loads(line)
             if set(row) != row_fields:
                 raise ValueError("unexpected result fields; refusing an invalid result record")
@@ -78,9 +78,11 @@ def publish(source: Path, destination: Path) -> None:
         staging = Path(temporary) / "comparison"
         staging.mkdir()
         report = {"selection_sha256": selection_sha, "methods": methods}
-        (staging / "summary.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        (staging / "summary.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         for method, rows in records.items():
-            with (staging / (method + ".jsonl")).open("w") as out:
+            with (staging / (method + ".jsonl")).open("w", encoding="utf-8") as out:
                 for row in rows:
                     out.write(row.model_dump_json() + "\n")
         staging.rename(destination)

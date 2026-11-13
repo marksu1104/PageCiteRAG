@@ -114,7 +114,7 @@ def verify_bundle(directory: Path, model_size: Literal["9b", "4b", "27b"] = "9b"
         manifest = directory / "manifest.json"
         if manifest.is_symlink() or manifest.stat().st_size > 65536:
             raise ValueError("invalid manifest")
-        value = json.loads(manifest.read_text())
+        value = json.loads(manifest.read_text(encoding="utf-8"))
         if (
             value["format"] != 1
             or value["llama_commit"] != LLAMA_COMMIT
@@ -160,7 +160,7 @@ def verify_gguf_only(directory: Path, spec: dict | None = None) -> dict:
         model_path = directory / spec["file"]
         if manifest_path.stat().st_size > 65536:
             raise ValueError("invalid model-only manifest")
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         actual_files = {
             str(path.relative_to(directory)) for path in directory.rglob("*") if path.is_file()
         }
@@ -580,7 +580,7 @@ class LlamaModelClient:
         self._auth_token = token
         key_file = temporary / "api-key"
         key_file.touch(mode=0o600)
-        key_file.write_text(token + "\n")
+        key_file.write_text(token + "\n", encoding="utf-8")
         env["CUDA_CACHE_PATH"] = str(temporary / "cuda-cache")
         with socket.socket() as port_probe:
             port_probe.bind(("127.0.0.1", 0))
@@ -667,7 +667,7 @@ class LlamaModelClient:
             time.sleep(0.1)
         if self.config.device == "cuda":
             self._log.flush()
-            log = (temporary / "server.log").read_text(errors="replace")
+            log = (temporary / "server.log").read_text(errors="replace", encoding="utf-8")
             self._verify_gpu_offload(log)
         props = self._request("/props")
         if props.get("default_generation_settings", {}).get("n_ctx") != self.config.num_ctx:

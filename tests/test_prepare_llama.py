@@ -23,7 +23,7 @@ def _fake_runtime(tmp_path):
     runtime = tmp_path / "models" / "runtime-9b"
     (runtime / "bin").mkdir(parents=True)
     (runtime / "bin" / "llama-server").write_bytes(b"server")
-    (runtime / "LLAMA-LICENSE").write_text("runtime license")
+    (runtime / "LLAMA-LICENSE").write_text("runtime license", encoding="utf-8")
     (runtime / "original-9b.gguf").write_bytes(b"original weights")
     return runtime
 
@@ -40,7 +40,7 @@ def test_4b_preparation_reuses_verified_runtime_and_only_downloads_selected_mode
     def verify(path, model_size="9b"):
         verified.append((path, model_size))
         if model_size == "4b":
-            manifest = json.loads((path / "manifest.json").read_text())
+            manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
             assert manifest["model_revision"] == spec["revision"]
             assert manifest["model_sha256"] == spec["sha256"]
             assert set(manifest["files"]) == {
@@ -66,7 +66,7 @@ def test_4b_preparation_reuses_verified_runtime_and_only_downloads_selected_mode
     assert (target / "bin" / "llama-server").read_bytes() == b"server"
     assert (runtime / "original-9b.gguf").read_bytes() == b"original weights"
     assert not (target / "original-9b.gguf").exists()
-    report = json.loads((output / "preparation.json").read_text())
+    report = json.loads((output / "preparation.json").read_text(encoding="utf-8"))
     assert report["prepared"] is True
     assert report["runtime_rebuilt"] is False
     assert not list(target.parent.glob(".prepare-*"))
@@ -91,7 +91,9 @@ def test_4b_failed_download_does_not_publish_bundle_or_change_runtime(monkeypatc
     assert not target.exists()
     assert not list(target.parent.glob(".prepare-*"))
     assert (runtime / "original-9b.gguf").read_bytes() == b"original weights"
-    assert json.loads((output / "preparation.json").read_text())["prepared"] is False
+    assert (
+        json.loads((output / "preparation.json").read_text(encoding="utf-8"))["prepared"] is False
+    )
 
 
 def test_4b_cli_uses_pinned_default_without_requiring_cuda_compilers(monkeypatch, tmp_path):
@@ -150,7 +152,7 @@ def test_27b_preparation_links_verified_local_weights_without_download_or_build(
     def verify(path, model_size="9b"):
         verified.append(model_size)
         if model_size == "27b":
-            manifest = json.loads((path / "manifest.json").read_text())
+            manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
             assert manifest["llama_commit"] == prepare_llama.LLAMA_COMMIT
             assert manifest["model_revision"] == spec["revision"]
             assert manifest["model_sha256"] == spec["sha256"]
@@ -171,7 +173,7 @@ def test_27b_preparation_links_verified_local_weights_without_download_or_build(
     assert (target / spec["file"]).read_bytes() == source.read_bytes()
     assert source.stat().st_nlink == 2
     assert not (target / "original-9b.gguf").exists()
-    report = json.loads((output / "preparation.json").read_text())
+    report = json.loads((output / "preparation.json").read_text(encoding="utf-8"))
     assert report["prepared"] is True and report["runtime_rebuilt"] is False
     assert report["local_source_model"] == str(source)
     assert not list(target.parent.glob(".prepare-*"))
@@ -233,7 +235,7 @@ def test_9b_gguf_only_preparation_downloads_without_runtime_or_compiler(monkeypa
     ]
     assert (target / spec["file"]).read_bytes() == weights
     assert prepare_llama.verify_gguf_only(target)["model_sha256"] == spec["sha256"]
-    report = json.loads((output / "preparation.json").read_text())
+    report = json.loads((output / "preparation.json").read_text(encoding="utf-8"))
     assert report["prepared"] is True
     assert "no llama.cpp build or CUDA toolkit" in report["scope"]
     assert not list(target.parent.glob(".gguf-only-*"))
@@ -269,7 +271,7 @@ def test_9b_gguf_only_preparation_hardlinks_verified_local_model_without_downloa
     prepared_model = target / spec["file"]
     assert prepared_model.stat().st_ino == source.stat().st_ino
     assert prepare_llama.verify_gguf_only(target)["model_sha256"] == spec["sha256"]
-    assert json.loads((output / "preparation.json").read_text())["prepared"] is True
+    assert json.loads((output / "preparation.json").read_text(encoding="utf-8"))["prepared"] is True
 
 
 def test_9b_gguf_only_failed_download_publishes_no_partial_model(monkeypatch, tmp_path):
@@ -296,7 +298,9 @@ def test_9b_gguf_only_failed_download_publishes_no_partial_model(monkeypatch, tm
 
     assert not target.exists()
     assert not list(target.parent.glob(".gguf-only-*"))
-    assert json.loads((output / "preparation.json").read_text())["prepared"] is False
+    assert (
+        json.loads((output / "preparation.json").read_text(encoding="utf-8"))["prepared"] is False
+    )
 
 
 def test_9b_gguf_only_cli_skips_cuda_compiler_arguments(monkeypatch, tmp_path):

@@ -7,7 +7,32 @@ import sys
 
 import pytest
 
+import page_cite_rag.cli as cli
 from page_cite_rag.cli import main
+
+
+def test_main_reconfigures_non_utf8_standard_streams(monkeypatch):
+    class FakeStream:
+        encoding = "cp950"
+
+        def __init__(self):
+            self.calls = []
+
+        def reconfigure(self, **kwargs):
+            self.calls.append(kwargs)
+
+    streams = [FakeStream(), FakeStream(), FakeStream()]
+    monkeypatch.setattr(cli.sys, "stdout", streams[0])
+    monkeypatch.setattr(cli.sys, "stderr", streams[1])
+    monkeypatch.setattr(cli.sys, "stdin", streams[2])
+    monkeypatch.setattr(cli, "_run_doctor", lambda _as_json: 0)
+
+    assert main(["doctor"]) == 0
+    assert [stream.calls for stream in streams] == [
+        [{"encoding": "utf-8", "errors": "replace"}],
+        [{"encoding": "utf-8", "errors": "replace"}],
+        [{"encoding": "utf-8", "errors": "replace"}],
+    ]
 
 
 def test_help_and_version(capsys: pytest.CaptureFixture[str]) -> None:

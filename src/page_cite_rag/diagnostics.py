@@ -462,8 +462,10 @@ def write_diagnostic(destination: Path, report: dict, rows: list[dict]) -> None:
     with tempfile.TemporaryDirectory(prefix=".diagnostic-", dir=destination.parent) as temporary:
         staging = Path(temporary) / "result"
         staging.mkdir()
-        (staging / "report.json").write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
+        (staging / "report.json").write_text(
+            json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
         (staging / "records.jsonl").write_text(
-            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
         )
         staging.rename(destination)

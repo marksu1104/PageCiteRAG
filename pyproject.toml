@@ -91,4 +91,6 @@ target-version = "py311"
 testpaths = ["tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]
+preview = true
+explicit-preview-rules = true
+select = ["E", "F", "I", "PLW1514"]

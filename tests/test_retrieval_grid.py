@@ -51,8 +51,8 @@ def test_grid_continuation_requires_frozen_snapshot_and_unchanged_retrieval(tmp_
     current = json.loads(json.dumps(frozen))
     current["source_code_sha256"]["scripts/run_reading_eval.py"] = "new-runner"
     current["answer"]["case_deadline_seconds"] = 600
-    (tmp_path / "configuration.json").write_text(json.dumps({"static": frozen}))
-    (tmp_path / "GPU-STOP.json").write_text("{}")
+    (tmp_path / "configuration.json").write_text(json.dumps({"static": frozen}), encoding="utf-8")
+    (tmp_path / "GPU-STOP.json").write_text("{}", encoding="utf-8")
     with zipfile.ZipFile(tmp_path / "source-at-revalidation.zip", "w") as archive:
         archive.writestr("scripts/run_reading_eval.py", old_runner)
     assert reading_eval._validate_stopped_grid_configuration(tmp_path, current) == frozen
@@ -261,9 +261,10 @@ def test_retrieval_score_reads_baseline_reranker_cost_from_grid_rows(tmp_path, f
         row["variants"]["keyword_expansion_hybrid_reranked"] = None
         row["reranker_timing_ms"] = None
         row["reranker_pair_tokens"] = []
-    (grid / "retrieval-grid.jsonl").write_text(json.dumps(row) + "\n")
+    (grid / "retrieval-grid.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
     (prepared / "retrieval.jsonl").write_text(
-        json.dumps({"case_id": "case", "candidate_result": {"elapsed_ms": 10}}) + "\n"
+        json.dumps({"case_id": "case", "candidate_result": {"elapsed_ms": 10}}) + "\n",
+        encoding="utf-8",
     )
     inputs = [
         {

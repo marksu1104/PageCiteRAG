@@ -35,7 +35,8 @@ def encoder_parts(tmp_path, monkeypatch):
     tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
     tokenizer.save(str(tmp_path / "tokenizer.json"))
     (tmp_path / "config_sentence_transformers.json").write_text(
-        json.dumps({"prompts": {"query": "Instruct: search\nQuery:", "document": ""}})
+        json.dumps({"prompts": {"query": "Instruct: search\nQuery:", "document": ""}}),
+        encoding="utf-8",
     )
     monkeypatch.setattr(
         embedding_native, "verify_model", lambda directory: {"tokenizer.json": "a" * 64}
@@ -77,7 +78,9 @@ def test_native_adapter_uses_only_query_prefix_and_validates_vectors(encoder_par
 
 def test_query_context_can_exceed_document_chunk_limit_without_truncation(encoder_parts):
     directory, transport = encoder_parts
-    (directory / "config.json").write_text(json.dumps({"max_position_embeddings": 32768}))
+    (directory / "config.json").write_text(
+        json.dumps({"max_position_embeddings": 32768}), encoding="utf-8"
+    )
     transport._context_size = lambda: 1024
     encoder = NativeEmbeddingEncoder(
         transport,
@@ -109,7 +112,9 @@ def test_query_context_can_exceed_document_chunk_limit_without_truncation(encode
 
 def test_explicit_large_context_checks_model_and_server_capacity(encoder_parts):
     directory, transport = encoder_parts
-    (directory / "config.json").write_text(json.dumps({"max_position_embeddings": 32768}))
+    (directory / "config.json").write_text(
+        json.dumps({"max_position_embeddings": 32768}), encoding="utf-8"
+    )
     transport._context_size = lambda: 8192
     encoder = NativeEmbeddingEncoder(transport, directory, max_tokens=8192, batch_size=1)
     assert encoder.identity["max_tokens"] == 8192
@@ -117,7 +122,9 @@ def test_explicit_large_context_checks_model_and_server_capacity(encoder_parts):
     transport._context_size = lambda: 1024
     with pytest.raises(RetrievalError, match="server context"):
         NativeEmbeddingEncoder(transport, directory, max_tokens=8192)
-    (directory / "config.json").write_text(json.dumps({"max_position_embeddings": 2048}))
+    (directory / "config.json").write_text(
+        json.dumps({"max_position_embeddings": 2048}), encoding="utf-8"
+    )
     with pytest.raises(RetrievalError, match="model capacity"):
         NativeEmbeddingEncoder(transport, directory, max_tokens=8192)
 

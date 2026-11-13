@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from types import SimpleNamespace
 
 import httpx
@@ -56,7 +57,7 @@ def make_client(
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "fake-model").write_bytes(b"fake weights")
-    (bundle / "manifest.json").write_text("{}")
+    (bundle / "manifest.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(llama, "verify_bundle", lambda *_: {"files": {"fake-model": "test"}})
     calls = []
     lifecycle = {"starts": 0, "stops": 0, "returncode": None}
@@ -781,7 +782,7 @@ def test_schema_prompt_budget_flag_is_explicit_and_validated(tmp_path, monkeypat
 def test_missing_or_corrupt_bundle_does_not_download(tmp_path):
     with pytest.raises(ModelError, match="prepare explicitly"):
         llama.verify_bundle(tmp_path / "missing")
-    (tmp_path / "manifest.json").write_text("{}")
+    (tmp_path / "manifest.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ModelError):
         llama.verify_bundle(tmp_path)
 
@@ -831,7 +832,7 @@ def test_verified_bundle_file_set_hashes_and_symlinks(tmp_path, monkeypatch):
         "model_sha256": digest,
         "files": {llama.MODEL_FILE: digest, "bin/llama-server": llama.sha256(binary)},
     }
-    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     assert llama.verify_bundle(tmp_path) == manifest
     with pytest.raises(ModelError):
         llama.verify_bundle(tmp_path, "27b")
@@ -839,7 +840,7 @@ def test_verified_bundle_file_set_hashes_and_symlinks(tmp_path, monkeypatch):
     with pytest.raises(ModelError):
         llama.verify_bundle(tmp_path)
     binary.write_bytes(b"synthetic binary")
-    (tmp_path / "unexpected").write_text("extra")
+    (tmp_path / "unexpected").write_text("extra", encoding="utf-8")
     with pytest.raises(ModelError):
         llama.verify_bundle(tmp_path)
     (tmp_path / "unexpected").unlink()
@@ -849,13 +850,12 @@ def test_verified_bundle_file_set_hashes_and_symlinks(tmp_path, monkeypatch):
         llama.verify_bundle(tmp_path)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="llama prctl ownership wrapper requires Linux")
 def test_linux_exec_wrapper_rejects_wrong_parent_and_executes_owned_program():
     import os
     import subprocess
     import sys
 
-    if sys.platform != "linux":
-        pytest.skip("Linux process-ownership guard")
     base = [sys.executable, "-I", "-m", "page_cite_rag.llama_process"]
     wrong = subprocess.run(
         base + ["1", sys.executable, "-c", "print('must-not-run')"],

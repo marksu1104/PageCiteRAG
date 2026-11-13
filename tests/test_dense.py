@@ -35,7 +35,9 @@ class FakeEncoder:
 
 def ingest(tmp_path):
     path = tmp_path / "sample.txt"
-    path.write_text("Alpha 12 samples.\n\nBeta not unless 3.5%.\n\nAlpha controls.")
+    path.write_text(
+        "Alpha 12 samples.\n\nBeta not unless 3.5%.\n\nAlpha controls.", encoding="utf-8"
+    )
     prepared = prepare_source(path, usage_scope="synthetic")
     store = SQLiteDocumentStore(tmp_path / "documents.sqlite3")
     store.ingest(prepared.document, prepared.iter_units())
@@ -205,7 +207,7 @@ def test_pinned_model_preparation_checks_files_and_does_not_redownload(tmp_path,
     assert len(calls) == 1
     assert embedding.prepare_embedding_model(directory) == report
     assert len(calls) == 1
-    (directory / "unexpected.py").write_text("raise AssertionError")
+    (directory / "unexpected.py").write_text("raise AssertionError", encoding="utf-8")
     with pytest.raises(RetrievalError, match="file list"):
         embedding.verify_model(directory)
 

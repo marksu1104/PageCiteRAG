@@ -1645,6 +1645,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr, sys.stdin):
+        encoding = getattr(stream, "encoding", None)
+        if not isinstance(encoding, str) or encoding.replace("-", "").casefold() != "utf8":
+            reconfigure = getattr(stream, "reconfigure", None)
+            if callable(reconfigure):
+                reconfigure(encoding="utf-8", errors="replace")
     parser = build_parser()
     args = parser.parse_args(argv)
 

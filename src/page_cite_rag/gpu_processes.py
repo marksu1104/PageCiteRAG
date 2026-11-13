@@ -310,7 +310,7 @@ def snapshot_gpu_processes(
 def _parent_pid(pid: int) -> int | None:
     """Parent PID from ``/proc``; ``None`` when it cannot be read (treated as foreign)."""
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         return int(stat[stat.rindex(")") + 2 :].split()[1])
     except (OSError, ValueError, IndexError):
         return None

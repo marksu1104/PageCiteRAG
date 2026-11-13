@@ -106,7 +106,7 @@ def main() -> None:
             "CUDA_VISIBLE_DEVICES": "-1",
         }
         modelfile = Path(temporary) / "Modelfile"
-        modelfile.write_text(modelfile_contents(source))
+        modelfile.write_text(modelfile_contents(source), encoding="utf-8")
         log = open(Path(temporary) / "server.log", "wb")
         server = subprocess.Popen(
             [str(runtime / "bin" / "ollama"), "serve"],

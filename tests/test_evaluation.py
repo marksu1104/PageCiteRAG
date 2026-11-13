@@ -181,7 +181,10 @@ def test_offline_runner_outputs_ids_only_and_reuses_completed_records(
     assert result["this_invocation"]["index_builds"] == 4
     assert result["this_invocation"]["index_loads"] == 4
     out = Path(result["run_directory"])
-    rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
+    rows = [
+        json.loads(line)
+        for line in (out / "results.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
     assert len(rows) == 8
     assert all("question" not in row and "text" not in row for row in rows)
     assert len(list((out / "queries").glob("*.json"))) == 8
@@ -251,10 +254,10 @@ def test_cannot_overwrite_existing_run_or_reuse_foreign_results(tmp_path, synthe
     with pytest.raises(EvaluationError, match="exists"):
         run_qasper(tmp_path, tmp_path / "out", dev_questions=2, validation_questions=2)
     query_path = next((Path(result["run_directory"]) / "queries").glob("*.json"))
-    record = json.loads(query_path.read_text())
+    record = json.loads(query_path.read_text(encoding="utf-8"))
     record["retrieved_passage_ids"] = ["foreign-paper/paragraph"]
     record["scores"] = [1]
-    query_path.write_text(json.dumps(record))
+    query_path.write_text(json.dumps(record), encoding="utf-8")
     with pytest.raises(EvaluationError, match="frozen selection"):
         run_qasper(tmp_path, tmp_path / "out", dev_questions=2, validation_questions=2, resume=True)
 

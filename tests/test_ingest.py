@@ -388,7 +388,7 @@ def test_pdf_spacing_default_and_stream_order_have_distinct_source_identity(
 
 def test_pdf_order_rejects_unknown_or_non_pdf_inputs_before_creating_store(tmp_path, capsys):
     source = tmp_path / "plain.txt"
-    source.write_text("NOT a PDF.")
+    source.write_text("NOT a PDF.", encoding="utf-8")
     with pytest.raises(DocumentIngestError, match="unsupported PDF reading order"):
         prepare_source(source, pdf_reading_order="automatic")
     with pytest.raises(DocumentIngestError, match="x-tolerance ratio"):

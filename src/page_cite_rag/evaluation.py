@@ -362,8 +362,8 @@ def run_qasper(
             raise EvaluationError("run directory exists; use --resume or a new output directory")
         try:
             if (
-                json.loads((run_dir / "configuration.json").read_text()) != config
-                or json.loads((run_dir / "selection.json").read_text()) != selection
+                json.loads((run_dir / "configuration.json").read_text(encoding="utf-8")) != config
+                or json.loads((run_dir / "selection.json").read_text(encoding="utf-8")) != selection
             ):
                 raise EvaluationError("run metadata does not match this configuration")
         except (OSError, ValueError) as exc:

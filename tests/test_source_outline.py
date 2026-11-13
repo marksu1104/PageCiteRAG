@@ -151,7 +151,7 @@ def test_read_only_old_markdown_without_outline_derives_without_writing(tmp_path
 
 def test_markdown_heading_inside_unsplit_paragraph_falls_back_to_unit(tmp_path):
     path = tmp_path / "ambiguous.md"
-    path.write_text("Introductory context.\n# Ambiguous heading\nContinuation.")
+    path.write_text("Introductory context.\n# Ambiguous heading\nContinuation.", encoding="utf-8")
     source = prepare_source(path)
     store = SQLiteDocumentStore(tmp_path / "source.sqlite3")
     store.ingest(source.document, source.iter_units())

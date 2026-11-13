@@ -6,6 +6,8 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 _PREPARE_PATH = Path(__file__).resolve().parents[1] / "scripts/prepare_reading_eval.py"
 _PREPARE_SPEC = importlib.util.spec_from_file_location("prepare_reading_eval", _PREPARE_PATH)
 prepare_reading_eval = importlib.util.module_from_spec(_PREPARE_SPEC)
@@ -385,6 +387,9 @@ def _write_product_freeze_fixture(tmp_path, monkeypatch, *, valid_source_hash=Tr
     return benchmark, cases_path, gold_path
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="asserts POSIX directory and file permission bits"
+)
 def test_product_freeze_combines_existing_benchmark_and_separate_gold(tmp_path, monkeypatch):
     benchmark, cases_path, gold_path = _write_product_freeze_fixture(tmp_path, monkeypatch)
     output = tmp_path / "combined"
@@ -393,8 +398,14 @@ def test_product_freeze_combines_existing_benchmark_and_separate_gold(tmp_path, 
         benchmark, cases_path, gold_path, output
     )
 
-    inputs = [json.loads(line) for line in (output / "inputs.jsonl").read_text().splitlines()]
-    gold = [json.loads(line) for line in (output / "gold.jsonl").read_text().splitlines()]
+    inputs = [
+        json.loads(line)
+        for line in (output / "inputs.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    gold = [
+        json.loads(line)
+        for line in (output / "gold.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
     assert len(inputs) == len(gold) == 13
     assert "expected_facts" not in inputs[-1]
     assert gold[-1]["expected_facts"] == ["Fact 11"]
