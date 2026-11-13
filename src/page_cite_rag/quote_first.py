@@ -2,7 +2,7 @@
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from page_cite_rag.generation import ChatMessage
@@ -176,6 +176,33 @@ def _answer_units(text: str) -> list[tuple[str, int, int]]:
                     start = end
         offset += len(line)
     return units
+
+
+def attribute_uncited_answer(
+    parse: QuoteFirstParse, verified_ids: Sequence[str], answer_format: str
+) -> tuple[QuoteFirstParse, list[dict]]:
+    """Attribute an answer written without any passage IDs to the verified evidence.
+
+    The natural-answer prompt lets background sentences go uncited, but a model that reasons
+    to a conclusion often writes the conclusion without IDs, which would leave no claim and
+    turn a supported answer into "insufficient evidence". Only when no answer sentence
+    carries any ID and some quotes passed verification, each sentence cites those verified
+    passages; the draft then marks it limited_inference with the reasoning as its basis
+    unless the text appears verbatim. An answer with any cited sentence is left unchanged.
+    """
+    if answer_format != "general" or not parse.parsed or parse.unanswerable or not verified_ids:
+        return parse, []
+    units = _answer_units(parse.answer_text)
+    if not units or any(_ID.search(unit) for unit, _, _ in units):
+        return parse, []
+    markers = "".join(f"[{sid}]" for sid in list(dict.fromkeys(verified_ids))[:8])
+    text = parse.answer_text
+    for _unit, _start, end in reversed(units):
+        text = f"{text[:end]} {markers}{text[end:]}"
+    lines = tuple(unit for unit, _, _ in _answer_units(text))
+    deviations: list[dict] = []
+    _deviation(deviations, "quote_first_uncited_answer_attributed")
+    return replace(parse, answer_text=text, answer_lines=lines), deviations
 
 
 def quote_first_explanation(

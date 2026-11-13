@@ -12,6 +12,7 @@ from page_cite_rag.quote_first import (
     QuoteFirstParse,
     parse_quote_first,
     quote_first_draft,
+    quote_first_explanation,
     quote_first_messages,
     verify_quotes,
 )
@@ -597,7 +598,7 @@ def test_inline_answer_preserves_markdown(heading):
     assert parsed.answer_lines == ("**Key fact** [S1].", "More detail [S1].")
 
 
-def test_general_background_alone_is_insufficient(setup, monkeypatch):
+def test_general_uncited_answer_with_verified_evidence_is_attributed(setup, monkeypatch):
     store, doc_id, blocks, retriever, model, _ = setup
     output = f'Evidence:\n[S{blocks[0].ordinal}] "{blocks[0].text}"\nAnswer: Background only.'
 
@@ -609,7 +610,49 @@ def test_general_background_alone_is_insufficient(setup, monkeypatch):
         store, doc_id, retriever, model, model.config, writer="quote_first"
     )
     result = workflow.answer_from_context("Explain", blocks, language="en")
-    assert result.status == "insufficient_evidence"
-    assert result.explanation is None
-    assert result.explanation_sources == ()
-    assert result.output_deviations == ()
+    # A conclusion written without IDs is kept, cited to the verified quote, as inference.
+    assert result.status == "answered"
+    assert result.explanation == "Background only. [1]"
+    assert result.explanation_sources == (blocks[0].block_id,)
+    assert {"type": "quote_first_uncited_answer_attributed", "count": 1} in (
+        result.output_deviations
+    )
+
+
+def _natural(answer: str) -> str:
+    return (
+        'Evidence:\n[S1] "The trial enrolled 120 adults."\n[S2] "传统中文证据"\n'
+        f"Reasoning: The two passages together give the answer [S1][S2].\nAnswer:\n{answer}"
+    )
+
+
+def test_uncited_derived_answer_is_attributed_to_verified_evidence(spans):
+    from page_cite_rag.quote_first import attribute_uncited_answer
+
+    parse = parse_quote_first(_natural("The trial had 120 adult participants."))
+    attributed, deviations = attribute_uncited_answer(parse, ["S1", "S2"], "general")
+    assert deviations == [{"type": "quote_first_uncited_answer_attributed", "count": 1}]
+    draft, _ = quote_first_draft(attributed, ["S1", "S2"], spans, "general")
+    assert draft["status"] == "answered"
+    claim = draft["answer_claims"][0]
+    assert [c["source_id"] for c in claim["citations"]] == ["S1", "S2"]
+    assert claim["support"] == "limited_inference"
+    assert "two passages together" in claim["inference_basis"]
+    text, sources = quote_first_explanation(attributed, ["S1", "S2"], spans)
+    assert text == "The trial had 120 adult participants. [1][2]"
+    assert len(sources) == 2
+
+
+def test_cited_answer_keeps_uncited_background_and_unanswerable_is_untouched(spans):
+    from page_cite_rag.quote_first import attribute_uncited_answer
+
+    cited = parse_quote_first(
+        _natural("The trial enrolled 120 adults [S1]. Trials like this are common.")
+    )
+    assert attribute_uncited_answer(cited, ["S1"], "general") == (cited, [])
+    refused = parse_quote_first(_natural("Unanswerable"))
+    assert attribute_uncited_answer(refused, ["S1"], "general") == (refused, [])
+    no_evidence = parse_quote_first(_natural("Some conclusion."))
+    assert attribute_uncited_answer(no_evidence, [], "general") == (no_evidence, [])
+    short = parse_quote_first(_natural("120"), "short_answer")
+    assert attribute_uncited_answer(short, ["S1"], "short_answer") == (short, [])

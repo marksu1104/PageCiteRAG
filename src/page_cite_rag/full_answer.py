@@ -38,6 +38,7 @@ from page_cite_rag.quote_first import (
     QUOTE_FIRST_PROMPT_VERSION,
     QUOTE_FIRST_V3_PROMPT_VERSION,
     QuoteFirstParse,
+    attribute_uncited_answer,
     parse_quote_first,
     parse_truncated_evidence,
     quote_answer_sources,
@@ -1875,6 +1876,8 @@ class FullAnswerWorkflow(AnswerWorkflow):
         parsed = parse_quote_first(generated.value, self.answer_format)
         answer_ids, deviations = verify_quotes(parsed, spans)
         verified_ids = [sid for sid in answer_ids if sid in extracted_ids]
+        parsed, attributed = attribute_uncited_answer(parsed, verified_ids, self.answer_format)
+        deviations.extend(attributed)
         payload, draft_deviations = quote_first_draft(
             parsed, verified_ids, spans, self.answer_format, extracted_ids=extracted_ids
         )
@@ -1903,6 +1906,8 @@ class FullAnswerWorkflow(AnswerWorkflow):
         spans = _spans(blocks)
         parsed = parse_quote_first(value, self.answer_format)
         ids, deviations = verify_quotes(parsed, spans)
+        parsed, attributed = attribute_uncited_answer(parsed, ids, self.answer_format)
+        deviations = [*deviations, *attributed]
         payload, draft_deviations = quote_first_draft(parsed, ids, spans, self.answer_format)
         return self._quote_draft(payload, parsed, ids, spans), (
             *deviations,
