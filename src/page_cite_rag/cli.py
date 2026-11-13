@@ -523,9 +523,14 @@ def _generation_options(parser: argparse.ArgumentParser) -> None:
             "your own Ollama server and --llm-model: an unvalidated configuration."
         ),
     )
+    parser.add_argument(
+        "--api-provider",
+        choices=("custom", "gemini", "groq", "openrouter", "ollama-local"),
+        default="custom",
+    )
     parser.add_argument("--api-base", help="Explicit OpenAI-compatible HTTPS API base URL.")
     parser.add_argument("--api-model", help="Explicit cloud model name (--backend api).")
-    parser.add_argument("--api-key-env", default="PAGECITE_API_KEY")
+    parser.add_argument("--api-key-env", default=None)
     parser.add_argument("--api-max-calls", type=_positive_integer, default=100)
     parser.add_argument(
         "--token-budget",
@@ -594,12 +599,12 @@ def _generation_config(args: argparse.Namespace):
         raise ValueError("--gpu-temperature-limit requires an owned backend on CUDA")
 
     if args.backend == "api":
-        from page_cite_rag.api_backend import validate_api_base
+        from page_cite_rag.api_backend import ApiChatClient, validate_api_base
         from page_cite_rag.generation import ModelError
 
-        if not args.api_base:
+        if not args.api_base and args.api_provider == "custom":
             raise ModelError("--api-base is required for --backend api")
-        validate_api_base(args.api_base)
+        validate_api_base(args.api_base or ApiChatClient.PROVIDERS[args.api_provider][0])
         if not args.api_model or not args.api_model.strip():
             raise ModelError("--api-model is required for --backend api")
         if args.bundle_dir is not None or args.llm_host != "http://127.0.0.1:11435":
@@ -648,6 +653,7 @@ def _open_generation_client(args: argparse.Namespace, config):
             model=args.api_model,
             api_key_env=args.api_key_env,
             max_calls=args.api_max_calls,
+            provider=args.api_provider,
         )
         print(
             "Document passages and questions will be sent to "

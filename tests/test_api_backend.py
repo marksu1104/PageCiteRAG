@@ -30,7 +30,12 @@ class Output(BaseModel):
 @pytest.fixture(autouse=True)
 def isolated_api_process(monkeypatch):
     monkeypatch.setenv("PAGECITE_API_KEY", KEY)
-    for attr in ("_process_calls", "_process_prompt_tokens", "_process_completion_tokens"):
+    for attr in (
+        "_process_calls",
+        "_process_prompt_tokens",
+        "_process_completion_tokens",
+        "_process_rate_limit_waits",
+    ):
         monkeypatch.setattr(ApiChatClient, attr, 0)
 
 
@@ -81,6 +86,7 @@ def test_success_request_usage_budget_and_key_privacy(structured, monkeypatch):
         assert budget_for_model(client, MESSAGES, None, client.config).exact_input_tokens is None
         assert client.identity == {
             "backend": "api",
+            "provider": "custom",
             "api_host": "provider.invalid",
             "model": "cloud-model",
         }
@@ -329,3 +335,143 @@ def test_closed_client_does_not_consume_call():
     with pytest.raises(ModelError, match="closed"):
         client.generate(MESSAGES, None)
     assert client.calls_used == 0
+
+
+@pytest.mark.parametrize(
+    "provider,base,key_env,field,value",
+    [
+        (
+            "gemini",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "GEMINI_API_KEY",
+            "reasoning_effort",
+            "none",
+        ),
+        ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", "reasoning_effort", "none"),
+        (
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            "OPENROUTER_API_KEY",
+            "reasoning",
+            {"enabled": False},
+        ),
+    ],
+)
+def test_provider_defaults_and_nonthinking(provider, base, key_env, field, value, monkeypatch):
+    monkeypatch.delenv("PAGECITE_API_KEY")
+    monkeypatch.setenv(key_env, KEY)
+    seen = []
+
+    def handler(request):
+        seen.append(
+            (str(request.url), request.headers.get("authorization"), json.loads(request.content))
+        )
+        return httpx.Response(200, json=completion())
+
+    with ApiChatClient(
+        GenerationConfig(),
+        api_base=None,
+        model="m",
+        provider=provider,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        client.generate(MESSAGES, None)
+        assert client.identity["provider"] == provider
+        assert client.thinking_control == (
+            "reasoning_disabled" if provider == "openrouter" else "reasoning_effort_none"
+        )
+    assert seen[0][0] == f"{base}/chat/completions"
+    assert seen[0][1] == f"Bearer {KEY}"
+    assert seen[0][2][field] == value
+
+
+def test_local_provider_no_key_or_authorization_and_base_override():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=completion())
+
+    with ApiChatClient(
+        GenerationConfig(),
+        api_base="http://localhost:11434/v1",
+        model="m",
+        provider="ollama-local",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        client.generate(MESSAGES, None)
+    assert "authorization" not in seen[0].headers
+    assert json.loads(seen[0].content)["reasoning_effort"] == "none"
+
+
+@pytest.mark.parametrize("route", ["generate", "agent"])
+@pytest.mark.parametrize(
+    "details,raises",
+    [(None, False), ({"reasoning_tokens": 0}, False), ({"reasoning_tokens": 1}, True)],
+)
+def test_reasoning_usage_rejected(route, details, raises):
+    payload = completion(
+        usage={
+            "prompt_tokens": 20,
+            "completion_tokens": 3,
+            **({"completion_tokens_details": details} if details is not None else {}),
+        }
+    )
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    with make_client(handler) as client:
+        if raises:
+            with pytest.raises(ModelError, match="API completion used reasoning tokens"):
+                if route == "generate":
+                    client.generate(MESSAGES, None)
+                else:
+                    client.dispatch_agent_request(
+                        httpx.MockTransport(handler),
+                        httpx.Request("POST", "https://provider.invalid/v1/chat/completions"),
+                    )
+        elif route == "generate":
+            client.generate(MESSAGES, None)
+        else:
+            client.dispatch_agent_request(
+                httpx.MockTransport(handler),
+                httpx.Request("POST", "https://provider.invalid/v1/chat/completions"),
+            )
+
+
+def test_429_retry_after_and_exhaustion():
+    calls, waits = [], []
+
+    def handler(request):
+        calls.append(1)
+        return (
+            httpx.Response(429, headers={"Retry-After": "2"})
+            if len(calls) == 1
+            else httpx.Response(200, json=completion())
+        )
+
+    with make_client(handler, wait=waits.append) as client:
+        client.generate(MESSAGES, None)
+        assert waits == [2]
+        assert client.rate_limit_waits == 1
+    calls.clear()
+
+    def always_limited(request):
+        calls.append(1)
+        return httpx.Response(429)
+
+    with make_client(always_limited, wait=lambda _: None) as client:
+        with pytest.raises(ModelError, match="API HTTP 429"):
+            client.generate(MESSAGES, None)
+    assert len(calls) == 3
+
+
+def test_429_retry_respects_max_calls():
+    calls = []
+    with make_client(
+        lambda r: (calls.append(1), httpx.Response(429))[1], max_calls=1, wait=lambda _: None
+    ) as client:
+        with pytest.raises(ModelError, match="call limit"):
+            client.generate(MESSAGES, None)
+    assert len(calls) == 1

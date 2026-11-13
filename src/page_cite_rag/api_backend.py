@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from urllib.parse import urlsplit
 
 import httpx
@@ -64,11 +64,38 @@ class ApiChatClient:
     Usage totals include every response with valid usage, including rejected output.
     """
 
-    thinking_control = "provider_default"
+    PROVIDERS = {
+        "custom": (None, "PAGECITE_API_KEY", "provider_default", None),
+        "gemini": (
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "GEMINI_API_KEY",
+            "reasoning_effort_none",
+            ("reasoning_effort", "none"),
+        ),
+        "groq": (
+            "https://api.groq.com/openai/v1",
+            "GROQ_API_KEY",
+            "reasoning_effort_none",
+            ("reasoning_effort", "none"),
+        ),
+        "openrouter": (
+            "https://openrouter.ai/api/v1",
+            "OPENROUTER_API_KEY",
+            "reasoning_disabled",
+            ("reasoning", {"enabled": False}),
+        ),
+        "ollama-local": (
+            "http://127.0.0.1:11434/v1",
+            None,
+            "reasoning_effort_none",
+            ("reasoning_effort", "none"),
+        ),
+    }
     _process_lock = threading.Lock()
     _process_calls = 0
     _process_prompt_tokens = 0
     _process_completion_tokens = 0
+    _process_rate_limit_waits = 0
 
     def __init__(
         self,
@@ -76,23 +103,44 @@ class ApiChatClient:
         *,
         api_base: str,
         model: str,
-        api_key_env: str = "PAGECITE_API_KEY",
+        api_key_env: str | None = None,
         max_calls: int = 100,
         transport: httpx.BaseTransport | None = None,
+        provider: str = "custom",
+        wait: Callable[[float], None] = time.sleep,
     ) -> None:
-        self._api_base = validate_api_base(api_base)
+        if provider not in self.PROVIDERS:
+            raise ModelError("--api-provider must be a supported provider")
+        default_base, default_key_env, self.thinking_control, self._thinking_field = self.PROVIDERS[
+            provider
+        ]
+        self._api_base = validate_api_base(api_base or default_base or "")
         if not isinstance(model, str) or not model.strip():
             raise ModelError("--api-model is required for --backend api")
         if type(max_calls) is not int or max_calls < 1:
             raise ModelError("--api-max-calls must be a positive integer")
-        if not isinstance(api_key_env, str) or not api_key_env.isidentifier():
+        if provider != "ollama-local" and api_key_env is None:
+            api_key_env = default_key_env
+        if provider == "ollama-local":
+            api_key_env = None
+        if api_key_env is not None and (
+            not isinstance(api_key_env, str) or not api_key_env.isidentifier()
+        ):
             raise ModelError("--api-key-env must name an environment variable")
         self.config = config
         self._model = model
         self._api_key_env = api_key_env
+        self._provider = provider
+        self._wait = wait
         self.max_calls = max_calls
-        self._read_key()
-        self.identity = {"backend": "api", "api_host": urlsplit(api_base).hostname, "model": model}
+        if self._api_key_env is not None:
+            self._read_key()
+        self.identity = {
+            "backend": "api",
+            "provider": provider,
+            "api_host": urlsplit(self._api_base).hostname,
+            "model": model,
+        }
         self._http = httpx.Client(
             timeout=config.timeout_seconds,
             transport=transport if transport is not None else httpx.HTTPTransport(retries=0),
@@ -102,6 +150,8 @@ class ApiChatClient:
         self._deadline: float | None = None
 
     def _read_key(self) -> str:
+        if self._api_key_env is None:
+            return ""
         key = os.environ.get(self._api_key_env)
         if key is None or not key.strip():
             raise ModelError("API key environment variable is missing or empty")
@@ -132,6 +182,34 @@ class ApiChatClient:
                     ApiChatClient._process_prompt_tokens + ApiChatClient._process_completion_tokens
                 ),
             }
+
+    @property
+    def rate_limit_waits(self) -> int:
+        return ApiChatClient._process_rate_limit_waits
+
+    def _send_with_rate_limit_retry(self, send):
+        for attempt in range(3):
+            if attempt:
+                self._reserve_call()
+            response = send()
+            if response.status_code != 429 or attempt == 2:
+                return response
+            retry_after = response.headers.get("retry-after")
+            try:
+                seconds = min(60, max(0, int(retry_after))) if retry_after is not None else 10
+            except ValueError:
+                seconds = 10
+            with self._process_lock:
+                ApiChatClient._process_rate_limit_waits += 1
+            self._wait(seconds)
+        raise AssertionError("unreachable")
+
+    def _check_reasoning_usage(self, payload: dict) -> None:
+        usage = payload.get("usage")
+        details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+        tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
+        if type(tokens) is int and tokens > 0:
+            raise ModelError("API completion used reasoning tokens")
 
     def before_agent_dispatch(self) -> None:
         """Check the process-wide ceiling; no GPU checks or consumed call yet."""
@@ -190,18 +268,26 @@ class ApiChatClient:
         self, inner: httpx.BaseTransport, request: httpx.Request
     ) -> httpx.Response:
         """Authenticate only at dispatch, keeping the key out of LangChain objects."""
-        key = self._read_key()
-        self._reserve_call()
+        key = self._read_key() if self._api_key_env is not None else None
         try:
-            request.headers["authorization"] = f"Bearer {key}"
-            response = inner.handle_request(request)
-            response.read()
+
+            def send():
+                if key is not None:
+                    request.headers["authorization"] = f"Bearer {key}"
+                try:
+                    current = inner.handle_request(request)
+                    current.read()
+                    return current
+                finally:
+                    request.headers.pop("authorization", None)
+
+            self._reserve_call()
+            response = self._send_with_rate_limit_retry(send)
         except (httpx.HTTPError, OSError, ValueError, UnicodeError):
             raise ModelError("API connection failed; no retry") from None
-        finally:
-            request.headers.pop("authorization", None)
         payload = self._validate_response(response)
         self._usage(payload)
+        self._check_reasoning_usage(payload)
         return response
 
     def set_request_deadline(self, deadline: float) -> None:
@@ -245,23 +331,31 @@ class ApiChatClient:
                 "type": "json_schema",
                 "json_schema": {"name": response_model.__name__, "schema": schema, "strict": False},
             }
+        if self._thinking_field is not None:
+            body[self._thinking_field[0]] = self._thinking_field[1]
         request = self._http.build_request(
             "POST", f"{self._api_base}/chat/completions", json=body, timeout=timeout
         )
-        key = self._read_key()
-        self._reserve_call()
+        key = self._read_key() if self._api_key_env is not None else None
         started = time.perf_counter()
         try:
-            request.headers["authorization"] = f"Bearer {key}"
-            response = self._http.send(request)
+
+            def send():
+                if key is not None:
+                    request.headers["authorization"] = f"Bearer {key}"
+                try:
+                    return self._http.send(request)
+                finally:
+                    request.headers.pop("authorization", None)
+
+            self._reserve_call()
+            response = self._send_with_rate_limit_retry(send)
         except (httpx.HTTPError, OSError, ValueError, UnicodeError):
             raise ModelError("API connection failed; no retry") from None
-        finally:
-            # Also scrub requests retained by transport failures, before they can escape.
-            request.headers.pop("authorization", None)
         elapsed_ms = (time.perf_counter() - started) * 1000
         payload = self._validate_response(response)
         prompt, completion = self._usage(payload)
+        self._check_reasoning_usage(payload)
         try:
             choice = payload["choices"][0]
             message = choice["message"]

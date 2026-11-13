@@ -1150,6 +1150,37 @@ def test_api_cli_warning_and_mock_generation(command, monkeypatch, capsys):
     assert len(sent) == 1
 
 
+def test_api_cli_provider_default_base_and_custom_still_requires_base(monkeypatch):
+    args = cli.build_parser().parse_args(
+        [
+            "ask",
+            "synthetic-document",
+            "question",
+            "--backend",
+            "api",
+            "--api-provider",
+            "gemini",
+            "--api-model",
+            "free-model",
+        ]
+    )
+    cli._generation_config(args)
+    assert args.api_base is None
+    custom = cli.build_parser().parse_args(
+        [
+            "ask",
+            "synthetic-document",
+            "question",
+            "--backend",
+            "api",
+            "--api-model",
+            "free-model",
+        ]
+    )
+    with pytest.raises(ModelError, match="--api-base is required"):
+        cli._generation_config(custom)
+
+
 def test_api_cli_agent_still_requires_native_retrieval(document, monkeypatch, capsys):
     monkeypatch.setattr(
         cli, "_open_generation_client", lambda *args: pytest.fail("no model dispatch")
