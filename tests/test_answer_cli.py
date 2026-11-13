@@ -698,6 +698,11 @@ def test_native_gpu_detail_searches_after_whole_document_admission(
 
     store, document_id, _ = document
     build_bm25_index(store, document_id)
+    # Detail mode reranks whenever the reranker file exists; this case has none, so the
+    # result must not depend on whether the developer machine holds the model.
+    monkeypatch.setattr(
+        "page_cite_rag.reranker_server.DEFAULT_MODEL_PATH", Path("/nonexistent/reranker.gguf")
+    )
     events = []
     expected_tokenizer_directory = tokenizer_directory
 
