@@ -97,11 +97,11 @@ def prepare_source(
     if suffix == ".txt":
         media_type = "text/plain"
         parser_name = "plain_text"
-        parser_version = "utf8-paragraph-v2"
+        parser_version = "utf8-paragraph-v3"
     elif suffix in {".md", ".markdown"}:
         media_type = "text/markdown"
         parser_name = "markdown"
-        parser_version = "utf8-paragraph-v2"
+        parser_version = "utf8-paragraph-v3"
     elif suffix == ".pdf":
         media_type = "application/pdf"
         parser_name = "pdfplumber"
@@ -153,7 +153,7 @@ def prepare_source(
 
 def _iter_text_units(path: Path, document: DocumentMetadata) -> Iterator[ParsedUnit]:
     try:
-        with path.open("r", encoding="utf-8", newline="") as source:
+        with path.open("r", encoding="utf-8-sig", newline=None) as source:
             text = source.read()
     except UnicodeDecodeError as exc:
         raise DocumentIngestError("text input must be valid UTF-8") from exc

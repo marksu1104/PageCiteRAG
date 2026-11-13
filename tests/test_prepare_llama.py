@@ -6,6 +6,10 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="llama bundle preparation script targets Linux runtimes"
+)
+
 _PREPARE_PATH = Path(__file__).resolve().parents[1] / "scripts/prepare_llama.py"
 _PREPARE_SPEC = importlib.util.spec_from_file_location("prepare_llama", _PREPARE_PATH)
 prepare_llama = importlib.util.module_from_spec(_PREPARE_SPEC)

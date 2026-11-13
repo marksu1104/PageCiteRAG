@@ -26,7 +26,7 @@ def test_token_chunks_cover_source_and_have_versioned_identity(tmp_path, phrase)
     from page_cite_rag.store import SQLiteDocumentStore
     from page_cite_rag.text import TokenBlockFactory
 
-    text = (phrase * 180) + "\r\n最後一行。\n"
+    text = (phrase * 180) + "\n最後一行。\n"
     tokenizer = Tokenizer(models.WordLevel({c: i + 1 for i, c in enumerate(sorted(set(text)))}))
     tokenizer.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
     tokenizer.save(str(tmp_path / "tokenizer.json"))
@@ -164,16 +164,17 @@ def test_text_ingestion_preserves_source_and_block_offsets(
     assert stored_document.parser_name == expected_parser
     assert stored_document.language == "zh-Hant+en"
     assert stored_document.usage_scope == "synthetic-test"
-    assert unit is not None and unit.text == source_text
+    normalized_text = source_text.replace("\r\n", "\n").replace("\r", "\n")
+    assert unit is not None and unit.text == normalized_text
     assert [block.line_start for block in blocks] == [1, 3, 6]
     assert [block.line_end for block in blocks] == [1, 4, 6]
-    assert all(unit.text[block.char_start : block.char_end] == block.text for block in blocks)
+    assert all(normalized_text[block.char_start : block.char_end] == block.text for block in blocks)
 
     duplicate = reopened_store.ingest(prepared.document, prepared.iter_units())
     assert duplicate.duplicate is True
     assert reopened_store.count_documents() == 1
     assert len(reopened_store.get_blocks(prepared.document.document_id)) == 3
-    assert prepared.document.parser_version == "utf8-paragraph-v2"
+    assert prepared.document.parser_version == "utf8-paragraph-v3"
 
 
 @pytest.mark.parametrize("suffix", [".txt", ".md"])
@@ -195,7 +196,30 @@ def test_long_single_newline_paragraphs_are_split_with_exact_offsets(tmp_path, s
     for index, char in enumerate(unit.text):
         if not char.isspace():
             assert covered_counts[index] == 1
-    assert prepared.document.parser_version == "utf8-paragraph-v2"
+    assert prepared.document.parser_version == "utf8-paragraph-v3"
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize("bom", [False, True])
+def test_text_newline_and_bom_variants_preserve_block_text_and_lines(tmp_path, newline, bom):
+    logical_text = "Heading\n\nEnglish and 中文.\nSecond detail.\n\nFinal paragraph."
+    encoded = logical_text.replace("\n", newline).encode("utf-8")
+    if bom:
+        encoded = b"\xef\xbb\xbf" + encoded
+    source = tmp_path / f"input-{ord(newline[0])}-{bom}.txt"
+    source.write_bytes(encoded)
+    prepared = prepare_source(source)
+    unit = next(prepared.iter_units())
+    blocks = list(iter_blocks(prepared.document, unit, 1))
+    assert unit.text == logical_text
+    baseline = tmp_path / "baseline.txt"
+    baseline.write_bytes(logical_text.encode("utf-8"))
+    baseline_prepared = prepare_source(baseline)
+    baseline_unit = next(baseline_prepared.iter_units())
+    baseline_blocks = list(iter_blocks(baseline_prepared.document, baseline_unit, 1))
+    assert [(block.text, block.line_start, block.line_end) for block in blocks] == [
+        (block.text, block.line_start, block.line_end) for block in baseline_blocks
+    ]
 
 
 def test_long_single_line_splits_at_sentence_boundaries_and_hard_cuts(tmp_path):
@@ -436,6 +460,7 @@ def test_installed_cli_ingests_and_reads_text_from_outside_repository(
         cwd=tmp_path,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
     assert ingest.returncode == 0, ingest.stderr
@@ -454,6 +479,7 @@ def test_installed_cli_ingests_and_reads_text_from_outside_repository(
         cwd=tmp_path,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
     assert readback.returncode == 0, readback.stderr

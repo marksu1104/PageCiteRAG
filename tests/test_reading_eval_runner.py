@@ -14,6 +14,11 @@ from page_cite_rag.retrieval import SearchBranchTrace, SearchContextGroup, Searc
 from page_cite_rag.source_outline import OUTLINE_KIND, SourceOutline
 from page_cite_rag.store import SQLiteDocumentStore
 
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="reading evaluation runner depends on fcntl and POSIX atomic file replacement semantics",
+)
+
 _RUNNER_PATH = Path(__file__).resolve().parents[1] / "scripts/run_reading_eval.py"
 _RUNNER_SPEC = importlib.util.spec_from_file_location("run_reading_eval", _RUNNER_PATH)
 run_reading_eval = importlib.util.module_from_spec(_RUNNER_SPEC)

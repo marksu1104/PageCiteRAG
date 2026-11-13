@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import scripts.device_check as device_check
 
 
@@ -11,9 +13,9 @@ def test_system_info_reads_linux_cpu_and_memory_sources(monkeypatch):
 
     def fake_read_text(path, *, encoding=None, **_kwargs):
         assert encoding == "utf-8"
-        if str(path) == "/proc/cpuinfo":
+        if Path(path) == Path("/proc/cpuinfo"):
             return "processor: 0\nmodel name: Test CPU 5600\n"
-        if str(path) == "/proc/meminfo":
+        if Path(path) == Path("/proc/meminfo"):
             return "MemTotal:       16384000 kB\n"
         raise AssertionError(path)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import shutil
 import sqlite3
+import sys
 
 import pytest
 
@@ -91,7 +92,8 @@ def test_read_only_open_rejects_v1_without_migration(tmp_path):
 
 def test_read_only_open_handles_uri_sensitive_path_characters(tmp_path):
     writable, source = _store(tmp_path)
-    path = tmp_path / "data #?% 中文.sqlite3"
+    filename = "data #?% 中文.sqlite3" if sys.platform != "win32" else "data #% 中文.sqlite3"
+    path = tmp_path / filename
     shutil.copyfile(writable.database_path, path)
     before = _sha(path)
     store = SQLiteDocumentStore(path, read_only=True)

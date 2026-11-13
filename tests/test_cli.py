@@ -82,6 +82,7 @@ def test_module_entry_point_works_outside_repository(tmp_path) -> None:
         capture_output=True,
         check=False,
         text=True,
+        encoding="utf-8",
     )
 
     assert result.returncode == 0

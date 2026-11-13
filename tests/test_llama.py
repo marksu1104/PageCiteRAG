@@ -815,6 +815,9 @@ def test_watchdog_stops_only_owned_server_and_surfaces_failure(tmp_path, monkeyp
     client.close()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="verified llama bundle contains a Linux runtime"
+)
 def test_verified_bundle_file_set_hashes_and_symlinks(tmp_path, monkeypatch):
     model = tmp_path / llama.MODEL_FILE
     model.write_bytes(b"synthetic weights")

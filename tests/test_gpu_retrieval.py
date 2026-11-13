@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -288,6 +289,9 @@ def test_request_session_cleans_up_when_a_query_fails(monkeypatch):
     assert staged._current_cancel is None
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="asserts CUDA server diagnostics from the Linux GPU backend"
+)
 def test_embedding_exit_diagnostics_keep_only_bounded_redacted_error_lines(tmp_path):
     from page_cite_rag.embedding_server import NativeEmbeddingServer
 

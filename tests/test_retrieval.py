@@ -17,7 +17,7 @@ from page_cite_rag.tokenize import LexicalTokenizer
 
 def _ingest(tmp_path, text="Alpha marker.\n\nBeta marker.\n\nAlpha marker.", name="sample.txt"):
     path = tmp_path / name
-    path.write_text(text, encoding="utf-8")
+    path.write_text(text, encoding="utf-8", newline="\n")
     prepared = prepare_source(path, usage_scope="synthetic-test")
     store = SQLiteDocumentStore(tmp_path / "documents.sqlite3")
     store.ingest(prepared.document, prepared.iter_units())

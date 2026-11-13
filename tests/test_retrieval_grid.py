@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import zipfile
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -13,6 +14,11 @@ from page_cite_rag.models import Block
 from page_cite_rag.retrieval import SearchBranchTrace, SearchHit, SearchResult
 from page_cite_rag.store import SQLiteDocumentStore
 from page_cite_rag.text import TokenBlockFactory
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="retrieval grid artifact persistence uses POSIX atomic file replacement semantics",
+)
 
 _RUNNER_PATH = Path(__file__).resolve().parents[1] / "scripts" / "run_reading_eval.py"
 _SPEC = spec_from_file_location("reading_eval_grid_under_test", _RUNNER_PATH)
