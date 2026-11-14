@@ -10,23 +10,35 @@ writer, so every kept point rests on verbatim quotes that passed the citation ch
   with the original question, plus up to eight verified map points as unverified hints.
 
 A document that fits the writer's context is answered in one call, like the detail route.
+
+Time: when the model client has a whole-question deadline and too little is left for one more
+section plus the reduce call (TIME_RESERVE_FACTOR mean section times), the remaining sections
+are skipped and the answer is built from the sections read, with a limitation naming the
+unread part. Two long LooGLE summaries otherwise ran past the 600 s default and failed whole.
 """
 
 from __future__ import annotations
 
 import math
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from page_cite_rag.generation import ContextBudgetError, OutputValidationError
 from page_cite_rag.models import Block
 
-GLOBAL_VERSION = "global-map-reduce/v1"
+GLOBAL_VERSION = "global-map-reduce/v2"
 SECTION_TOKENS = 5000
 MAX_SECTIONS = 15
 MAX_FINDINGS = 8
 FINDING_CHARS = 200
+TIME_RESERVE_FACTOR = 2.5  # one more section (1) plus the reduce call (about 1.5 sections)
+UNREAD_LIMITATION = {
+    "en": "The time limit was reached before the whole document was read; this answer does "
+    "not cover blocks {first} to {last}.",
+    "zh-Hant": "回答時間已到，未讀完整份文件；本回答未涵蓋第 {first} 至第 {last} 段。",
+}
 _CJK = re.compile(r"[㐀-鿿豈-﫿]")
 
 MAP_QUESTION = {
@@ -149,7 +161,16 @@ def answer_global(workflow, question: str, *, language: str = "auto") -> GlobalA
     section_results, section_trace = [], []
     prompt_total = completion_total = 0
     last_error: Exception | None = None
+    seconds_left = getattr(getattr(workflow, "_model", None), "request_seconds_left", None)
+    map_seconds: list[float] = []
+    unread: list = []
     for index, section in enumerate(sections, 1):
+        left = seconds_left() if callable(seconds_left) else None
+        if map_seconds and left is not None:
+            if left < TIME_RESERVE_FACTOR * sum(map_seconds) / len(map_seconds):
+                unread = sections[index - 1 :]
+                break
+        started = time.monotonic()
         try:
             result = workflow.answer_from_context(map_question, section, language=language)
         except (OutputValidationError, ContextBudgetError) as exc:
@@ -167,6 +188,8 @@ def answer_global(workflow, question: str, *, language: str = "auto") -> GlobalA
                 }
             )
             continue
+        finally:
+            map_seconds.append(time.monotonic() - started)
         prompt, completion = _usage(result)
         prompt_total += prompt
         completion_total += completion
@@ -179,6 +202,10 @@ def answer_global(workflow, question: str, *, language: str = "auto") -> GlobalA
                 "status": result.status,
                 "points": len(_claims(result)),
                 "omitted_blocks": len(getattr(result, "omitted_block_ids", ())),
+                # Why a section kept nothing: the model's refusal and dropped quotes differ.
+                "deviations": [
+                    d.get("type") for d in getattr(result, "output_deviations", ()) or ()
+                ],
             }
         )
     order = {block.block_id: position for position, block in enumerate(blocks)}
@@ -193,10 +220,13 @@ def answer_global(workflow, question: str, *, language: str = "auto") -> GlobalA
         "sections": section_trace,
         "map_question": map_question,
     }
+    if unread:
+        trace["unread_sections"] = len(unread)
+        trace["unread_blocks"] = [unread[0][0].ordinal, unread[-1][-1].ordinal]
     if not cited:
         trace.update(
             reason="no_verified_points",
-            calls=len(sections),
+            calls=len(sections) - len(unread),
             prompt_tokens=prompt_total,
             completion_tokens=completion_total,
         )
@@ -209,9 +239,14 @@ def answer_global(workflow, question: str, *, language: str = "auto") -> GlobalA
     final = workflow.answer_from_context(
         question, reduce_blocks, language=language, search_findings=findings
     )
+    if unread:
+        note = UNREAD_LIMITATION.get(language, UNREAD_LIMITATION["en"]).format(
+            first=unread[0][0].ordinal, last=unread[-1][-1].ordinal
+        )
+        final = final.model_copy(update={"limitations": (*final.limitations, note)})
     prompt, completion = _usage(final)
     trace.update(
-        calls=len(sections) + 1,
+        calls=len(sections) - len(unread) + 1,
         reduce_blocks=len(reduce_blocks),
         reduce_omitted_blocks=len(getattr(final, "omitted_block_ids", ())),
         findings=len(findings),

@@ -310,6 +310,11 @@ class ApiChatClient:
     def clear_request_deadline(self) -> None:
         self._deadline = None
 
+    def request_seconds_left(self) -> float | None:
+        """Seconds left before the whole-question deadline; None when there is none."""
+        deadline = self._deadline
+        return None if deadline is None else deadline - time.monotonic()
+
     def generate(
         self,
         messages: Sequence[ChatMessage],

@@ -125,7 +125,10 @@ class FakeClient:
                     if "Traditional Chinese" in messages[0].content
                     else "The result was not significant unless n > 64."
                 )
-                source_id = "S999" if self.invalid_citation else source_id
+                if self.invalid_citation:
+                    # An unknown ID whose quote is in no passage (a mistyped ID whose quote is
+                    # verbatim in one passage is repaired; see test_quote_first).
+                    source_id, quote = "S999", "a sentence that is in no passage"
                 value = (
                     "Answer: Unanswerable"
                     if self.insufficient

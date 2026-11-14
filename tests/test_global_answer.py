@@ -44,6 +44,13 @@ class Result:
     detail_claims: tuple = ()
     omitted_block_ids: tuple = ()
     generation_stats: Stats = field(default_factory=lambda: Stats(100, 10))
+    limitations: tuple = ()
+    output_deviations: tuple = ()
+
+    def model_copy(self, *, update):
+        from dataclasses import replace
+
+        return replace(self, **update)
 
 
 class Store:
@@ -195,3 +202,38 @@ def test_a_failed_section_is_skipped_not_fatal():
 
     with pytest.raises(ContextBudgetError):
         ga.answer_global(AllFail(blocks), "Q? contributions", language="en")
+
+
+class Clock:
+    """A model client whose whole-question deadline moves with each section read."""
+
+    def __init__(self, left):
+        self.left = list(left)
+
+    def request_seconds_left(self):
+        return self.left.pop(0) if self.left else 0.0
+
+
+def test_time_budget_answers_from_the_sections_read(monkeypatch):
+    blocks = [block(i) for i in range(1, 41)]
+    workflow = Workflow(blocks)
+    ticks = iter(float(i) for i in range(1000))
+    monkeypatch.setattr(ga.time, "monotonic", lambda: next(ticks))  # each section takes 1 s
+    workflow._model = Clock([100.0, 100.0, 100.0, 2.0])
+    answer = ga.answer_global(workflow, "Q? what are the contributions", language="en")
+    sections = ga.plan_sections(blocks)
+    assert len(answer.trace["sections"]) == 3
+    assert answer.trace["unread_sections"] == len(sections) - 3
+    assert answer.trace["unread_blocks"] == [sections[3][0].ordinal, 40]
+    assert answer.trace["calls"] == 4
+    assert answer.result.limitations[-1].startswith("The time limit was reached")
+    assert f"blocks {sections[3][0].ordinal} to 40" in answer.result.limitations[-1]
+
+
+def test_without_a_deadline_every_section_is_read():
+    blocks = [block(i) for i in range(1, 41)]
+    workflow = Workflow(blocks)
+    workflow._model = object()
+    answer = ga.answer_global(workflow, "Q? what are the contributions", language="en")
+    assert "unread_sections" not in answer.trace
+    assert all(s["deviations"] == [] for s in answer.trace["sections"])

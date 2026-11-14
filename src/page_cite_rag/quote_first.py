@@ -13,6 +13,7 @@ QUOTE_FIRST_V3_PROMPT_VERSION = "quote-first-answer/v4-no-refusal"
 _ID = re.compile(r"\[(S\d+(?:_\d+)?)\]")
 _HEADER = re.compile(r"^\s*[#*\s]*(Evidence|Reasoning|Answer)\**\s*:\s*\**\s*(.*?)\s*$", re.I)
 _BULLET = re.compile(r"^\s*(?:[-*•]|\d+\.)\s+(.+)$")
+_UNANSWERABLE = re.compile(r"^[\W_]*unanswerable(?![\w-])", re.I)
 
 
 def quote_first_messages(
@@ -135,10 +136,9 @@ def parse_quote_first(text: str, answer_format: str = "general") -> QuoteFirstPa
         end = next((i for i, m in reasoning_headers if i > ei), last)
         area = "\n".join([em[2], *lines[ei + 1 : end]])
         evidence = _parse_evidence(area)
-    unanswerable = (
-        bool(answer_lines)
-        and re.sub(r"[\W_]", "", " ".join(answer_lines)).casefold() == "unanswerable"
-    )
+    # "Unanswerable" alone, or followed by IDs or an explanation ("Unanswerable (the passages
+    # only say ...)"), is a refusal; it was otherwise shown as an answer with citations.
+    unanswerable = bool(answer_lines) and bool(_UNANSWERABLE.match(answer_text))
     return QuoteFirstParse(
         tuple(evidence),
         reasoning,
@@ -337,6 +337,54 @@ def _deviation(deviations: list[dict], kind: str, count: int = 1) -> None:
             item["count"] += count
             return
     deviations.append({"type": kind, "count": count})
+
+
+def repair_source_ids(
+    parse: QuoteFirstParse, spans: Mapping[str, SourceSpan]
+) -> tuple[QuoteFirstParse, list[dict]]:
+    """Give a mistyped passage ID back to the one passage that holds its quote verbatim.
+
+    The model sometimes copies a quote exactly but writes an ID that is not in the context
+    (P2-3 probe: a sentence of [S35] quoted under [S25]); the whole answer was then dropped as
+    unverified. Only IDs absent from the context are repaired, and only when every substantial
+    fragment quoted under that ID is verbatim in the same single passage; the ID is then
+    replaced throughout the reply. A quote found in no passage or in several stays unverified.
+    """
+    unknown = list(dict.fromkeys(sid for sid, _ in parse.evidence if sid not in spans))
+    mapping = {}
+    for sid in unknown:
+        fragments = [
+            part
+            for source_id, parts in parse.evidence
+            if source_id == sid
+            for part in parts
+            if len(_normalized(part)) >= 4
+        ]
+        if not fragments:
+            continue
+        holders = [
+            key
+            for key, span in spans.items()
+            if all(quote_is_verbatim(part, span.text) for part in fragments)
+        ]
+        if len(holders) == 1:
+            mapping[sid] = holders[0]
+    if not mapping:
+        return parse, []
+
+    def fix(text: str) -> str:
+        return _ID.sub(lambda m: f"[{mapping.get(m[1], m[1])}]", text)
+
+    repaired = replace(
+        parse,
+        evidence=tuple((mapping.get(sid, sid), parts) for sid, parts in parse.evidence),
+        reasoning=fix(parse.reasoning),
+        answer_lines=tuple(fix(line) for line in parse.answer_lines),
+        answer_text=fix(parse.answer_text),
+    )
+    deviations: list[dict] = []
+    _deviation(deviations, "quote_source_id_repaired", len(mapping))
+    return repaired, deviations
 
 
 def verify_quotes(

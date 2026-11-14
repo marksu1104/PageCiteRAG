@@ -45,6 +45,7 @@ from page_cite_rag.quote_first import (
     quote_first_draft,
     quote_first_explanation,
     quote_first_messages,
+    repair_source_ids,
     verify_quotes,
 )
 from page_cite_rag.reading_plan import ReadingPlan, RequirementCoverage
@@ -1803,8 +1804,12 @@ class FullAnswerWorkflow(AnswerWorkflow):
         """A quote-first reply cut at the output limit keeps the quotes it verified."""
         if self.writer != "quote_first" or error.reason != "output_limit":
             raise error
-        extracted = parse_truncated_evidence(error.raw_model_output or "")
-        verified, deviations = verify_quotes(extracted, _spans(blocks))
+        spans = _spans(blocks)
+        extracted, repaired = repair_source_ids(
+            parse_truncated_evidence(error.raw_model_output or ""), spans
+        )
+        verified, deviations = verify_quotes(extracted, spans)
+        deviations.extend(repaired)
         if not verified:
             raise error
         return _TruncatedReply(extracted, tuple(verified), tuple(deviations), error.accounting)
@@ -1873,8 +1878,11 @@ class FullAnswerWorkflow(AnswerWorkflow):
         generated = self._generate_checked(
             messages, None, budget, before_generation, after_generation
         )
-        parsed = parse_quote_first(generated.value, self.answer_format)
+        parsed, repaired = repair_source_ids(
+            parse_quote_first(generated.value, self.answer_format), spans
+        )
         answer_ids, deviations = verify_quotes(parsed, spans)
+        deviations.extend(repaired)
         verified_ids = [sid for sid in answer_ids if sid in extracted_ids]
         parsed, attributed = attribute_uncited_answer(parsed, verified_ids, self.answer_format)
         deviations.extend(attributed)
@@ -1904,10 +1912,10 @@ class FullAnswerWorkflow(AnswerWorkflow):
         if self.writer == "structured":
             return super()._output_draft(value, blocks)
         spans = _spans(blocks)
-        parsed = parse_quote_first(value, self.answer_format)
+        parsed, repaired = repair_source_ids(parse_quote_first(value, self.answer_format), spans)
         ids, deviations = verify_quotes(parsed, spans)
         parsed, attributed = attribute_uncited_answer(parsed, ids, self.answer_format)
-        deviations = [*deviations, *attributed]
+        deviations = [*deviations, *repaired, *attributed]
         payload, draft_deviations = quote_first_draft(parsed, ids, spans, self.answer_format)
         return self._quote_draft(payload, parsed, ids, spans), (
             *deviations,

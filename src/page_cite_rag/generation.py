@@ -373,6 +373,11 @@ class OllamaModelClient:
     def clear_request_deadline(self) -> None:
         self._request_deadline = None
 
+    def request_seconds_left(self) -> float | None:
+        """Seconds left before the whole-question deadline; None when there is none."""
+        deadline = self._request_deadline
+        return None if deadline is None else deadline - time.monotonic()
+
     def remaining_request_timeout_seconds(self) -> float:
         if self._request_deadline is None:
             return self.config.timeout_seconds

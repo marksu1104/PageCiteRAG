@@ -14,6 +14,7 @@ from page_cite_rag.quote_first import (
     quote_first_draft,
     quote_first_explanation,
     quote_first_messages,
+    repair_source_ids,
     verify_quotes,
 )
 from page_cite_rag.span_citations import SourceSpan
@@ -63,9 +64,25 @@ def test_unparsed(text):
     assert not parse_quote_first(text).parsed
 
 
-@pytest.mark.parametrize("text", ["Answer: Unanswerable", "**Answer:** UNANSWERABLE!"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Answer: Unanswerable",
+        "**Answer:** UNANSWERABLE!",
+        "Answer: Unanswerable (The passages only describe a mansion.) [S2]",
+        "Answer: Unanswerable [S1][S2](The question assumes another country.)",
+        "Answer:\nUnanswerable. The passages do not name the spouse.",
+    ],
+)
 def test_unanswerable(text):
     assert parse_quote_first(text).unanswerable
+
+
+@pytest.mark.parametrize(
+    "text", ["Answer: Unanswerable-looking claims were tested [S1]", "Answer: It is answered."]
+)
+def test_answer_that_only_mentions_unanswerable_is_an_answer(text):
+    assert not parse_quote_first(text).unanswerable
 
 
 def test_evidence_without_reasoning():
@@ -693,3 +710,53 @@ def test_abbreviation_periods_do_not_split_answer_sentences():
         "Smith et al. tested it, e.g. on QA [S1].",
         "It ended in 1991.",
     )
+
+
+def _span(text: str, block: str = "b") -> SourceSpan:
+    return SourceSpan(block, block, 0, len(text), text)
+
+
+def test_mistyped_unknown_id_is_repaired_when_one_passage_holds_the_quote():
+    spans = {
+        "S31": _span("Inflation fell to 8.7% in April.", "31"),
+        "S35": _span("Net migration reached 606,000, with emigration at 557,000.", "35"),
+    }
+    parse = parse_quote_first(
+        'Evidence:\n[S25] "with emigration at 557,000"\n'
+        "Reasoning: The passage [S25] gives the emigration figure.\n"
+        "Answer: 557,000 people left the UK in 2022 [S25]."
+    )
+    repaired, deviations = repair_source_ids(parse, spans)
+    assert repaired.evidence == (("S35", ("with emigration at 557,000",)),)
+    assert "[S35]" in repaired.reasoning and "[S25]" not in repaired.answer_text
+    assert repaired.answer_lines == ("557,000 people left the UK in 2022 [S35].",)
+    assert deviations == [{"type": "quote_source_id_repaired", "count": 1}]
+    assert verify_quotes(repaired, spans) == (["S35"], [])
+
+
+def test_id_repair_leaves_known_ambiguous_and_missing_quotes_alone(spans):
+    known = parse_quote_first('Evidence:\n[S1] "something else"\nAnswer: x [S1]')
+    ambiguous = parse_quote_first('Evidence:\n[S99] "enrolled 120 adults"\nAnswer: x [S99]')
+    missing = parse_quote_first('Evidence:\n[S99] "not in any passage"\nAnswer: x [S99]')
+    for parse in (known, ambiguous, missing):
+        assert repair_source_ids(parse, spans) == (parse, [])
+
+
+def test_workflow_keeps_an_answer_whose_quote_id_was_mistyped(setup, monkeypatch):
+    store, doc_id, blocks, retriever, model, _ = setup
+    workflow = document_workflow(
+        store, doc_id, retriever, model, model.config, writer="quote_first"
+    )
+
+    def generate(messages, response_model):
+        model.calls.append((messages, response_model))
+        output = (
+            'Evidence:\n[S999] "Children were excluded."\nReasoning: It says so.\n'
+            "Answer: Children were excluded [S999]."
+        )
+        return GenerationResult(output, stats(), check_budget(messages, None, model.config))
+
+    monkeypatch.setattr(model, "generate", generate)
+    result = workflow.answer_from_context("Who was excluded?", blocks, language="en")
+    assert result.status != "insufficient_evidence"
+    assert {"type": "quote_source_id_repaired", "count": 1} in result.output_deviations
