@@ -179,7 +179,7 @@ def document_workflow(
 
 
 def ask_document(
-    workflow: AnswerWorkflow, question: str, *, language: Language = "zh-Hant"
+    workflow: AnswerWorkflow, question: str, *, language: Language = "auto"
 ) -> AnswerResult:
     return workflow.ask(question, language=language)
 
@@ -309,7 +309,7 @@ def answer_question(
     workflow: FullAnswerWorkflow,
     question: str,
     *,
-    language: Language = "zh-Hant",
+    language: Language = "auto",
     source_language: str = "unknown",
     mode: Mode = "detail",
     route: Route | None = None,
@@ -400,6 +400,6 @@ def explain_source(
     block_id: str,
     question: str,
     *,
-    language: Language = "zh-Hant",
+    language: Language = "auto",
 ) -> AnswerResult:
     return workflow.explain(block_id, question=question, language=language)

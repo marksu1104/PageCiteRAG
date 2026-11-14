@@ -42,10 +42,10 @@ def test_service_and_base_workflow_keep_the_same_explanation_defaults(tmp_path):
     assert (WorkflowConfig().top_k, WorkflowConfig().neighbor_blocks) == (6, 1)
 
 
-def test_public_api_defaults_to_traditional_chinese():
+def test_public_api_answers_in_the_language_of_the_question():
     from page_cite_rag.api import QuestionRequest
 
-    assert QuestionRequest(question="為什麼結果不顯著？").language == "zh-Hant"
+    assert QuestionRequest(question="為什麼結果不顯著？").language == "auto"
 
 
 @pytest.fixture

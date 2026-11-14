@@ -250,7 +250,7 @@ class DocumentService:
         operation: Literal["ask", "explain"],
         question: str,
         *,
-        language: Language = "zh-Hant",
+        language: Language = "auto",
         block_id: str | None = None,
         rewrite_query: bool = False,
         mode: Mode | None = None,

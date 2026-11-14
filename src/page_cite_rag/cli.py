@@ -573,7 +573,7 @@ def _generation_options(parser: argparse.ArgumentParser) -> None:
         help="Seconds for the whole question (default 600, at most 3600 on the CLI).",
     )
     parser.add_argument("--llm-threads", type=_positive_integer, default=2)
-    parser.add_argument("--language", choices=("en", "zh-Hant", "auto"), default="zh-Hant")
+    parser.add_argument("--language", choices=("en", "zh-Hant", "auto"), default="auto")
     parser.add_argument("--format", choices=("text", "json"), default="text")
 
 

@@ -612,9 +612,13 @@ main([sys.argv[2], '--help'])
         assert "--native-gpu" in result.stdout
 
 
-def test_public_cli_defaults_to_traditional_chinese():
+def test_public_cli_answers_in_the_language_of_the_question():
+    from page_cite_rag.workflows import resolve_answer_language
+
     args = cli.build_parser().parse_args(["ask", "0" * 64, "為什麼結果不顯著？"])
-    assert args.language == "zh-Hant"
+    assert args.language == "auto"
+    assert resolve_answer_language("為什麼結果不顯著？", args.language) == "zh-Hant"
+    assert resolve_answer_language("Why is the result not significant?", args.language) == "en"
     assert args.generation_timeout == 600
     assert args.request_timeout_seconds == 600
 

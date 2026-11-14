@@ -124,7 +124,7 @@ def reduce_context(workflow, question, language, sections, cited, order) -> list
     return sorted(selected, key=lambda b: order[b.block_id])
 
 
-def answer_global(workflow, question: str, *, language: str = "zh-Hant") -> GlobalAnswer:
+def answer_global(workflow, question: str, *, language: str = "auto") -> GlobalAnswer:
     """Answer a whole-document question; the trace records every step and its token use."""
     from page_cite_rag.workflows import resolve_answer_language
 
