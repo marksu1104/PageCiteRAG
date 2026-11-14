@@ -313,6 +313,30 @@ def test_agent_continues_after_a_parallel_tool_reply(setup, monkeypatch):
     assert [m["tool_call_id"] for m in tool_results] == ["tool-1"]
 
 
+def test_tool_call_signature_is_sent_back_on_the_next_turn(setup, monkeypatch):
+    """Gemini 3 rejects a later turn whose tool call lost its thought_signature (HTTP 400);
+    the LangChain adapter drops that field, so the transport restores it."""
+    workflow, client, blocks, retriever, model, checks = setup
+    pids = [f"P{b.ordinal}" for b in blocks]
+    signature = {"google": {"thought_signature": "c2lnbmF0dXJl"}}
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.read()))
+        if len(requests) == 1:
+            first = response(request, arguments={"query": "first"})
+            call = {**first.json()["choices"][0]["message"]["tool_calls"][0]}
+            call["extra_content"] = signature
+            return response(request, arguments={"query": "first"}, tool_calls=[call])
+        return response(request, "finish", {"passage_ids": [pids[0]]})
+
+    mock_agent_http(monkeypatch, client, handler)
+    run = run_evidence_agent(workflow, client, "Who was excluded?", language="en")
+    assert run.answer is not None and len(requests) == 2
+    sent = [m for m in requests[1]["messages"] if m["role"] == "assistant" and m.get("tool_calls")]
+    assert sent and sent[0]["tool_calls"][0]["extra_content"] == signature
+
+
 @pytest.mark.parametrize("field", ["reasoning", "reasoning_content"])
 def test_response_guards_preserve_usage(field):
     after = []

@@ -166,6 +166,11 @@ class ApiChatClient:
     def chat_completions_base_url(self) -> str:
         return self._api_base
 
+    @property
+    def thinking_field(self) -> tuple[str, object] | None:
+        """The request field and value that turn this provider's reasoning off, if any."""
+        return self._thinking_field
+
     def chat_sampling(self) -> dict:
         # GenerationConfig's existing generation profile uses temperature 0.0.
         return {"temperature": 0.0}

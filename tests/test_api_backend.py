@@ -494,3 +494,41 @@ def test_hidden_reasoning_in_total_tokens_is_rejected(monkeypatch, total, fails)
             client._check_reasoning_usage(payload)
     else:
         client._check_reasoning_usage(payload)
+
+
+@pytest.mark.parametrize(
+    "provider,key_env,field,value",
+    [
+        ("gemini", "GEMINI_API_KEY", "reasoning_effort", "minimal"),
+        ("openrouter", "OPENROUTER_API_KEY", "reasoning", {"enabled": False}),
+        ("groq", "GROQ_API_KEY", "reasoning_effort", "none"),
+    ],
+)
+def test_agent_guard_requires_each_presets_own_reasoning_off_field(
+    provider, key_env, field, value, monkeypatch
+):
+    """Deep mode used to require reasoning_effort "none" only, so it failed every question on
+    the Gemini and OpenRouter presets."""
+    from page_cite_rag.evidence_agent import GuardedTransport
+
+    monkeypatch.setenv(key_env, KEY)
+    sent = []
+
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json=completion())
+
+    with ApiChatClient(
+        GenerationConfig(),
+        api_base="https://provider.invalid/v1",
+        model="m",
+        provider=provider,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        assert client.thinking_field == (field, value)
+        guard = GuardedTransport(client, inner=httpx.MockTransport(handler))
+        url = "https://provider.invalid/v1/chat/completions"
+        with pytest.raises(ModelError, match="must disable reasoning"):
+            guard.handle_request(httpx.Request("POST", url, json={"max_tokens": 512}))
+        guard.handle_request(httpx.Request("POST", url, json={"max_tokens": 512, field: value}))
+    assert sent and sent[-1][field] == value

@@ -76,6 +76,26 @@ def _validate_model_calls(model_calls: int) -> None:
         raise ValueError("model_calls must be an integer from 8 to 12")
 
 
+def _tool_call_key(call: dict) -> str:
+    """A tool call's ID, or its name and arguments when the provider gave none."""
+    if call.get("id"):
+        return str(call["id"])
+    function = call.get("function") or {}
+    return f"{function.get('name')}|{function.get('arguments')}"
+
+
+def _thinking_field(client) -> tuple[str, object] | None:
+    """The field that turns the model's reasoning off: the API preset's own (Gemini's lowest
+    is reasoning_effort "minimal", OpenRouter's is reasoning.enabled false) or the pinned
+    Ollama's reasoning_effort "none". Only "none" was sent and accepted before, so deep mode
+    failed every question on the Gemini and OpenRouter presets (found 2026-11-15)."""
+    if hasattr(client, "thinking_field"):
+        return client.thinking_field
+    if getattr(client, "thinking_control", "reasoning_effort_none") == "reasoning_effort_none":
+        return ("reasoning_effort", "none")
+    return None
+
+
 class GuardedTransport(httpx.BaseTransport):
     """Inspect raw responses before the model adapter can discard reasoning fields."""
 
@@ -97,14 +117,19 @@ class GuardedTransport(httpx.BaseTransport):
         self.records: list[dict] = []
         self.repairs = 0
         self.dispatch_error: BaseException | None = None
+        # Provider data attached to a tool call that must come back unchanged with it on the
+        # next turn: Gemini 3 answers HTTP 400 when a call's thought_signature is missing, and
+        # the LangChain adapter drops that field (found 2026-11-15).
+        self.tool_call_extras: dict[str, dict] = {}
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.read())
         thinking_control = getattr(self.client, "thinking_control", "reasoning_effort_none")
+        field = _thinking_field(self.client)
         if (
-            (thinking_control == "reasoning_effort_none" and body.get("reasoning_effort") != "none")
+            (field is not None and body.get(field[0]) != field[1])
+            or (field is None and thinking_control != "provider_default")
             or (thinking_control == "provider_default" and "reasoning_effort" in body)
-            or thinking_control not in ("reasoning_effort_none", "provider_default")
             or body.get("stream", False)
         ):
             raise ModelError("Agent request must disable reasoning and streaming")
@@ -114,6 +139,12 @@ class GuardedTransport(httpx.BaseTransport):
             body["max_tokens"] = body.pop("max_completion_tokens")
         if body.get("max_tokens") != LIMITS.max_tokens:
             raise ModelError("Agent request must carry its output token cap")
+        for message in body.get("messages") or []:
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    extra = self.tool_call_extras.get(_tool_call_key(call))
+                    if extra is not None and "extra_content" not in call:
+                        call["extra_content"] = extra
         if len(self.records) - self.repairs >= self.model_call_limit:
             raise ModelError("Agent model-call ceiling reached")
         response, problem = self._dispatch(request, body)
@@ -210,6 +241,9 @@ class GuardedTransport(httpx.BaseTransport):
                 record["requested_tool_calls"].append(
                     {"id": call.get("id"), "name": function.get("name"), "arguments": arguments}
                 )
+            for call in message.get("tool_calls") or []:
+                if isinstance(call.get("extra_content"), dict):
+                    self.tool_call_extras[_tool_call_key(call)] = call["extra_content"]
             record["thinking_detected"] = bool(
                 message.get("reasoning") or message.get("reasoning_content")
             )
@@ -569,6 +603,7 @@ def run_evidence_agent(
         after_model_call=after_model_call,
         model_calls=model_calls,
     )
+    thinking = _thinking_field(client)
     with httpx.Client(transport=transport, trust_env=False) as http:
         llm = ChatOpenAI(
             base_url=client.chat_completions_base_url(),
@@ -579,12 +614,19 @@ def run_evidence_agent(
             timeout=LIMITS.timeout_seconds,
             max_retries=0,
             **(
-                {"reasoning_effort": "none"}
-                if client.thinking_control == "reasoning_effort_none"
+                {"reasoning_effort": thinking[1]}
+                if thinking is not None and thinking[0] == "reasoning_effort"
                 else {}
             ),
             http_client=http,
-            model_kwargs={"parallel_tool_calls": False},
+            model_kwargs={
+                "parallel_tool_calls": False,
+                **(
+                    {thinking[0]: thinking[1]}
+                    if thinking is not None and thinking[0] != "reasoning_effort"
+                    else {}
+                ),
+            },
         )
         try:
             agent_started = time.perf_counter()
