@@ -267,14 +267,57 @@ def test_request_guard_precedes_dispatch(body):
     assert calls == []
 
 
-@pytest.mark.parametrize("field", ["reasoning", "reasoning_content", "parallel"])
+def test_parallel_tool_calls_keep_only_the_first():
+    after = []
+
+    def handler(request):
+        first = response(request).json()["choices"][0]["message"]["tool_calls"][0]
+        return response(request, tool_calls=[first, {**first, "id": "tool-2"}])
+
+    guard = GuardedTransport(
+        SimpleNamespace(before_agent_dispatch=lambda: None),
+        inner=httpx.MockTransport(handler),
+        after_model_call=after.append,
+    )
+    result = guard.handle_request(httpx.Request("POST", "http://synthetic", json=CAPPED))
+    calls = result.json()["choices"][0]["message"]["tool_calls"]
+    assert [c["id"] for c in calls] == ["tool-1"]
+    assert after[0]["status"] == "completed"
+    assert after[0]["parallel_tools_dropped"] == 1
+    assert len(after[0]["requested_tool_calls"]) == 2
+    assert after[0]["prompt_eval_count"] == 10 and after[0]["eval_count"] == 2
+
+
+def test_agent_continues_after_a_parallel_tool_reply(setup, monkeypatch):
+    workflow, client, blocks, retriever, model, checks = setup
+    pids = [f"P{b.ordinal}" for b in blocks]
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.read()))
+        if len(requests) == 1:
+            first = response(request, arguments={"query": "first"})
+            call = first.json()["choices"][0]["message"]["tool_calls"][0]
+            second = {**call, "id": "tool-2"}
+            return response(request, arguments={"query": "first"}, tool_calls=[call, second])
+        return response(request, "finish", {"passage_ids": [pids[0]]})
+
+    mock_agent_http(monkeypatch, client, handler)
+    after = []
+    run = run_evidence_agent(
+        workflow, client, "Who was excluded?", language="en", after_model_call=after.append
+    )
+    assert run.answer is not None and len(requests) == 2
+    assert after[0]["parallel_tools_dropped"] == 1
+    tool_results = [m for m in requests[1]["messages"] if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in tool_results] == ["tool-1"]
+
+
+@pytest.mark.parametrize("field", ["reasoning", "reasoning_content"])
 def test_response_guards_preserve_usage(field):
     after = []
 
     def handler(request):
-        if field == "parallel":
-            first = response(request).json()["choices"][0]["message"]["tool_calls"][0]
-            return response(request, tool_calls=[first, {**first, "id": "tool-2"}])
         return response(request, **{field: "hidden reasoning"})
 
     guard = GuardedTransport(

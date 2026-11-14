@@ -216,7 +216,21 @@ class GuardedTransport(httpx.BaseTransport):
             if record["thinking_detected"]:
                 raise ModelError("thinking observed in raw Agent response; stop entire question")
             if len(record["requested_tool_calls"]) > 1:
-                raise ModelError("Agent returned parallel tools despite serial-call policy")
+                # Requests disable parallel tool calls, yet the model occasionally returns
+                # several. One search per model call is the budget rule, so only the first
+                # runs; the model can ask for the others on later steps.
+                record["parallel_tools_dropped"] = len(record["requested_tool_calls"]) - 1
+                message["tool_calls"] = message["tool_calls"][:1]
+                response = httpx.Response(
+                    response.status_code,
+                    headers={
+                        k: v
+                        for k, v in response.headers.items()
+                        if k.lower() not in ("content-length", "content-encoding")
+                    },
+                    content=json.dumps(payload).encode("utf-8"),
+                    request=request,
+                )
             # Recorded only: LangChain ends the search on a reply without a tool call.
             cut = record["finish_reason"] == "length" and not record["requested_tool_calls"]
             record["status"] = "cut_without_tool_call" if cut else "completed"
