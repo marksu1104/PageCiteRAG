@@ -153,7 +153,8 @@ def _answer_units(text: str) -> list[tuple[str, int, int]]:
     """Return claim units and their original ranges, preserving adjacent source markers."""
     units = []
     offset = 0
-    boundary = re.compile(r"[。！？!?]+|\.(?=\s|$|\[S\d)")
+    # A period after a single letter ("U.S.", "e.g.") or "et al." does not end a sentence.
+    boundary = re.compile(r"[。！？!?]+|(?<!\b[A-Za-z])(?<!\bal)\.(?=\s|$|\[S\d)")
     trailing_ids = re.compile(r"(?:[ \t]*\[S\d+(?:_\d+)?\])+")
     for line in text.splitlines(keepends=True):
         if line.strip() and not line.lstrip().startswith("#"):
@@ -186,23 +187,72 @@ def attribute_uncited_answer(
     The natural-answer prompt lets background sentences go uncited, but a model that reasons
     to a conclusion often writes the conclusion without IDs, which would leave no claim and
     turn a supported answer into "insufficient evidence". Only when no answer sentence
-    carries any ID and some quotes passed verification, each sentence cites those verified
-    passages; the draft then marks it limited_inference with the reasoning as its basis
-    unless the text appears verbatim. An answer with any cited sentence is left unchanged.
+    carries any ID and some quotes passed verification, the answer is attributed to them; the
+    draft then marks it limited_inference with the reasoning as its basis unless the text
+    appears verbatim. An answer with any cited sentence is left unchanged.
+
+    A one-sentence answer is the conclusion of the whole reasoning, so it cites all verified
+    passages. In a longer answer each sentence usually restates one reasoning sentence or
+    quote: it takes the verified IDs of the one it overlaps most (at least
+    ALIGN_MIN_OVERLAP of its words), and falls back to all verified passages otherwise.
     """
     if answer_format != "general" or not parse.parsed or parse.unanswerable or not verified_ids:
         return parse, []
     units = _answer_units(parse.answer_text)
     if not units or any(_ID.search(unit) for unit, _, _ in units):
         return parse, []
-    markers = "".join(f"[{sid}]" for sid in list(dict.fromkeys(verified_ids))[:8])
+    verified = list(dict.fromkeys(verified_ids))
+    chain = verified[:8]
+    candidates = [] if len(units) == 1 else _alignment_candidates(parse, verified)
     text = parse.answer_text
-    for _unit, _start, end in reversed(units):
-        text = f"{text[:end]} {markers}{text[end:]}"
+    aligned = 0
+    for unit, _start, end in reversed(units):
+        ids = _aligned_ids(unit, candidates) or chain
+        aligned += ids is not chain
+        text = f"{text[:end]} {''.join(f'[{sid}]' for sid in ids)}{text[end:]}"
     lines = tuple(unit for unit, _, _ in _answer_units(text))
     deviations: list[dict] = []
     _deviation(deviations, "quote_first_uncited_answer_attributed")
+    if aligned:
+        _deviation(deviations, "quote_first_uncited_sentence_aligned", aligned)
     return replace(parse, answer_text=text, answer_lines=lines), deviations
+
+
+# Offline check on the P2-4 dev answers whose sentences the model cited itself: with the IDs
+# removed, 66 of 67 sentences reached this overlap and 58 of those 66 picked an ID the model
+# had used.
+ALIGN_MIN_OVERLAP = 0.3
+
+
+def _overlap_tokens(text: str) -> set[str]:
+    """Words of three or more letters, numbers, and CJK character pairs, ignoring IDs."""
+    text = _ID.sub(" ", text).lower()
+    words = {w for w in re.findall(r"[a-z0-9]+", text) if len(w) >= 3 or w.isdigit()}
+    cjk = re.findall(r"[㐀-鿿豈-﫿]", text)
+    return words | {a + b for a, b in zip(cjk, cjk[1:], strict=False)}
+
+
+def _alignment_candidates(
+    parse: QuoteFirstParse, verified: Sequence[str]
+) -> list[tuple[set[str], list[str]]]:
+    """Reasoning sentences and quotes, each with the verified IDs it carries."""
+    candidates = []
+    for sentence, _, _ in _answer_units(parse.reasoning):
+        ids = [sid for sid in dict.fromkeys(_ID.findall(sentence)) if sid in verified]
+        if ids:
+            candidates.append((_overlap_tokens(sentence), ids))
+    for sid, fragments in parse.evidence:
+        if sid in verified:
+            candidates.append((_overlap_tokens(" ".join(fragments)), [sid]))
+    return candidates
+
+
+def _aligned_ids(unit: str, candidates: Sequence[tuple[set[str], list[str]]]) -> list[str]:
+    words = _overlap_tokens(unit)
+    if not words or not candidates:
+        return []
+    best_words, best_ids = max(candidates, key=lambda c: len(words & c[0]))
+    return best_ids if len(words & best_words) / len(words) >= ALIGN_MIN_OVERLAP else []
 
 
 def quote_first_explanation(

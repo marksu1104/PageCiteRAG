@@ -524,7 +524,7 @@ def test_general_sentence_units_preserve_markers_and_markdown():
         "Bullet has two sentences. Keep together [S1]",
         "編號。維持一項 [S2]",
     )
-    assert "this works. [S1][S2]" in parsed.answer_lines
+    assert "Example e.g. this works. [S1][S2]" in parsed.answer_lines
     assert not any(unit.startswith("[S") for unit in parsed.answer_lines)
     assert parsed.answer_lines[-1] == "Done."
 
@@ -643,6 +643,31 @@ def test_uncited_derived_answer_is_attributed_to_verified_evidence(spans):
     assert len(sources) == 2
 
 
+def test_longer_uncited_answer_cites_each_sentence_to_what_it_restates():
+    from page_cite_rag.quote_first import attribute_uncited_answer
+
+    parse = parse_quote_first(
+        'Evidence:\n[S1] "The trial enrolled 120 adults."\n[S2] "Dropout was 8 percent."\n'
+        '[S3] "模型在三個資料集上都優於基線。"\n'
+        "Reasoning: The trial enrolled 120 adults [S1]. Dropout reached 8 percent [S2]. "
+        "模型在三個資料集上都優於基線 [S3]。\n"
+        "Answer:\nThe trial enrolled 120 adults. Only 8 percent dropped out. "
+        "它在三個資料集上都優於基線。Overall the design seems sound."
+    )
+    attributed, deviations = attribute_uncited_answer(parse, ["S1", "S2", "S3"], "general")
+    assert attributed.answer_lines == (
+        "The trial enrolled 120 adults. [S1]",
+        "Only 8 percent dropped out. [S2]",
+        "它在三個資料集上都優於基線。 [S3]",
+        # No reasoning sentence or quote matches: the whole verified chain, as before.
+        "Overall the design seems sound. [S1][S2][S3]",
+    )
+    assert deviations == [
+        {"type": "quote_first_uncited_answer_attributed", "count": 1},
+        {"type": "quote_first_uncited_sentence_aligned", "count": 3},
+    ]
+
+
 def test_cited_answer_keeps_uncited_background_and_unanswerable_is_untouched(spans):
     from page_cite_rag.quote_first import attribute_uncited_answer
 
@@ -656,3 +681,15 @@ def test_cited_answer_keeps_uncited_background_and_unanswerable_is_untouched(spa
     assert attribute_uncited_answer(no_evidence, [], "general") == (no_evidence, [])
     short = parse_quote_first(_natural("120"), "short_answer")
     assert attribute_uncited_answer(short, ["S1"], "short_answer") == (short, [])
+
+
+def test_abbreviation_periods_do_not_split_answer_sentences():
+    parse = parse_quote_first(
+        'Evidence:\n[S1] "x"\nAnswer:\nThe rivalry between the U.S. and the Soviet Union '
+        "is the Cold War [S1]. Smith et al. tested it, e.g. on QA [S1]. It ended in 1991."
+    )
+    assert parse.answer_lines == (
+        "The rivalry between the U.S. and the Soviet Union is the Cold War [S1].",
+        "Smith et al. tested it, e.g. on QA [S1].",
+        "It ended in 1991.",
+    )
