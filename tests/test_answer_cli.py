@@ -706,6 +706,8 @@ def test_pinned_model_size_is_configured_and_used_by_client(monkeypatch):
     args = cli.build_parser().parse_args(["ask", "0" * 64, "question", "--model-size", "4b"])
     config = cli._generation_config(args)
     assert config.model_size == "4b"
+    # The 4B bundle, not the 9B default (the CLI used the 9B path for every size until 11-15).
+    assert config.bundle_dir == Path("models/llama-qwen35-4b/7fe450e1-e87f1764")
     captured = {}
 
     class FakePinnedClient:
@@ -1603,3 +1605,12 @@ def require_retrieval(monkeypatch):
     from page_cite_rag.full_answer import FullAnswerWorkflow
 
     monkeypatch.setattr(FullAnswerWorkflow, "whole_document_fits", lambda *args, **kwargs: False)
+
+
+def test_default_bundle_follows_the_pinned_size():
+    from page_cite_rag.llama import DEFAULT_BUNDLE, default_bundle
+
+    assert default_bundle("9b") == DEFAULT_BUNDLE
+    assert default_bundle("27b") == Path("models/llama-qwen35-27b/7fe450e1-3221f178")
+    args = cli.build_parser().parse_args(["ask", "0" * 64, "question"])
+    assert cli._generation_config(args).bundle_dir == DEFAULT_BUNDLE

@@ -100,6 +100,14 @@ def model_spec(model_size: Literal["9b", "4b", "27b"] = "9b") -> dict:
     raise ValueError("unsupported pinned model size")
 
 
+def default_bundle(model_size: Literal["9b", "4b", "27b"] = "9b") -> Path:
+    """Where `scripts/prepare_llama.py` puts the bundle for one pinned size."""
+    if model_size == "9b":
+        return DEFAULT_BUNDLE
+    revision = model_spec(model_size)["revision"]
+    return Path("models") / f"llama-qwen35-{model_size}" / f"{LLAMA_COMMIT[:8]}-{revision[:8]}"
+
+
 def sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()

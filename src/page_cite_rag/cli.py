@@ -636,12 +636,12 @@ def _generation_config(args: argparse.Namespace):
             num_thread=args.llm_threads,
             num_gpu=0,
         )
-    from page_cite_rag.llama import DEFAULT_BUNDLE, LlamaConfig
+    from page_cite_rag.llama import LlamaConfig, default_bundle
 
     if args.llm_host != "http://127.0.0.1:11435":
         raise ValueError("owned backends start their own server; --llm-host needs --backend ollama")
     return LlamaConfig(
-        bundle_dir=args.bundle_dir or DEFAULT_BUNDLE,
+        bundle_dir=args.bundle_dir or default_bundle(args.model_size),
         device=args.device,
         gpu_uuid=args.gpu_uuid,
         num_ctx=args.context_window,
