@@ -371,6 +371,7 @@ def answer_question(
                     for key in (
                         "tool_call_repairs",
                         "handoff_reason",
+                        "context_check",
                         "search_steps",
                         "token_usage",
                     )

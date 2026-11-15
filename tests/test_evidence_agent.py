@@ -562,6 +562,21 @@ def test_uncapped_or_unaccounted_output_fails(completion_tokens):
     assert after[0]["status"] == "failed"
 
 
+def test_ollama_counts_text_with_the_served_tokenizer(monkeypatch, tmp_path):
+    from page_cite_rag import ollama_backend
+
+    client = object.__new__(OllamaGgufClient)
+    client._gguf_path = None
+    with pytest.raises(ModelError, match="not loaded"):
+        client.count_text_tokens("P1: text")
+    client._gguf_path = tmp_path / "served.gguf"
+    seen = []
+    monkeypatch.setattr(
+        ollama_backend, "gguf_token_ids", lambda path, text: seen.append(path) or [7] * 3
+    )
+    assert client.count_text_tokens("P1: text") == 3 and seen == [client._gguf_path]
+
+
 def test_chat_sampling_follows_client_profile():
     client = object.__new__(OllamaGgufClient)
     client._sampling_seed = 7
@@ -652,11 +667,135 @@ def test_other_server_errors_are_recorded_and_not_resent():
         inner=httpx.MockTransport(handler),
         after_model_call=after.append,
     )
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(ModelError, match="HTTP 500: llama runner process has terminated"):
         guard.handle_request(httpx.Request("POST", "http://synthetic", json=CAPPED))
-    assert len(sent) == 1 and guard.repairs == 0
+    assert len(sent) == 1 and guard.repairs == 0 and not guard.context_full
     assert after[0]["status"] == "failed" and after[0]["http_status"] == 500
     assert after[0]["error_message"] == "llama runner process has terminated"
+
+
+@pytest.mark.parametrize("window", [600, 100_000])
+def test_request_that_would_not_fit_is_not_sent(setup, monkeypatch, window):
+    workflow, client, blocks, retriever, model, _ = setup
+    counted = []
+
+    def count_text_tokens(text):
+        counted.append(text)
+        return len(text)
+
+    client.count_text_tokens = count_text_tokens
+    client.config = SimpleNamespace(num_ctx=window)
+    pids = [f"P{b.ordinal}" for b in blocks]
+    initial = workflow.search_sources("Who was excluded?")[0]
+    initial = initial.model_copy(update={"hits": initial.hits[:1]})
+    retriever.change = lambda result: result.model_copy(
+        update={"hits": (result.hits[0].model_copy(update={"block": blocks[1]}),)}
+    )
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.read()))
+        if len(requests) == 1:
+            return response(request)
+        return response(request, "finish", {"passage_ids": [pids[1]]})
+
+    mock_agent_http(monkeypatch, client, handler)
+    result = run_evidence_agent(
+        workflow, client, "Who was excluded?", language="en", initial_search=initial
+    )
+    trace = result.trace
+    if window == 100_000:
+        assert len(requests) == 2 and trace["handoff_reason"] == "finish_called"
+        assert trace["context_check"] is None
+        return
+    # 10 prompt + 2 reply tokens reported by the server, two new messages, the tool result.
+    assert len(requests) == 1 and len(trace["model_calls"]) == 1
+    assert trace["context_check"] == {
+        "estimated_prompt_tokens": 12
+        + 2 * agent_module.MESSAGE_TEMPLATE_TOKENS
+        + sum(map(len, counted)),
+        "max_tokens": LIMITS.max_tokens,
+        "context_window": 600,
+    }
+    assert trace["handoff_reason"] == "context_full"
+    assert trace["handoff_passage_ids"] == [pids[0], pids[1]]
+    assert result.answer.status == "answered" and len(model.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (
+            400,
+            "request (16901 tokens) exceeds the available context size (16384 tokens), "
+            "try increasing it",
+        ),
+        # The pinned Ollama dropped the oldest messages, the question among them, to fit.
+        (
+            500,
+            "\n------------\nWhile executing CallExpression at line 79, column 24 in source:"
+            "\n...raise_exception('No user query found in messages.') }}\nError: Jinja Exception: "
+            "No user query found in messages.",
+        ),
+        (500, "the input length exceeds the context length"),
+    ],
+)
+def test_full_context_ends_search_and_hands_seen_passages_to_writer(
+    setup, monkeypatch, status, message
+):
+    workflow, client, blocks, retriever, model, _ = setup
+    pids = [f"P{b.ordinal}" for b in blocks]
+    initial = workflow.search_sources("Who was excluded?")[0]
+    initial = initial.model_copy(update={"hits": initial.hits[:1]})
+    retriever.change = lambda result: result.model_copy(
+        update={"hits": (result.hits[0].model_copy(update={"block": blocks[1]}),)}
+    )
+    requests, after = [], []
+
+    def handler(request):
+        requests.append(json.loads(request.read()))
+        if len(requests) == 1:
+            return response(request)
+        return httpx.Response(
+            status, json={"error": {"message": message, "type": "api_error"}}, request=request
+        )
+
+    mock_agent_http(monkeypatch, client, handler)
+    result = run_evidence_agent(
+        workflow,
+        client,
+        "Who was excluded?",
+        language="en",
+        initial_search=initial,
+        after_model_call=after.append,
+    )
+    assert len(requests) == 2
+    assert [r["status"] for r in after] == ["completed", "context_full"]
+    assert after[1]["http_status"] == status
+    assert after[1]["error_message"] == message
+    trace = result.trace
+    assert trace["handoff_reason"] == "context_full"
+    assert trace["selected_passage_ids"] == []
+    assert trace["handoff_passage_ids"] == [pids[0], pids[1]]
+    assert result.answer.status == "answered" and len(model.calls) == 1
+
+
+def test_guard_failure_on_a_full_context_still_stops_the_question(setup, monkeypatch):
+    workflow, client, _, _, model, _ = setup
+
+    def after(record):
+        raise ModelError("GPU thermal slowdown observed; own server stopped")
+
+    mock_agent_http(
+        monkeypatch,
+        client,
+        lambda request: server_error(request, "the input length exceeds the context length"),
+    )
+    with pytest.raises(ModelError, match="thermal"):
+        run_evidence_agent(
+            workflow, client, "Who was excluded?", language="en", after_model_call=after
+        )
+    assert model.calls == []
 
 
 def test_correction_does_not_use_an_agent_step():

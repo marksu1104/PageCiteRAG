@@ -326,3 +326,9 @@ class OllamaGgufClient(LlamaModelClient):
 
     def count_chat_input_tokens(self, payload: dict) -> int:
         raise ModelError("native chat-template token counting is unavailable on Ollama")
+
+    def count_text_tokens(self, text: str) -> int:
+        """Exact tokens of plain text with the served GGUF's own tokenizer (no chat template)."""
+        if self._gguf_path is None:
+            raise ModelError("the served model's tokenizer is not loaded yet")
+        return len(gguf_token_ids(self._gguf_path, text))

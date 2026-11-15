@@ -208,6 +208,7 @@ def test_agent_holds_session_and_reports_accounting(monkeypatch):
                 "model_calls": [{}, {}],
                 "tool_call_repairs": 1,
                 "handoff_reason": "finished",
+                "context_check": None,
                 "search_steps": ["q"],
                 "token_usage": {"total": 10},
             },
@@ -228,6 +229,7 @@ def test_agent_holds_session_and_reports_accounting(monkeypatch):
         "model_calls": 2,
         "tool_call_repairs": 1,
         "handoff_reason": "finished",
+        "context_check": None,
         "search_steps": ["q"],
         "token_usage": {"total": 10},
     }

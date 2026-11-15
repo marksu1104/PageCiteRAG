@@ -43,9 +43,28 @@ LIMITS = EvidenceAgentLimits()
 # 512-token reply: text before the call used up the cap and cut its JSON (2026-11-13).
 TOOL_CALL_REJECTED = re.compile(r'invalid tool call arguments for "([^"]+)"')
 
+# Every search adds up to five full passages to the conversation. On documents cut into
+# 2,000-character blocks the sixth request outgrows the 16,384-token window (8 of 22
+# long-dependency LooGLE questions failed, 2026-11-15). The pinned Ollama 0.35 then drops the
+# oldest messages to fit, the question among them, and Qwen's chat template stops with HTTP 500
+# "No user query found in messages." (reproduced on CPU). A single message too long to drop
+# returns llama-server's HTTP 400 instead. Requests are checked before dispatch; these server
+# answers remain a second line of defence.
+CONTEXT_FULL = re.compile(
+    r"exceeds the available context size|input length exceeds the context length"
+    r"|context size has been exceeded|no user query found in messages",
+    re.IGNORECASE,
+)
+# Chat-template tokens around one message (role markers, tool-response tags), with room to spare.
+MESSAGE_TEMPLATE_TOKENS = 32
+
 
 class AgentToolCallError(ModelError):
     """The server rejected the model's tool-call arguments and no correction is left."""
+
+
+class AgentContextFull(ModelError):
+    """The next agent request no longer fits the context window, so the search ends there."""
 
 
 @dataclass(frozen=True)
@@ -116,6 +135,17 @@ class GuardedTransport(httpx.BaseTransport):
         self.after_model_call = after_model_call
         self.records: list[dict] = []
         self.repairs = 0
+        self.context_full = False
+        # Admission before dispatch needs the served model's tokenizer and window; API
+        # providers enforce their own (larger) limits and answer with their own errors.
+        config = getattr(client, "config", None)
+        self.context_window = (
+            config.num_ctx
+            if hasattr(client, "count_text_tokens") and hasattr(config, "num_ctx")
+            else None
+        )
+        self.context_check: dict | None = None
+        self._last_prompt: tuple[int, int, int] | None = None
         self.dispatch_error: BaseException | None = None
         # Provider data attached to a tool call that must come back unchanged with it on the
         # next turn: Gemini 3 answers HTTP 400 when a call's thought_signature is missing, and
@@ -147,7 +177,17 @@ class GuardedTransport(httpx.BaseTransport):
                         call["extra_content"] = extra
         if len(self.records) - self.repairs >= self.model_call_limit:
             raise ModelError("Agent model-call ceiling reached")
-        response, problem = self._dispatch(request, body)
+        messages = body.get("messages") or []
+        estimate = self._next_prompt_tokens(messages)
+        if estimate is not None and estimate + LIMITS.max_tokens > self.context_window:
+            self.context_full = True
+            self.context_check = {
+                "estimated_prompt_tokens": estimate,
+                "max_tokens": LIMITS.max_tokens,
+                "context_window": self.context_window,
+            }
+            raise AgentContextFull("the next agent request would not fit the context window")
+        response, problem = self._dispatch(request, body, estimate=estimate)
         while problem is not None and self.repairs < LIMITS.tool_call_repairs:
             # The cut reply is not resent; say what failed and ask for the tool call alone.
             self.repairs += 1
@@ -160,10 +200,35 @@ class GuardedTransport(httpx.BaseTransport):
             )
             self.dispatch_error = error
             raise error
+        record = self.records[-1]
+        if type(record["prompt_eval_count"]) is int and type(record["eval_count"]) is int:
+            # A repaired prompt also counts its correction, so the next estimate stays high.
+            self._last_prompt = (record["prompt_eval_count"], record["eval_count"], len(messages))
         return response
 
+    def _next_prompt_tokens(self, messages: list[dict]) -> int | None:
+        """Exact tokens of the last prompt and reply, plus the new tool results counted with the
+        served model's tokenizer. None before the first reply or without a local tokenizer."""
+        if self.context_window is None or self._last_prompt is None:
+            return None
+        prompt, reply, seen = self._last_prompt
+        total = prompt + reply
+        for message in messages[seen:]:
+            total += MESSAGE_TEMPLATE_TOKENS
+            if message.get("role") == "assistant":
+                continue  # its tool call is the reply already counted
+            content = message.get("content")
+            text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            total += self.client.count_text_tokens(text)
+        return total
+
     def _dispatch(
-        self, request: httpx.Request, body: dict, *, repair: bool = False
+        self,
+        request: httpx.Request,
+        body: dict,
+        *,
+        repair: bool = False,
+        estimate: int | None = None,
     ) -> tuple[httpx.Response, str | None]:
         """Send one model call; return the rejected tool name when the server refused its args."""
         request = httpx.Request(
@@ -184,6 +249,8 @@ class GuardedTransport(httpx.BaseTransport):
             "error_message": None,
             "finish_reason": None,
             "repair": repair,
+            # Admission estimate, kept so it can be checked against prompt_eval_count.
+            "estimated_prompt_tokens": estimate,
             "requested_tool_calls": [],
             "thinking_detected": False,
         }
@@ -219,6 +286,16 @@ class GuardedTransport(httpx.BaseTransport):
                 if response.status_code == 500 and rejected:
                     record["status"] = "tool_call_rejected"
                     return response, rejected.group(1)
+                if CONTEXT_FULL.search(record["error_message"]):
+                    record["status"] = "context_full"
+                    self.context_full = True
+                    raise AgentContextFull("agent context window is full; the search ends here")
+                if not isinstance(self.client, ApiChatClient):
+                    # Keep the local server's reason in the error; it was lost before.
+                    raise ModelError(
+                        f"agent model server returned HTTP {response.status_code}: "
+                        f"{record['error_message']}"
+                    )
                 response.raise_for_status()
             payload = response.json()
             usage = payload.get("usage") or {}
@@ -269,6 +346,8 @@ class GuardedTransport(httpx.BaseTransport):
             cut = record["finish_reason"] == "length" and not record["requested_tool_calls"]
             record["status"] = "cut_without_tool_call" if cut else "completed"
             return response, None
+        except AgentContextFull:
+            raise
         except BaseException as exc:
             record.update(status="failed", error_type=type(exc).__name__)
             self.dispatch_error = exc
@@ -649,13 +728,17 @@ def run_evidence_agent(
                 )
             finally:
                 agent_loop_ms = (time.perf_counter() - agent_started) * 1000
-        except BaseException:
+        except BaseException as exc:
             # The OpenAI adapter wraps transport errors; preserve the original guard/hook failure.
             if transport.dispatch_error is not None:
                 raise transport.dispatch_error from None
-            raise
+            # A full context ends the search like the call limit: the writer gets what was seen.
+            if not (transport.context_full and isinstance(exc, Exception)):
+                raise
 
     selected, handoff, reason = state.handoff()
+    if transport.context_full:
+        reason = "context_full"
     steps = [
         row["arguments"]["query"]
         for row in state.calls
@@ -713,6 +796,7 @@ def run_evidence_agent(
             "selected_passage_ids": selected,
             "handoff_passage_ids": handoff,
             "handoff_reason": reason,
+            "context_check": transport.context_check,
             "search_steps": steps,
             "timing": {
                 "total_ms": (time.perf_counter() - total_started) * 1000,
