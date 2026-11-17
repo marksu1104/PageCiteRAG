@@ -817,7 +817,12 @@ _ROUTE_REASONS = {
 
 def _print_route(trace: dict) -> None:
     route = trace.get("route")
-    if trace.get("mode") == "global":
+    if trace.get("mode") == "global" and route == "agent_cover":
+        print(
+            f"Mode: global document answer (coverage agent, {trace['model_calls']} model calls, "
+            f"{len(trace['search_steps'])} searches)."
+        )
+    elif trace.get("mode") == "global":
         print("Mode: global document answer.")
     elif route == "whole_document_context":
         print("Route: whole document (fits the context).")

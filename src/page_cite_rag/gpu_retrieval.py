@@ -17,7 +17,7 @@ from page_cite_rag.embedding import DEFAULT_MODEL_DIR
 from page_cite_rag.embedding_native import NativeEmbeddingEncoder
 from page_cite_rag.embedding_server import NativeEmbeddingServer, verify_native_model
 from page_cite_rag.retrieval import SearchResult
-from page_cite_rag.retrieval_profile import RERANK_POOL
+from page_cite_rag.retrieval_profile import FORMAL_RETRIEVAL, RERANK_POOL
 from page_cite_rag.store import SQLiteDocumentStore
 
 
@@ -71,6 +71,8 @@ class StagedGpuSearch:
         self.gpu_uuid = gpu_uuid
         self.gpu_temperature_limit_c = gpu_temperature_limit_c
         self.reranker_model_path = reranker_model_path
+        self.tokenizer_directory = tokenizer_directory
+        self.candidates = candidates
         self._store = store
         self.last_trace: dict | None = None
         self._cancel_lock = threading.Lock()
@@ -86,6 +88,25 @@ class StagedGpuSearch:
         self._session_query_ms = 0.0
         self._session_start_attempted = False
         self._server_context = None
+
+    def agent_view(self) -> StagedGpuSearch:
+        """The same index and GPU settings with the agent's retrieval (deep mode): no reranker
+        and the formal candidates per branch. Auto mode reranks; a whole-document question it
+        routes to the agent must search as the validated agent did."""
+        if self.reranker_model_path is None and self.candidates in (
+            None,
+            FORMAL_RETRIEVAL.candidates_per_branch,
+        ):
+            return self
+        return StagedGpuSearch(
+            self._store,
+            self.document_id,
+            self.method,
+            self.model_path,
+            self.gpu_uuid,
+            tokenizer_directory=self.tokenizer_directory,
+            gpu_temperature_limit_c=self.gpu_temperature_limit_c,
+        )
 
     def cancel(self) -> None:
         """Signal only this search's owned embedding process to stop."""

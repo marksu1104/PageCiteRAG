@@ -89,6 +89,28 @@ SYSTEM_PROMPT = (
     "that contain the needed facts, in reasoning order. Do not answer the question yourself."
 )
 
+# Whole-document questions (summary, main idea, strengths and weaknesses): the same agent, tools,
+# limits and writer, with a search strategy that covers the aspects the answer needs instead of
+# following one chain of facts. This is the text that was evaluated (2026-11-16/17); a test pins
+# both prompts so changing one cannot move the other.
+COVER_PROMPT = (
+    "You gather evidence from one long document so that a writer can answer a question about "
+    "the document as a whole, such as a summary, its main idea, or its strengths and "
+    "weaknesses. First decide which aspects a good answer must cover. For a research paper "
+    "these are the problem and motivation, the proposed method, the main results and the "
+    "conclusions; for strengths and weaknesses they are the contributions, the evidence "
+    "supporting them, the limitations and what remains open; for a story they are the main "
+    "characters, the central conflict, the key events and the ending.\n"
+    "Search for one aspect at a time with a short query naming that aspect and the document's "
+    'topic, for example "proposed method architecture" or "limitations future work", never the '
+    "whole question. If the passages returned do not cover an aspect, search again with "
+    "different words.\n"
+    "You have at most 8 steps in total. Your last step must be finish with the IDs of the "
+    "passages that together cover every aspect, most important first. Do not answer the "
+    "question yourself."
+)
+STRATEGIES = {"chain": SYSTEM_PROMPT, "cover": COVER_PROMPT}
+
 
 def _validate_model_calls(model_calls: int) -> None:
     if type(model_calls) is not int or not 8 <= model_calls <= 12:
@@ -620,11 +642,13 @@ class EvidenceTools:
         return [search_passages, finish]
 
 
-def evidence_agent(llm, state):
+def evidence_agent(llm, state, *, strategy: str = "chain"):
     from langchain.agents import create_agent
     from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
 
-    system_prompt = SYSTEM_PROMPT.replace(
+    if strategy not in STRATEGIES:
+        raise ValueError("strategy must be chain or cover")
+    system_prompt = STRATEGIES[strategy].replace(
         "at most 8 steps", f"at most {state.model_call_limit} steps"
     )
     if state.handoff_findings:
@@ -654,9 +678,12 @@ def run_evidence_agent(
     model_calls: int = LIMITS.model_calls,
     before_model_call: Callable[[], None] | None = None,
     after_model_call: Callable[[dict], None] | None = None,
+    strategy: str = "chain",
 ) -> EvidenceAgentResult:
     """Gather passages, then hand every seen original to the quote-first workflow."""
     _validate_model_calls(model_calls)
+    if strategy not in STRATEGIES:
+        raise ValueError("strategy must be chain or cover")
     total_started = time.perf_counter()
     if not isinstance(workflow, FullAnswerWorkflow) or workflow.writer != "quote_first":
         raise ValueError("evidence agent requires a quote-first FullAnswerWorkflow")
@@ -710,7 +737,7 @@ def run_evidence_agent(
         try:
             agent_started = time.perf_counter()
             try:
-                evidence_agent(llm, state).invoke(
+                evidence_agent(llm, state, strategy=strategy).invoke(
                     {
                         "messages": [
                             {
@@ -784,6 +811,7 @@ def run_evidence_agent(
         answer,
         {
             "version": EVIDENCE_AGENT_VERSION,
+            "strategy": strategy,
             "handoff_findings": handoff_findings,
             "findings": state.findings,
             "findings_rejected": state.findings_rejected,

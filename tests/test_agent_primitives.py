@@ -197,9 +197,9 @@ def test_agent_holds_session_and_reports_accounting(monkeypatch):
     workflow = SimpleNamespace(_retriever=retriever, _model=client)
     expected = object()
 
-    def run(passed, passed_client, question, *, language):
+    def run(passed, passed_client, question, *, language, strategy):
         assert passed is workflow and passed_client is client
-        assert question == "question" and language == "en"
+        assert question == "question" and language == "en" and strategy == "chain"
         assert events == ["start"]
         return SimpleNamespace(
             answer=expected,
@@ -226,6 +226,7 @@ def test_agent_holds_session_and_reports_accounting(monkeypatch):
         "route": "agent",
         "reason": "requested",
         "agent_version": "fake-agent/v1",
+        "agent_strategy": "chain",
         "model_calls": 2,
         "tool_call_repairs": 1,
         "handoff_reason": "finished",

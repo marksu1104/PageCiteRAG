@@ -343,13 +343,21 @@ def answer_question(
     if router is not None:
         trace["router"] = router
     if mode == "global":
+        if _cover_agent_ready(workflow) and not workflow.whole_document_fits(
+            question, language=language
+        ):
+            # On 70 unseen LooGLE paper summaries (2026-11-17, all too long to fit) the coverage
+            # agent was more faithful than map-reduce at the same completeness and about twice
+            # as fast; map-reduce stays for setups without the agent.
+            trace.update(route="agent_cover", reason="whole_document_exceeds_context")
+            cover = _with_agent_retrieval(workflow)
+            return _agent_answer(cover, question, language, trace, strategy="cover")
         from page_cite_rag.global_answer import answer_global
 
         run = answer_global(workflow, question, language=language)
         trace.update(route="global", reason="requested", global_trace=run.trace)
         return AgentAnswer(run.result, trace)
     if route == "agent":
-        from page_cite_rag.evidence_agent import run_evidence_agent
         from page_cite_rag.ollama_backend import OllamaGgufClient
 
         retriever = workflow._retriever
@@ -359,26 +367,8 @@ def answer_question(
             raise ValueError("agent requires retrieval without reranking")
         if not isinstance(workflow._model, OllamaGgufClient):
             raise ValueError("agent requires --backend pinned-ollama (OllamaGgufClient)")
-        with retriever.session():
-            run = run_evidence_agent(workflow, workflow._model, question, language=language)
         trace.update(route="agent", reason="requested")
-        trace.update(
-            {
-                "agent_version": run.trace["version"],
-                "model_calls": len(run.trace["model_calls"]),
-                **{
-                    key: run.trace[key]
-                    for key in (
-                        "tool_call_repairs",
-                        "handoff_reason",
-                        "context_check",
-                        "search_steps",
-                        "token_usage",
-                    )
-                },
-            }
-        )
-        return AgentAnswer(run.answer, trace)
+        return _agent_answer(workflow, question, language, trace, strategy="chain")
     if route == "auto":
         if workflow.whole_document_fits(question, language=language):
             result = workflow.answer_from_context(
@@ -394,6 +384,58 @@ def answer_question(
             workflow.config = workflow.config.model_copy(update={"top_k": RERANK_KEEP})
             trace.update(route="reranked", reason="whole_document_exceeds_context")
     return AgentAnswer(ask_document(workflow, question, language=language), trace)
+
+
+def _cover_agent_ready(workflow) -> bool:
+    """Whether this setup has the agent: pinned 9B and native-GPU hybrid search (not CPU or
+    API retrieval, which keep the map-reduce route)."""
+    from page_cite_rag.gpu_retrieval import StagedGpuSearch
+    from page_cite_rag.ollama_backend import OllamaGgufClient
+
+    retriever = workflow._retriever
+    return (
+        isinstance(retriever, StagedGpuSearch)
+        and retriever.method == "hybrid"
+        and isinstance(workflow._model, OllamaGgufClient)
+        and getattr(workflow, "writer", None) == "quote_first"
+    )
+
+
+def _with_agent_retrieval(workflow):
+    """The same workflow searching as deep mode does (no reranker), as the agent was validated."""
+    view = workflow._retriever.agent_view()
+    if view is workflow._retriever:
+        return workflow
+    cover = copy(workflow)
+    cover._retriever = view
+    return cover
+
+
+def _agent_answer(workflow, question: str, language, trace: dict, *, strategy: str) -> AgentAnswer:
+    from page_cite_rag.evidence_agent import run_evidence_agent
+
+    with workflow._retriever.session():
+        run = run_evidence_agent(
+            workflow, workflow._model, question, language=language, strategy=strategy
+        )
+    trace.update(
+        {
+            "agent_version": run.trace["version"],
+            "agent_strategy": strategy,
+            "model_calls": len(run.trace["model_calls"]),
+            **{
+                key: run.trace[key]
+                for key in (
+                    "tool_call_repairs",
+                    "handoff_reason",
+                    "context_check",
+                    "search_steps",
+                    "token_usage",
+                )
+            },
+        }
+    )
+    return AgentAnswer(run.answer, trace)
 
 
 def explain_source(
