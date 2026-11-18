@@ -2181,6 +2181,7 @@ gpu-embed = [
     { name = "tokenizers" },
 ]
 mcp = [
+    { name = "fastapi" },
     { name = "mcp" },
 ]
 ml-cpu = [
@@ -2216,6 +2217,7 @@ requires-dist = [
     { name = "docling", marker = "extra == 'parser'", specifier = "==2.142.1" },
     { name = "docling-core", marker = "extra == 'parser'", specifier = "==2.104.0" },
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.116,<1" },
+    { name = "fastapi", marker = "extra == 'mcp'", specifier = ">=0.116,<1" },
     { name = "httpx", specifier = ">=0.28,<0.29" },
     { name = "jieba", specifier = "==0.42.1" },
     { name = "langchain", marker = "extra == 'agent'", specifier = "==1.4.6" },

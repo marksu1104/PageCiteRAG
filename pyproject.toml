@@ -41,6 +41,8 @@ agent = [
     "langchain-openai==1.7.2",
 ]
 mcp = [
+    # The MCP server shares the HTTP API's request models and error mapping (page_cite_rag.api).
+    "fastapi>=0.116,<1",
     "mcp==2.3.0",
 ]
 ml-cpu = [
