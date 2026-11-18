@@ -138,6 +138,23 @@ def test_deep_mode_keeps_the_chain_strategy(monkeypatch):
     assert seen == [("chain", "agent")]
 
 
+def test_deep_request_on_a_reranking_service_uses_the_agent_retrieval(monkeypatch):
+    # serve/mcp rerank for auto mode; a per-request deep question must not fail on that and
+    # must search without the reranker, as the agent was validated.
+    reranked = FakeSearch(reranker="reranker.gguf", candidates=100)
+    reranked.view = FakeSearch()
+    workflow = capable(monkeypatch, reranked)
+    seen = []
+
+    def agent_answer(passed, question, language, trace, *, strategy):
+        seen.append((passed._retriever, strategy, trace["route"]))
+        return application.AgentAnswer("result", trace)
+
+    monkeypatch.setattr(application, "_agent_answer", agent_answer)
+    application.answer_question(workflow, "Who founded it?", mode="deep", language="en")
+    assert seen == [(reranked.view, "chain", "agent")] and workflow._retriever is reranked
+
+
 def test_agent_view_drops_reranking_only(monkeypatch):
     built = []
 

@@ -363,12 +363,14 @@ def answer_question(
         retriever = workflow._retriever
         if not isinstance(retriever, StagedGpuSearch) or retriever.method != "hybrid":
             raise ValueError("agent requires --native-gpu and --method hybrid")
-        if retriever.reranker_model_path is not None:
-            raise ValueError("agent requires retrieval without reranking")
         if not isinstance(workflow._model, OllamaGgufClient):
             raise ValueError("agent requires --backend pinned-ollama (OllamaGgufClient)")
         trace.update(route="agent", reason="requested")
-        return _agent_answer(workflow, question, language, trace, strategy="chain")
+        # serve and mcp build one reranking search for auto mode; a per-request deep question
+        # searches as the validated agent did (no reranker), like the coverage agent.
+        return _agent_answer(
+            _with_agent_retrieval(workflow), question, language, trace, strategy="chain"
+        )
     if route == "auto":
         if workflow.whole_document_fits(question, language=language):
             result = workflow.answer_from_context(

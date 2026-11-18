@@ -153,21 +153,23 @@ def test_detail_selects_whole_document_or_reranked(monkeypatch, fits):
     assert workflow.config.top_k == 100
 
 
-@pytest.mark.parametrize("bad", ["retriever", "method", "reranker", "client"])
-def test_agent_requires_native_hybrid_without_rerank_and_owned_client(bad):
+@pytest.mark.parametrize("bad", ["retriever", "method", "client"])
+def test_agent_requires_native_hybrid_and_owned_client(bad):
+    # A reranking search is not an error: deep searches through its agent view
+    # (tests/test_global_cover.py).
     from page_cite_rag.application import answer_question
     from page_cite_rag.gpu_retrieval import StagedGpuSearch
 
     retriever = object.__new__(StagedGpuSearch)
     retriever.method = "dense" if bad == "method" else "hybrid"
-    retriever.reranker_model_path = "fake" if bad == "reranker" else None
+    retriever.reranker_model_path = None
+    retriever.candidates = None
     workflow = SimpleNamespace(
         _retriever=None if bad == "retriever" else retriever, _model=object()
     )
     requirement = {
         "retriever": "--native-gpu",
         "method": "--method hybrid",
-        "reranker": "without reranking",
         "client": "--backend pinned-ollama",
     }
     with pytest.raises(ValueError, match=requirement[bad]):
@@ -193,6 +195,7 @@ def test_agent_holds_session_and_reports_accounting(monkeypatch):
     retriever = object.__new__(StagedGpuSearch)
     retriever.method = "hybrid"
     retriever.reranker_model_path = None
+    retriever.candidates = None
     client = object.__new__(OllamaGgufClient)
     workflow = SimpleNamespace(_retriever=retriever, _model=client)
     expected = object()
