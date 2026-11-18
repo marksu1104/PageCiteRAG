@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PageCiteRAG reader</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">PageCiteRAG</div>
+  <div class="doc" id="doc-title">No document loaded</div>
+  <button type="button" class="link" id="forget-token" hidden>Change token</button>
+</header>
+
+<form class="token" id="token-form" hidden>
+  <label for="token-input">API token</label>
+  <p class="hint">The value of <code>PAGE_CITE_RAG_API_TOKEN</code> used to start <code>page-cite-rag serve</code>. It stays in this browser tab only.</p>
+  <div class="row">
+    <input id="token-input" type="password" autocomplete="off" spellcheck="false" required>
+    <button type="submit">Connect</button>
+  </div>
+  <p class="error" id="token-error" role="alert"></p>
+</form>
+
+<main class="layout" id="app" hidden>
+  <section class="chat" aria-label="Question and answer">
+    <form class="ask" id="ask-form">
+      <label for="question">Ask about this document</label>
+      <textarea id="question" rows="3" maxlength="4000" placeholder="e.g. What is the main idea of this paper? / 這篇論文的主旨是什麼？" required></textarea>
+      <div class="row">
+        <label class="mode" for="mode">Mode
+          <select id="mode">
+            <option value="">auto</option>
+            <option value="detail">detail</option>
+            <option value="global">global</option>
+            <option value="deep">deep</option>
+          </select>
+        </label>
+        <button type="submit" id="ask-button">Ask</button>
+        <span class="status" id="ask-status" aria-live="polite"></span>
+      </div>
+    </form>
+    <article class="answer" id="answer" hidden>
+      <div class="answer-meta" id="answer-meta"></div>
+      <div class="answer-text" id="answer-text"></div>
+      <h2 class="sources-title" id="sources-title">Sources</h2>
+      <ol class="sources" id="sources"></ol>
+      <p class="note" id="answer-note"></p>
+    </article>
+  </section>
+
+  <aside class="viewer" aria-label="Source viewer">
+    <div class="viewer-empty" id="viewer-empty">Click a source number in the answer to see the quotation on its page.</div>
+    <div class="viewer-body" id="viewer-body" hidden>
+      <div class="viewer-head"><span class="viewer-badge" id="viewer-badge"></span><span id="viewer-where"></span></div>
+      <blockquote class="quote" id="viewer-quote"></blockquote>
+      <p class="checked">Checked word for word against the stored source.</p>
+      <div class="page" id="viewer-page"></div>
+      <p class="hint" id="viewer-hint"></p>
+    </div>
+  </aside>
+</main>
+<div class="tip" id="tip" role="tooltip" hidden></div>
+</body>
+</html>

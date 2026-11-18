@@ -1340,10 +1340,23 @@ def _run_serve(args: argparse.Namespace) -> int:
         from page_cite_rag.api import create_app
 
         runtime = _create_document_service(args)
+        pdf = None
+        if args.pdf is not None:
+            from page_cite_rag.web import verified_pdf
+
+            try:
+                pdf = verified_pdf(args.pdf, runtime.document()["document"]["source_sha256"])
+            except ValueError as error:
+                # Fixed messages from web.verified_pdf; they contain no path or user input.
+                raise _RouteConfigurationError(str(error)) from None
         import uvicorn
 
+        print(
+            f"page-cite-rag: reader at http://127.0.0.1:{args.port}/ (paste the API token there)",
+            file=sys.stderr,
+        )
         uvicorn.run(
-            create_app(runtime, api_token=api_token),
+            create_app(runtime, api_token=api_token, pdf=pdf),
             host="127.0.0.1",
             port=args.port,
             workers=1,
@@ -1653,6 +1666,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _document_service_options(serve_parser)
     serve_parser.add_argument("--port", type=_positive_integer, default=8765)
+    serve_parser.add_argument(
+        "--pdf",
+        type=Path,
+        help="Original PDF for the browser reader's page view; must have the ingested "
+        "file's SHA-256.",
+    )
     mcp_parser = subparsers.add_parser("mcp", help="Serve one document over MCP stdio.")
     _document_service_options(mcp_parser)
 

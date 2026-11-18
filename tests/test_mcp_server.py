@@ -209,6 +209,7 @@ def test_mcp_cli_shares_options_and_runtime(monkeypatch):
     mcp = vars(parser.parse_args(["mcp", "a" * 64]))
     serve.pop("command")
     serve.pop("port")  # Only the HTTP transport has a port.
+    serve.pop("pdf")  # And only it serves the browser reader's page images.
     mcp.pop("command")
     assert mcp == serve
     subparsers = next(a for a in parser._actions if a.dest == "command")

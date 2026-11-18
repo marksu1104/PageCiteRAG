@@ -1,4 +1,8 @@
-"""Loopback-only, single-document FastAPI adapter over the shared application core."""
+"""Loopback-only, single-document FastAPI adapter over the shared application core.
+
+The browser reader (page_cite_rag.web) is served from "/" without the token because the page
+holds no document data; every data request it makes carries the token.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +11,11 @@ import hmac
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Path, Query, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from page_cite_rag.application import Mode
 from page_cite_rag.generation import ModelError
 from page_cite_rag.retrieval import RetrievalError
 from page_cite_rag.service import (
@@ -21,6 +26,7 @@ from page_cite_rag.service import (
     ServiceDeadlineError,
     ServiceStoppedError,
 )
+from page_cite_rag.web import SECURITY_HEADERS, PdfPages, asset
 from page_cite_rag.workflows import WorkflowError
 
 
@@ -33,6 +39,8 @@ class QuestionRequest(BaseModel):
 
 class AskRequest(QuestionRequest):
     rewrite_query: bool = False
+    # Same per-request override as the MCP ask tool; None keeps the service's --mode.
+    mode: Mode | None = None
 
 
 class ExplainRequest(QuestionRequest):
@@ -63,6 +71,7 @@ async def _answer(service: DocumentService, request: Request, mode: str, payload
             language=payload.language,
             block_id=getattr(payload, "block_id", None),
             rewrite_query=getattr(payload, "rewrite_query", False),
+            mode=getattr(payload, "mode", None),
         )
     except Exception as error:
         raise _failure(error) from None
@@ -85,9 +94,17 @@ async def _answer(service: DocumentService, request: Request, mode: str, payload
 
 
 def create_app(
-    service: DocumentService, *, api_token: str, allow_test_client: bool = False
+    service: DocumentService,
+    *,
+    api_token: str,
+    allow_test_client: bool = False,
+    pdf: PdfPages | None = None,
 ) -> FastAPI:
-    """No import-time model load; require a caller-supplied token and loopback client."""
+    """No import-time model load; require a caller-supplied token and loopback client.
+
+    ``pdf`` is the verified original file (web.verified_pdf); without it the reader still
+    shows answers and quotations, and page images answer 404.
+    """
     if not isinstance(api_token, str) or not api_token.strip():
         raise ValueError("a nonempty local API token is required")
     expected_authorization = f"Bearer {api_token}".encode("utf-8")
@@ -109,6 +126,9 @@ def create_app(
             allowed.add("testclient")
         if request.client is None or request.client.host not in allowed:
             return JSONResponse(status_code=403, content={"detail": "loopback clients only"})
+        if request.method == "GET" and (public := asset(request.url.path)) is not None:
+            content, media_type = public
+            return Response(content, media_type=media_type, headers=SECURITY_HEADERS)
         supplied_authorization = request.headers.get("authorization", "").encode("utf-8")
         if not hmac.compare_digest(supplied_authorization, expected_authorization):
             return JSONResponse(status_code=401, content={"detail": "bearer token required"})
@@ -137,6 +157,24 @@ def create_app(
             return service.source_details(block_id)
         except Exception as error:
             raise _failure(error) from None
+
+    @app.get("/v1/pages/{page_number}")
+    async def page_image(page_number: int = Path(ge=1)):
+        if pdf is None:
+            raise HTTPException(404, "no PDF bound; start serve with --pdf")
+        try:
+            image, width, height = await asyncio.to_thread(pdf.render, page_number)
+        except IndexError:
+            raise HTTPException(404, "page outside the bound PDF") from None
+        return Response(
+            image,
+            media_type="image/png",
+            headers={
+                "X-Page-Width-Points": f"{width:.2f}",
+                "X-Page-Height-Points": f"{height:.2f}",
+                "Cache-Control": "no-store",
+            },
+        )
 
     @app.post("/v1/ask", response_model=ServiceAnswer)
     async def ask(request: Request, payload: AskRequest):
